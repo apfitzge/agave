@@ -1,6 +1,6 @@
 use {
     crate::{
-        bytes::{advance_offset_for_type, read_type},
+        bytes::{advance_offset_for_type, check_remaining},
         result::{Result, TransactionViewError},
         transaction_data::TransactionData,
         transaction_frame::TransactionFrame,
@@ -13,6 +13,9 @@ pub struct EntryView<D: TransactionData> {
     /// Underlying data buffer for the entry.
     data: D,
 
+    /// The number of hashes in the entry.
+    num_hashes: u64,
+
     /// List of `TransactionFrame` and starting offsets for
     /// each transaction in the entry.
     frames_and_offsets: Vec<(usize, TransactionFrame)>,
@@ -20,22 +23,25 @@ pub struct EntryView<D: TransactionData> {
 
 impl<D: TransactionData> EntryView<D> {
     pub fn try_new(data: D) -> Result<Self> {
-        // The alignment of the data buffer must be 8 for the deserialization here to work correctly.
         let bytes = data.data();
-        if bytes.as_ptr() as usize % 8 != 0 {
-            return Err(TransactionViewError::IncorrectAlignment);
-        }
-
         let mut offset = 0;
 
         // `num_hashes` - u64
-        advance_offset_for_type::<u64>(bytes, &mut offset)?;
+        check_remaining(bytes, offset, core::mem::size_of::<u64>())?;
+        let num_hashes = u64::from_le_bytes(
+            bytes[offset..offset + core::mem::size_of::<u64>()]
+                .try_into()
+                .map_err(|_| TransactionViewError::ParseError)?,
+        );
+        offset += core::mem::size_of::<u64>();
+
         // `hash` - Hash
         advance_offset_for_type::<Hash>(bytes, &mut offset)?;
 
         let frames_and_offsets = Self::parse_entry_transactions(bytes, offset)?;
         Ok(Self {
             data,
+            num_hashes,
             frames_and_offsets,
         })
     }
@@ -43,26 +49,21 @@ impl<D: TransactionData> EntryView<D> {
     /// Returns the number of hashes in the entry.
     #[inline]
     pub fn num_hashes(&self) -> u64 {
-        let bytes = self.data.data();
-        // SAFETY:
-        // - The data buffer is guaranteed to be correctly aligned to 8.
-        // - The `EntryView` was constructed with `data` so there are at least 8 bytes.
-        unsafe { *bytes.as_ptr().cast::<u64>() }
+        self.num_hashes
     }
 
     /// Returns the hash of the entry.
     #[inline]
-    pub fn hash(&self) -> Hash {
-        let bytes = self.data.data();
+    pub fn hash(&self) -> &Hash {
+        const _: () = assert!(core::mem::align_of::<Hash>() == 1, "Hash alignment");
+
         // SAFETY:
-        // - The data buffer is guaranteed to be correctly aligned to 8.
-        // - The `EntryView` was constructed with `data` so there are at least 8 bytes.
-        unsafe {
-            *bytes
-                .as_ptr()
-                .add(core::mem::size_of::<u64>())
-                .cast::<Hash>()
-        }
+        // - The pointer is correctly aligned (no alignment constraints).
+        // - `Hash` is just a byte array; there is no possibility the `Hash`
+        //   is not initialized properly.
+        // - Aliasing rules are respected because the lifetime of the returned
+        //   reference is the same as the input/source `bytes`.
+        unsafe { &*(self.data.data().as_ptr().add(core::mem::size_of::<u64>()) as *const Hash) }
     }
 
     /// Get the number of transactions in the entry.
@@ -88,8 +89,14 @@ impl<D: TransactionData> EntryView<D> {
         data: &[u8],
         mut offset: usize,
     ) -> Result<Vec<(usize, TransactionFrame)>> {
+        check_remaining(data, offset, core::mem::size_of::<u64>())?;
         // Read the number of transactions
-        let num_transactions = unsafe { *read_type::<u64>(data, &mut offset)? } as usize;
+        let num_transactions = u64::from_le_bytes(
+            data[offset..offset + core::mem::size_of::<u64>()]
+                .try_into()
+                .map_err(|_| TransactionViewError::ParseError)?,
+        ) as usize;
+        offset += core::mem::size_of::<u64>();
 
         let mut frames_and_offsets = Vec::with_capacity(num_transactions);
         while frames_and_offsets.len() < num_transactions {
@@ -148,7 +155,7 @@ mod tests {
         let entry_view = EntryView::try_new(&bytes[..]).unwrap();
 
         assert_eq!(entry_view.num_hashes(), entry.num_hashes);
-        assert_eq!(entry_view.hash(), entry.hash);
+        assert_eq!(entry_view.hash(), &entry.hash);
         assert_eq!(entry_view.num_transactions(), entry.transactions.len());
     }
 
@@ -158,7 +165,7 @@ mod tests {
         let entry_view = EntryView::try_new(&bytes[..]).unwrap();
 
         assert_eq!(entry_view.num_hashes(), entry.num_hashes);
-        assert_eq!(entry_view.hash(), entry.hash);
+        assert_eq!(entry_view.hash(), &entry.hash);
         assert_eq!(entry_view.num_transactions(), entry.transactions.len());
 
         let transaction = entry_view.get_transaction(0).unwrap();
@@ -183,7 +190,7 @@ mod tests {
         let entry_view = EntryView::try_new(&bytes[..]).unwrap();
 
         assert_eq!(entry_view.num_hashes(), entry.num_hashes);
-        assert_eq!(entry_view.hash(), entry.hash);
+        assert_eq!(entry_view.hash(), &entry.hash);
         assert_eq!(entry_view.num_transactions(), entry.transactions.len());
 
         for i in 0..entry.transactions.len() {
@@ -208,7 +215,7 @@ mod tests {
         let entry_view = EntryView::try_new(&bytes[..]).unwrap();
 
         assert_eq!(entry_view.num_hashes(), entry.num_hashes);
-        assert_eq!(entry_view.hash(), entry.hash);
+        assert_eq!(entry_view.hash(), &entry.hash);
         assert_eq!(entry_view.num_transactions(), entry.transactions.len());
     }
 }
