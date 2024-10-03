@@ -62,6 +62,20 @@ impl<D: TransactionData> TransactionView<true, D> {
     }
 }
 
+impl<'a, const SANITIZED: bool> TransactionView<SANITIZED, &'a [u8]> {
+    /// Construct a new `TransactionView` from a slice of bytes,
+    /// without running parsing or sanitization checks.
+    /// This is intentionally only exposed to the crate, so that
+    /// the `EntryView` can construct `TransactionView` instances
+    /// on the fly.
+    ///
+    /// # Safety
+    /// - The caller must ensure that the slice of bytes is a valid serialized transaction.
+    pub(crate) unsafe fn from_bytes_unchecked(data: &'a [u8], frame: TransactionFrame) -> Self {
+        Self { data, frame }
+    }
+}
+
 impl<const SANITIZED: bool, D: TransactionData> TransactionView<SANITIZED, D> {
     /// Return the number of signatures in the transaction.
     #[inline]
