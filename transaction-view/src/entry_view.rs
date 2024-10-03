@@ -1,112 +1,100 @@
 use {
     crate::{
-        bytes::{advance_offset_for_type, check_remaining},
+        bytes::{check_remaining, read_type},
         result::{Result, TransactionViewError},
         transaction_data::TransactionData,
         transaction_frame::TransactionFrame,
         transaction_view::{TransactionView, UnsanitizedTransactionView},
     },
     solana_sdk::hash::Hash,
+    std::sync::Arc,
 };
 
-pub struct EntryView<D: TransactionData> {
-    /// Underlying data buffer for the entry.
-    data: D,
-
-    /// The number of hashes in the entry.
-    num_hashes: u64,
-
-    /// List of `TransactionFrame` and starting offsets for
-    /// each transaction in the entry.
-    frames_and_offsets: Vec<(usize, TransactionFrame)>,
+pub trait EntryData: Clone {
+    fn data(&self) -> &[u8];
 }
 
-impl<D: TransactionData> EntryView<D> {
-    pub fn try_new(data: D) -> Result<Self> {
-        let bytes = data.data();
-        let mut offset = 0;
-
-        // `num_hashes` - u64
-        check_remaining(bytes, offset, core::mem::size_of::<u64>())?;
-        let num_hashes = u64::from_le_bytes(
-            bytes[offset..offset + core::mem::size_of::<u64>()]
-                .try_into()
-                .map_err(|_| TransactionViewError::ParseError)?,
-        );
-        offset += core::mem::size_of::<u64>();
-
-        // `hash` - Hash
-        advance_offset_for_type::<Hash>(bytes, &mut offset)?;
-
-        let frames_and_offsets = Self::parse_entry_transactions(bytes, offset)?;
-        Ok(Self {
-            data,
-            num_hashes,
-            frames_and_offsets,
-        })
-    }
-
-    /// Returns the number of hashes in the entry.
+impl EntryData for Arc<Vec<u8>> {
     #[inline]
-    pub fn num_hashes(&self) -> u64 {
-        self.num_hashes
+    fn data(&self) -> &[u8] {
+        self.as_ref()
     }
+}
 
-    /// Returns the hash of the entry.
+pub struct EntryTransactionData<D: EntryData> {
+    data: D,
+    offset: usize,
+}
+
+impl<D: EntryData> TransactionData for EntryTransactionData<D> {
     #[inline]
-    pub fn hash(&self) -> &Hash {
-        const _: () = assert!(core::mem::align_of::<Hash>() == 1, "Hash alignment");
-
-        // SAFETY:
-        // - The pointer is correctly aligned (no alignment constraints).
-        // - `Hash` is just a byte array; there is no possibility the `Hash`
-        //   is not initialized properly.
-        // - Aliasing rules are respected because the lifetime of the returned
-        //   reference is the same as the input/source `bytes`.
-        unsafe { &*(self.data.data().as_ptr().add(core::mem::size_of::<u64>()) as *const Hash) }
+    fn data(&self) -> &[u8] {
+        &self.data.data()[self.offset..]
     }
+}
 
-    /// Get the number of transactions in the entry.
-    #[inline]
-    pub fn num_transactions(&self) -> usize {
-        self.frames_and_offsets.len()
-    }
+pub fn read_entry<D: EntryData>(
+    data: D,
+) -> Result<(
+    u64,
+    Hash,
+    impl ExactSizeIterator<Item = Result<TransactionView<false, EntryTransactionData<D>>>>,
+)> {
+    let mut offset = 0;
+    let (num_hashes, hash, num_transactions) = read_entry_header(data.data(), &mut offset)?;
+    let transactions = (0..num_transactions as usize)
+        .map(move |_| read_transaction_view(data.clone(), &mut offset));
 
-    /// Get the transaction at the given index.
-    /// If the index is out of bounds, `None` is returned.
-    #[inline]
-    pub fn get_transaction(&self, index: usize) -> Option<UnsanitizedTransactionView<&[u8]>> {
-        self.frames_and_offsets.get(index).map(|(offset, frame)| {
-            // SAFETY: The format was checked on construction in `try_new`.
-            unsafe {
-                TransactionView::from_bytes_unchecked(&self.data.data()[*offset..], frame.clone())
-            }
-        })
-    }
+    Ok((num_hashes, hash, transactions))
+}
 
-    #[inline]
-    fn parse_entry_transactions(
-        data: &[u8],
-        mut offset: usize,
-    ) -> Result<Vec<(usize, TransactionFrame)>> {
-        check_remaining(data, offset, core::mem::size_of::<u64>())?;
-        // Read the number of transactions
-        let num_transactions = u64::from_le_bytes(
-            data[offset..offset + core::mem::size_of::<u64>()]
-                .try_into()
-                .map_err(|_| TransactionViewError::ParseError)?,
-        ) as usize;
-        offset += core::mem::size_of::<u64>();
+/// Read the header information from an entry.
+/// This includes:
+/// - `num_hashes` - u64
+/// - `hash` - Hash
+/// - `num_transactions` - u64
+#[inline]
+fn read_entry_header(bytes: &[u8], offset: &mut usize) -> Result<(u64, Hash, u64)> {
+    Ok((
+        read_u64(bytes, offset)?,
+        *unsafe { read_type::<Hash>(bytes, offset)? },
+        read_u64(bytes, offset)?,
+    ))
+}
 
-        let mut frames_and_offsets = Vec::with_capacity(num_transactions);
-        while frames_and_offsets.len() < num_transactions {
-            let (frame, bytes_read) = TransactionFrame::try_new(&data[offset..])?;
-            frames_and_offsets.push((offset, frame));
-            offset += bytes_read;
-        }
+/// This function reads a `u64` WITHOUT assuming the alignment of the data.
+#[inline]
+fn read_u64(bytes: &[u8], offset: &mut usize) -> Result<u64> {
+    check_remaining(bytes, *offset, core::mem::size_of::<u64>())?;
+    let value = u64::from_le_bytes(
+        bytes[*offset..*offset + core::mem::size_of::<u64>()]
+            .try_into()
+            .map_err(|_| TransactionViewError::ParseError)?,
+    );
+    *offset += core::mem::size_of::<u64>();
+    Ok(value)
+}
 
-        Ok(frames_and_offsets)
-    }
+/// This will clone the `data` for each transaction, but this should
+/// be relatively cheap.
+#[inline]
+fn read_transaction_view<D: EntryData>(
+    data: D,
+    offset: &mut usize,
+) -> Result<UnsanitizedTransactionView<EntryTransactionData<D>>> {
+    let (frame, bytes_read) = TransactionFrame::try_new(&data.data()[*offset..])?;
+    // SAFETY: The format was verified by `TransactionFrame::try_new`.
+    let view = unsafe {
+        UnsanitizedTransactionView::from_data_unchecked(
+            EntryTransactionData {
+                data,
+                offset: *offset,
+            },
+            frame,
+        )
+    };
+    *offset += bytes_read;
+    Ok(view)
 }
 
 #[cfg(test)]
@@ -138,37 +126,41 @@ mod tests {
         }
     }
 
-    fn create_entry_and_serialize(transactions: Vec<VersionedTransaction>) -> (Entry, Vec<u8>) {
+    fn create_entry_and_serialize(
+        transactions: Vec<VersionedTransaction>,
+    ) -> (Entry, Arc<Vec<u8>>) {
         let entry = Entry {
             num_hashes: 42,
             hash: Hash::default(),
             transactions,
         };
 
-        let serialized_entry = bincode::serialize(&entry).unwrap();
+        let serialized_entry = Arc::new(bincode::serialize(&entry).unwrap());
         (entry, serialized_entry)
     }
 
     #[test]
     fn test_tick_entry() {
         let (entry, bytes) = create_entry_and_serialize(vec![]);
-        let entry_view = EntryView::try_new(&bytes[..]).unwrap();
+        let (num_hashes, hash, transactions) = read_entry(bytes).unwrap();
+        let transactions = transactions.collect::<Result<Vec<_>>>().unwrap();
 
-        assert_eq!(entry_view.num_hashes(), entry.num_hashes);
-        assert_eq!(entry_view.hash(), &entry.hash);
-        assert_eq!(entry_view.num_transactions(), entry.transactions.len());
+        assert_eq!(num_hashes, entry.num_hashes);
+        assert_eq!(hash, entry.hash);
+        assert_eq!(transactions.len(), entry.transactions.len());
     }
 
     #[test]
     fn test_single_transaction() {
         let (entry, bytes) = create_entry_and_serialize(vec![simple_transfer()]);
-        let entry_view = EntryView::try_new(&bytes[..]).unwrap();
+        let (num_hashes, hash, transactions) = read_entry(bytes).unwrap();
+        let transactions = transactions.collect::<Result<Vec<_>>>().unwrap();
 
-        assert_eq!(entry_view.num_hashes(), entry.num_hashes);
-        assert_eq!(entry_view.hash(), &entry.hash);
-        assert_eq!(entry_view.num_transactions(), entry.transactions.len());
+        assert_eq!(num_hashes, entry.num_hashes);
+        assert_eq!(hash, entry.hash);
+        assert_eq!(transactions.len(), entry.transactions.len());
 
-        let transaction = entry_view.get_transaction(0).unwrap();
+        let transaction = &transactions[0];
         assert_eq!(transaction.signatures().len(), 1);
         assert_eq!(
             transaction
@@ -187,14 +179,14 @@ mod tests {
             simple_transfer(),
             simple_transfer(),
         ]);
-        let entry_view = EntryView::try_new(&bytes[..]).unwrap();
+        let (num_hashes, hash, transactions) = read_entry(bytes).unwrap();
+        let transactions = transactions.collect::<Result<Vec<_>>>().unwrap();
 
-        assert_eq!(entry_view.num_hashes(), entry.num_hashes);
-        assert_eq!(entry_view.hash(), &entry.hash);
-        assert_eq!(entry_view.num_transactions(), entry.transactions.len());
+        assert_eq!(num_hashes, entry.num_hashes);
+        assert_eq!(hash, entry.hash);
+        assert_eq!(transactions.len(), entry.transactions.len());
 
-        for i in 0..entry.transactions.len() {
-            let transaction = entry_view.get_transaction(i).unwrap();
+        for transaction in transactions.iter() {
             assert_eq!(transaction.signatures().len(), 1);
             assert_eq!(
                 transaction
@@ -210,12 +202,13 @@ mod tests {
     #[test]
     fn test_trailing_bytes() {
         let (entry, mut bytes) = create_entry_and_serialize(vec![simple_transfer()]);
-        bytes.push(0); // trailing bytes are okay for entries.
+        Arc::make_mut(&mut bytes).push(0); // trailing bytes are okay for entries.
 
-        let entry_view = EntryView::try_new(&bytes[..]).unwrap();
+        let (num_hashes, hash, transactions) = read_entry(bytes).unwrap();
+        let transactions = transactions.collect::<Result<Vec<_>>>().unwrap();
 
-        assert_eq!(entry_view.num_hashes(), entry.num_hashes);
-        assert_eq!(entry_view.hash(), &entry.hash);
-        assert_eq!(entry_view.num_transactions(), entry.transactions.len());
+        assert_eq!(num_hashes, entry.num_hashes);
+        assert_eq!(hash, entry.hash);
+        assert_eq!(transactions.len(), entry.transactions.len());
     }
 }
