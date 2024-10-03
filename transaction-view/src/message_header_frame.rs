@@ -16,7 +16,7 @@ pub enum TransactionVersion {
 }
 
 /// Metadata for accessing message header fields in a transaction view.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct MessageHeaderFrame {
     /// The offset to the first byte of the message in the transaction packet.
     pub(crate) offset: u16,
