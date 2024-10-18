@@ -722,7 +722,7 @@ mod tests {
             signature::Keypair,
             signer::Signer,
             system_instruction, system_transaction,
-            transaction::VersionedTransaction,
+            transaction::{MessageHash, VersionedTransaction},
         },
         solana_svm_transaction::svm_message::SVMMessage,
         std::{
@@ -1092,7 +1092,7 @@ mod tests {
                     &[&payer],
                 )
                 .unwrap(),
-                None,
+                MessageHash::Compute,
                 None,
                 loader,
                 &HashSet::default(),
