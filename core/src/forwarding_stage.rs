@@ -33,13 +33,14 @@ impl<T: LikeClusterInfo> ForwardingStage<T> {
         poh_recorder: Arc<RwLock<PohRecorder>>,
         cluster_info: T,
         connection_cache: Arc<ConnectionCache>,
+        data_budget: DataBudget,
     ) -> JoinHandle<()> {
         let forwarding_stage = Self {
             receiver,
             poh_recorder,
             cluster_info,
             connection_cache,
-            data_budget: DataBudget::default(),
+            data_budget,
             udp_socket: UdpSocket::bind("0.0.0.0:0").unwrap(),
         };
         Builder::new()
@@ -117,5 +118,194 @@ impl<T: LikeClusterInfo> ForwardingStage<T> {
             .and_then(|batch| batch.iter().next())
             .map(|packet| packet.meta().is_simple_vote_tx())
             .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        crate::{
+            banking_stage::test_utilities::{
+                create_slow_genesis_config_with_leader, new_test_cluster_info,
+            },
+            sigverify::SigverifyTracerPacketStats,
+        },
+        crossbeam_channel::unbounded,
+        solana_client::{connection_cache::ConnectionCache, rpc_client::SerializableTransaction},
+        solana_gossip::cluster_info::{ClusterInfo, Node},
+        solana_ledger::{blockstore::Blockstore, genesis_utils::GenesisConfigInfo},
+        solana_perf::packet::PacketBatch,
+        solana_poh::{poh_recorder::create_test_recorder, poh_service::PohService},
+        solana_runtime::bank::Bank,
+        solana_sdk::{
+            hash::Hash, packet::Packet, poh_config::PohConfig, signature::Keypair, signer::Signer,
+            system_transaction, transaction::VersionedTransaction,
+        },
+        solana_streamer::{
+            nonblocking::testing_utilities::{
+                setup_quic_server_with_sockets, SpawnTestServerResult, TestServerConfig,
+            },
+            quic::rt,
+        },
+        std::{
+            sync::atomic::{AtomicBool, Ordering},
+            time::{Duration, Instant},
+        },
+        tempfile::TempDir,
+        tokio::time::sleep,
+    };
+
+    struct TestSetup {
+        _ledger_dir: TempDir,
+        blockhash: Hash,
+        rent_min_balance: u64,
+        poh_recorder: Arc<RwLock<PohRecorder>>,
+        exit: Arc<AtomicBool>,
+        poh_service: PohService,
+        cluster_info: Arc<ClusterInfo>,
+        local_node: Node,
+    }
+
+    fn setup() -> TestSetup {
+        let validator_keypair = Arc::new(Keypair::new());
+        let genesis_config_info =
+            create_slow_genesis_config_with_leader(10_000, &validator_keypair.pubkey());
+        let GenesisConfigInfo { genesis_config, .. } = &genesis_config_info;
+
+        let (bank, _bank_forks) = Bank::new_no_wallclock_throttle_for_tests(&genesis_config);
+
+        let ledger_path = TempDir::new().unwrap();
+        let blockstore = Arc::new(
+            Blockstore::open(ledger_path.as_ref())
+                .expect("Expected to be able to open database ledger"),
+        );
+        let poh_config = PohConfig {
+            // limit tick count to avoid clearing working_bank at
+            // PohRecord then PohRecorderError(MaxHeightReached) at BankingStage
+            target_tick_count: Some(bank.max_tick_height() - 1),
+            ..PohConfig::default()
+        };
+
+        let (exit, poh_recorder, poh_service, _entry_receiver) =
+            create_test_recorder(bank, blockstore, Some(poh_config), None);
+
+        let (local_node, cluster_info) = new_test_cluster_info(Some(validator_keypair));
+        let cluster_info = Arc::new(cluster_info);
+
+        TestSetup {
+            _ledger_dir: ledger_path,
+            blockhash: genesis_config.hash(),
+            rent_min_balance: genesis_config.rent.minimum_balance(0),
+            poh_recorder,
+            exit,
+            poh_service,
+            cluster_info,
+            local_node,
+        }
+    }
+
+    async fn check_all_received(
+        socket: UdpSocket,
+        expected_num_packets: usize,
+        expected_packet_size: usize,
+        expected_blockhash: &Hash,
+    ) {
+        let SpawnTestServerResult {
+            join_handle,
+            exit,
+            receiver,
+            server_address: _,
+            stats: _,
+        } = setup_quic_server_with_sockets(vec![socket], None, TestServerConfig::default());
+
+        let now = Instant::now();
+        let mut total_packets = 0;
+        while now.elapsed().as_secs() < 5 {
+            if let Ok(packets) = receiver.try_recv() {
+                total_packets += packets.len();
+                for packet in packets.iter() {
+                    assert_eq!(packet.meta().size, expected_packet_size);
+                    let tx: VersionedTransaction = packet.deserialize_slice(..).unwrap();
+                    assert_eq!(
+                        tx.get_recent_blockhash(),
+                        expected_blockhash,
+                        "Unexpected blockhash, tx: {tx:?}, expected blockhash: {expected_blockhash}."
+                    );
+                }
+            } else {
+                sleep(Duration::from_millis(100)).await;
+            }
+            if total_packets >= expected_num_packets {
+                break;
+            }
+        }
+        assert_eq!(total_packets, expected_num_packets);
+
+        exit.store(true, Ordering::Relaxed);
+        join_handle.await.unwrap();
+    }
+
+    #[test]
+    fn test_forwarder_budget() {
+        let TestSetup {
+            blockhash,
+            rent_min_balance,
+            poh_recorder,
+            exit,
+            poh_service,
+            cluster_info,
+            local_node,
+            ..
+        } = setup();
+
+        // Create `PacketBatch` with 1 unprocessed packet
+        let tx = system_transaction::transfer(
+            &Keypair::new(),
+            &solana_sdk::pubkey::new_rand(),
+            rent_min_balance,
+            blockhash,
+        );
+        let mut packet = Packet::from_data(None, tx).unwrap();
+        // unstaked transactions will not be forwarded
+        packet.meta_mut().set_from_staked_node(true);
+        let expected_packet_size = packet.meta().size;
+        let packet_batches = vec![PacketBatch::new(vec![packet])];
+
+        let test_cases = vec![
+            ("budget-restricted", DataBudget::restricted(), 0),
+            ("budget-available", DataBudget::default(), 1),
+        ];
+        let runtime = rt("solQuicTestRt".to_string());
+        let connection_cache = Arc::new(ConnectionCache::new("connection_cache_test"));
+        for (_name, data_budget, expected_num_forwarded) in test_cases {
+            let (forward_stage_sender, forward_stage_receiver) = unbounded();
+            let forwarding_stage = ForwardingStage::spawn(
+                forward_stage_receiver,
+                poh_recorder.clone(),
+                cluster_info.clone(),
+                connection_cache.clone(),
+                data_budget,
+            );
+            let tracer_packet_stats_to_send = SigverifyTracerPacketStats::default();
+            let banking_packet_batch = BankingPacketBatch::new((
+                packet_batches.clone(),
+                Some(tracer_packet_stats_to_send),
+            ));
+            forward_stage_sender.send(banking_packet_batch).unwrap();
+
+            let recv_socket = &local_node.sockets.tpu_forwards_quic[0];
+            runtime.block_on(check_all_received(
+                (*recv_socket).try_clone().unwrap(),
+                expected_num_forwarded,
+                expected_packet_size,
+                &blockhash,
+            ));
+            drop(forward_stage_sender);
+            forwarding_stage.join().unwrap();
+        }
+
+        exit.store(true, Ordering::Relaxed);
+        poh_service.join().unwrap();
     }
 }

@@ -737,19 +737,59 @@ impl BankingStage {
 }
 
 #[cfg(test)]
+pub mod test_utilities {
+    use {
+        super::*,
+        solana_gossip::cluster_info::Node,
+        solana_ledger::genesis_utils::{create_genesis_config_with_leader, GenesisConfigInfo},
+        solana_runtime::genesis_utils::bootstrap_validator_stake_lamports,
+        solana_sdk::{
+            pubkey::Pubkey,
+            signature::{Keypair, Signer},
+        },
+        solana_streamer::socket::SocketAddrSpace,
+    };
+
+    pub fn new_test_cluster_info(keypair: Option<Arc<Keypair>>) -> (Node, ClusterInfo) {
+        let keypair = keypair.unwrap_or_else(|| Arc::new(Keypair::new()));
+        let node = Node::new_localhost_with_pubkey(&keypair.pubkey());
+        let cluster_info =
+            ClusterInfo::new(node.info.clone(), keypair, SocketAddrSpace::Unspecified);
+        (node, cluster_info)
+    }
+    pub fn create_slow_genesis_config_with_leader(
+        lamports: u64,
+        validator_pubkey: &Pubkey,
+    ) -> GenesisConfigInfo {
+        let mut config_info = create_genesis_config_with_leader(
+            lamports,
+            validator_pubkey,
+            // See solana_ledger::genesis_utils::create_genesis_config.
+            bootstrap_validator_stake_lamports(),
+        );
+
+        // For these tests there's only 1 slot, don't want to run out of ticks
+        config_info.genesis_config.ticks_per_slot *= 8;
+        config_info
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use {
         super::*,
-        crate::banking_trace::{BankingPacketBatch, BankingTracer},
+        crate::{
+            banking_stage::test_utilities::{
+                create_slow_genesis_config_with_leader, new_test_cluster_info,
+            },
+            banking_trace::{BankingPacketBatch, BankingTracer},
+        },
         crossbeam_channel::{unbounded, Receiver},
         itertools::Itertools,
         solana_entry::entry::{self, Entry, EntrySlice},
-        solana_gossip::cluster_info::Node,
         solana_ledger::{
             blockstore::Blockstore,
-            genesis_utils::{
-                create_genesis_config, create_genesis_config_with_leader, GenesisConfigInfo,
-            },
+            genesis_utils::{create_genesis_config, GenesisConfigInfo},
             get_tmp_ledger_path_auto_delete,
             leader_schedule_cache::LeaderScheduleCache,
         },
@@ -760,16 +800,14 @@ mod tests {
             },
             poh_service::PohService,
         },
-        solana_runtime::{bank::Bank, genesis_utils::bootstrap_validator_stake_lamports},
+        solana_runtime::bank::Bank,
         solana_sdk::{
             hash::Hash,
             poh_config::PohConfig,
-            pubkey::Pubkey,
             signature::{Keypair, Signer},
             system_transaction,
             transaction::{SanitizedTransaction, Transaction},
         },
-        solana_streamer::socket::SocketAddrSpace,
         solana_vote_program::{
             vote_state::TowerSync, vote_transaction::new_tower_sync_transaction,
         },
@@ -778,14 +816,6 @@ mod tests {
             thread::sleep,
         },
     };
-
-    pub(crate) fn new_test_cluster_info(keypair: Option<Arc<Keypair>>) -> (Node, ClusterInfo) {
-        let keypair = keypair.unwrap_or_else(|| Arc::new(Keypair::new()));
-        let node = Node::new_localhost_with_pubkey(&keypair.pubkey());
-        let cluster_info =
-            ClusterInfo::new(node.info.clone(), keypair, SocketAddrSpace::Unspecified);
-        (node, cluster_info)
-    }
 
     pub(crate) fn sanitize_transactions(txs: Vec<Transaction>) -> Vec<SanitizedTransaction> {
         txs.into_iter()
@@ -1233,22 +1263,6 @@ mod tests {
 
     pub(crate) fn create_slow_genesis_config(lamports: u64) -> GenesisConfigInfo {
         create_slow_genesis_config_with_leader(lamports, &solana_sdk::pubkey::new_rand())
-    }
-
-    pub(crate) fn create_slow_genesis_config_with_leader(
-        lamports: u64,
-        validator_pubkey: &Pubkey,
-    ) -> GenesisConfigInfo {
-        let mut config_info = create_genesis_config_with_leader(
-            lamports,
-            validator_pubkey,
-            // See solana_ledger::genesis_utils::create_genesis_config.
-            bootstrap_validator_stake_lamports(),
-        );
-
-        // For these tests there's only 1 slot, don't want to run out of ticks
-        config_info.genesis_config.ticks_per_slot *= 8;
-        config_info
     }
 
     pub(crate) fn simulate_poh(

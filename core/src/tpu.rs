@@ -1,6 +1,7 @@
 //! The `tpu` module implements the Transaction Processing Unit, a
 //! multi-stage transaction processing pipeline in software.
 
+use solana_perf::data_budget::DataBudget;
 pub use solana_sdk::net::DEFAULT_TPU_COALESCE;
 use {
     crate::{
@@ -261,6 +262,7 @@ impl Tpu {
             poh_recorder.clone(),
             cluster_info.clone(),
             connection_cache.clone(),
+            DataBudget::default(),
         );
 
         let (entry_receiver, tpu_entry_notifier) =
