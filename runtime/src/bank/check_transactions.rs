@@ -24,10 +24,7 @@ use {
         nonce_info::NonceInfo,
         transaction_error_metrics::TransactionErrorMetrics,
     },
-    solana_svm_transaction::{
-        nonce_extraction::{get_durable_nonce, get_ix_signers},
-        svm_message::SVMMessage,
-    },
+    solana_svm_transaction::svm_message::SVMMessage,
 };
 
 impl Bank {
@@ -170,12 +167,13 @@ impl Bank {
         &self,
         message: &impl SVMMessage,
     ) -> Option<(Pubkey, AccountSharedData, NonceData)> {
-        let nonce_address = get_durable_nonce(message)?;
+        let nonce_address = message.get_durable_nonce()?;
         let nonce_account = self.get_account_with_fixed_root(nonce_address)?;
         let nonce_data =
             nonce_account::verify_nonce_account(&nonce_account, message.recent_blockhash())?;
 
-        let nonce_is_authorized = get_ix_signers(message, NONCED_TX_MARKER_IX_INDEX as usize)
+        let nonce_is_authorized = message
+            .get_ix_signers(NONCED_TX_MARKER_IX_INDEX as usize)
             .any(|signer| signer == &nonce_data.authority);
         if !nonce_is_authorized {
             return None;
