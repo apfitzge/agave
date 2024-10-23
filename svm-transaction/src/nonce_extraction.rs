@@ -1,59 +1,8 @@
-//! Functionality derived from the `SVMMessage` base functions.
-//!
-
-use {
-    crate::svm_message::SVMMessage,
-    solana_sdk::{nonce::NONCED_TX_MARKER_IX_INDEX, pubkey::Pubkey, system_program},
-};
-
-/// If the message uses a durable nonce, return the pubkey of the nonce account
-pub fn get_durable_nonce(message: &(impl SVMMessage + ?Sized)) -> Option<&Pubkey> {
-    let account_keys = message.account_keys();
-    message
-        .instructions_iter()
-        .nth(usize::from(NONCED_TX_MARKER_IX_INDEX))
-        .filter(
-            |ix| match account_keys.get(usize::from(ix.program_id_index)) {
-                Some(program_id) => system_program::check_id(program_id),
-                _ => false,
-            },
-        )
-        .filter(|ix| is_advance_nonce_account_instruction(ix.data))
-        .and_then(|ix| {
-            ix.accounts.first().and_then(|idx| {
-                let index = usize::from(*idx);
-                if !message.is_writable(index) {
-                    None
-                } else {
-                    account_keys.get(index)
-                }
-            })
-        })
-}
-
-/// For the instruction at `index`, return an iterator over input accounts
-/// that are signers.
-pub fn get_ix_signers(
-    message: &(impl SVMMessage + ?Sized),
-    index: usize,
-) -> impl Iterator<Item = &Pubkey> {
-    message
-        .instructions_iter()
-        .nth(index)
-        .into_iter()
-        .flat_map(|ix| {
-            ix.accounts
-                .iter()
-                .copied()
-                .map(usize::from)
-                .filter(|index| message.is_signer(*index))
-                .filter_map(|signer_index| message.account_keys().get(signer_index))
-        })
-}
-
 /// Serialized value of [`SystemInstruction::AdvanceNonceAccount`].
 const SERIALIZED_ADVANCE_NONCE_ACCOUNT: [u8; 4] = 4u32.to_le_bytes();
-fn is_advance_nonce_account_instruction(data: &[u8]) -> bool {
+
+#[inline]
+pub(crate) fn is_advance_nonce_account_instruction(data: &[u8]) -> bool {
     const SERIALIZED_SIZE: usize = 4;
     data.get(..SERIALIZED_SIZE)
         .map(|data| data == SERIALIZED_ADVANCE_NONCE_ACCOUNT)
@@ -64,6 +13,7 @@ fn is_advance_nonce_account_instruction(data: &[u8]) -> bool {
 mod tests {
     use {
         super::*,
+        crate::svm_message::SVMMessage,
         solana_sdk::{
             hash::Hash,
             instruction::CompiledInstruction,
@@ -73,7 +23,9 @@ mod tests {
                 MessageHeader, SanitizedMessage, SanitizedVersionedMessage, SimpleAddressLoader,
                 VersionedMessage,
             },
+            pubkey::Pubkey,
             system_instruction::SystemInstruction,
+            system_program,
         },
         std::collections::HashSet,
     };
@@ -133,8 +85,8 @@ mod tests {
         // No instructions - no nonce
         {
             let message = create_message_for_test(1, 1, vec![Pubkey::new_unique()], vec![], None);
-            assert!(message.get_durable_nonce().is_none());
-            assert!(get_durable_nonce(&message).is_none());
+            assert!(SanitizedMessage::get_durable_nonce(&message).is_none());
+            assert!(SVMMessage::get_durable_nonce(&message).is_none());
         }
 
         // system program id instruction - invalid
@@ -146,8 +98,8 @@ mod tests {
                 vec![CompiledInstruction::new_from_raw_parts(1, vec![], vec![])],
                 None,
             );
-            assert!(message.get_durable_nonce().is_none());
-            assert!(get_durable_nonce(&message).is_none());
+            assert!(SanitizedMessage::get_durable_nonce(&message).is_none());
+            assert!(SVMMessage::get_durable_nonce(&message).is_none());
         }
 
         // system program id instruction - not nonce
@@ -163,8 +115,8 @@ mod tests {
                 )],
                 None,
             );
-            assert!(message.get_durable_nonce().is_none());
-            assert!(get_durable_nonce(&message).is_none());
+            assert!(SanitizedMessage::get_durable_nonce(&message).is_none());
+            assert!(SVMMessage::get_durable_nonce(&message).is_none());
         }
 
         // system program id - nonce instruction (no accounts)
@@ -180,8 +132,8 @@ mod tests {
                 )],
                 None,
             );
-            assert!(message.get_durable_nonce().is_none());
-            assert!(get_durable_nonce(&message).is_none());
+            assert!(SanitizedMessage::get_durable_nonce(&message).is_none());
+            assert!(SVMMessage::get_durable_nonce(&message).is_none());
         }
 
         // system program id - nonce instruction (non-fee-payer, non-writable)
@@ -199,8 +151,8 @@ mod tests {
                 )],
                 None,
             );
-            assert!(message.get_durable_nonce().is_none());
-            assert!(get_durable_nonce(&message).is_none());
+            assert!(SanitizedMessage::get_durable_nonce(&message).is_none());
+            assert!(SVMMessage::get_durable_nonce(&message).is_none());
         }
 
         // system program id - nonce instruction fee-payer
@@ -217,8 +169,11 @@ mod tests {
                 )],
                 None,
             );
-            assert_eq!(message.get_durable_nonce(), Some(&payer_nonce));
-            assert_eq!(get_durable_nonce(&message), Some(&payer_nonce));
+            assert_eq!(
+                SanitizedMessage::get_durable_nonce(&message),
+                Some(&payer_nonce)
+            );
+            assert_eq!(SVMMessage::get_durable_nonce(&message), Some(&payer_nonce));
         }
 
         // system program id - nonce instruction w/ trailing bytes fee-payer
@@ -237,8 +192,11 @@ mod tests {
                 )],
                 None,
             );
-            assert_eq!(message.get_durable_nonce(), Some(&payer_nonce));
-            assert_eq!(get_durable_nonce(&message), Some(&payer_nonce));
+            assert_eq!(
+                SanitizedMessage::get_durable_nonce(&message),
+                Some(&payer_nonce)
+            );
+            assert_eq!(SVMMessage::get_durable_nonce(&message), Some(&payer_nonce));
         }
 
         // system program id - nonce instruction (non-fee-payer)
@@ -256,8 +214,8 @@ mod tests {
                 )],
                 None,
             );
-            assert_eq!(message.get_durable_nonce(), Some(&nonce));
-            assert_eq!(get_durable_nonce(&message), Some(&nonce));
+            assert_eq!(SanitizedMessage::get_durable_nonce(&message), Some(&nonce));
+            assert_eq!(SVMMessage::get_durable_nonce(&message), Some(&nonce));
         }
 
         // system program id - nonce instruction (non-fee-payer, multiple accounts)
@@ -276,8 +234,8 @@ mod tests {
                 )],
                 None,
             );
-            assert_eq!(message.get_durable_nonce(), Some(&nonce));
-            assert_eq!(get_durable_nonce(&message), Some(&nonce));
+            assert_eq!(SanitizedMessage::get_durable_nonce(&message), Some(&nonce));
+            assert_eq!(SVMMessage::get_durable_nonce(&message), Some(&nonce));
         }
 
         // system program id - nonce instruction (non-fee-payer, loaded account)
@@ -298,8 +256,8 @@ mod tests {
                     readonly: vec![],
                 }),
             );
-            assert_eq!(message.get_durable_nonce(), Some(&nonce));
-            assert_eq!(get_durable_nonce(&message), Some(&nonce));
+            assert_eq!(SanitizedMessage::get_durable_nonce(&message), Some(&nonce));
+            assert_eq!(SVMMessage::get_durable_nonce(&message), Some(&nonce));
         }
     }
 
@@ -329,19 +287,19 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            get_ix_signers(&message, 0).collect::<HashSet<_>>(),
+            SVMMessage::get_ix_signers(&message, 0).collect::<HashSet<_>>(),
             HashSet::from_iter([&signer0])
         );
         assert_eq!(
-            get_ix_signers(&message, 1).collect::<HashSet<_>>(),
+            SVMMessage::get_ix_signers(&message, 1).collect::<HashSet<_>>(),
             HashSet::from_iter([&signer0, &signer1])
         );
         assert_eq!(
-            get_ix_signers(&message, 2).collect::<HashSet<_>>(),
+            SVMMessage::get_ix_signers(&message, 2).collect::<HashSet<_>>(),
             HashSet::from_iter([&signer0])
         );
         assert_eq!(
-            get_ix_signers(&message, 3).collect::<HashSet<_>>(),
+            SVMMessage::get_ix_signers(&message, 3).collect::<HashSet<_>>(),
             HashSet::default()
         );
     }
