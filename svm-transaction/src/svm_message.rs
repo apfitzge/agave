@@ -1,6 +1,8 @@
 use {
     crate::{
-        instruction::SVMInstruction, message_address_table_lookup::SVMMessageAddressTableLookup,
+        instruction::SVMInstruction,
+        message_address_table_lookup::SVMMessageAddressTableLookup,
+        nonce_extraction::{get_durable_nonce, get_ix_signers},
     },
     core::fmt::Debug,
     solana_sdk::{hash::Hash, message::AccountKeys, pubkey::Pubkey},
@@ -58,6 +60,17 @@ pub trait SVMMessage: Debug {
         } else {
             false
         }
+    }
+
+    /// If the message uses a durable nonce, return the pubkey of the nonce account
+    fn get_durable_nonce(&self) -> Option<&Pubkey> {
+        get_durable_nonce(self)
+    }
+
+    /// For the instruction at `index`, return an iterator over input accounts
+    /// that are signers.
+    fn get_ix_signers(&self, index: usize) -> impl Iterator<Item = &Pubkey> {
+        get_ix_signers(self, index)
     }
 
     /// Get the number of lookup tables.

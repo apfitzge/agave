@@ -7,7 +7,7 @@ use {
 };
 
 /// If the message uses a durable nonce, return the pubkey of the nonce account
-pub fn get_durable_nonce(message: &impl SVMMessage) -> Option<&Pubkey> {
+pub fn get_durable_nonce(message: &(impl SVMMessage + ?Sized)) -> Option<&Pubkey> {
     let account_keys = message.account_keys();
     message
         .instructions_iter()
@@ -33,7 +33,10 @@ pub fn get_durable_nonce(message: &impl SVMMessage) -> Option<&Pubkey> {
 
 /// For the instruction at `index`, return an iterator over input accounts
 /// that are signers.
-pub fn get_ix_signers(message: &impl SVMMessage, index: usize) -> impl Iterator<Item = &Pubkey> {
+pub fn get_ix_signers(
+    message: &(impl SVMMessage + ?Sized),
+    index: usize,
+) -> impl Iterator<Item = &Pubkey> {
     message
         .instructions_iter()
         .nth(index)
