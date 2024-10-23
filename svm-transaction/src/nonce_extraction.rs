@@ -2,12 +2,8 @@
 //!
 
 use {
-    solana_program::program_utils::limited_deserialize,
-    solana_sdk::{
-        nonce::NONCED_TX_MARKER_IX_INDEX, pubkey::Pubkey, system_instruction::SystemInstruction,
-        system_program,
-    },
-    solana_svm_transaction::svm_message::SVMMessage,
+    crate::svm_message::SVMMessage,
+    solana_sdk::{nonce::NONCED_TX_MARKER_IX_INDEX, pubkey::Pubkey, system_program},
 };
 
 /// If the message uses a durable nonce, return the pubkey of the nonce account
@@ -22,12 +18,7 @@ pub fn get_durable_nonce(message: &impl SVMMessage) -> Option<&Pubkey> {
                 _ => false,
             },
         )
-        .filter(|ix| {
-            matches!(
-                limited_deserialize(ix.data, 4 /* serialized size of AdvanceNonceAccount */),
-                Ok(SystemInstruction::AdvanceNonceAccount)
-            )
-        })
+        .filter(|ix| is_advance_nonce_account_instruction(ix.data))
         .and_then(|ix| {
             ix.accounts.first().and_then(|idx| {
                 let index = usize::from(*idx);
@@ -57,6 +48,15 @@ pub fn get_ix_signers(message: &impl SVMMessage, index: usize) -> impl Iterator<
         })
 }
 
+/// Serialized value of [`SystemInstruction::AdvanceNonceAccount`].
+const SERIALIZED_ADVANCE_NONCE_ACCOUNT: [u8; 4] = 4u32.to_le_bytes();
+fn is_advance_nonce_account_instruction(data: &[u8]) -> bool {
+    const SERIALIZED_SIZE: usize = 4;
+    data.get(..SERIALIZED_SIZE)
+        .map(|data| data == SERIALIZED_ADVANCE_NONCE_ACCOUNT)
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use {
@@ -70,6 +70,7 @@ mod tests {
                 MessageHeader, SanitizedMessage, SanitizedVersionedMessage, SimpleAddressLoader,
                 VersionedMessage,
             },
+            system_instruction::SystemInstruction,
         },
         std::collections::HashSet,
     };
@@ -220,8 +221,7 @@ mod tests {
         // system program id - nonce instruction w/ trailing bytes fee-payer
         {
             let payer_nonce = Pubkey::new_unique();
-            let mut instruction_bytes =
-                bincode::serialize(&SystemInstruction::AdvanceNonceAccount).unwrap();
+            let mut instruction_bytes = SERIALIZED_ADVANCE_NONCE_ACCOUNT.to_vec();
             instruction_bytes.push(0); // add a trailing byte
             let message = create_message_for_test(
                 1,

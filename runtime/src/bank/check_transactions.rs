@@ -1,6 +1,5 @@
 use {
     super::{Bank, BankStatusCache},
-    crate::nonce_extraction::{get_durable_nonce, get_ix_signers},
     solana_accounts_db::blockhash_queue::BlockhashQueue,
     solana_perf::perf_libs,
     solana_sdk::{
@@ -25,7 +24,10 @@ use {
         nonce_info::NonceInfo,
         transaction_error_metrics::TransactionErrorMetrics,
     },
-    solana_svm_transaction::svm_message::SVMMessage,
+    solana_svm_transaction::{
+        nonce_extraction::{get_durable_nonce, get_ix_signers},
+        svm_message::SVMMessage,
+    },
 };
 
 impl Bank {
