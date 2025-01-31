@@ -5,7 +5,8 @@ use {
         scheduler_messages::{ConsumeWork, FinishedConsumeWork},
     },
     crate::banking_stage::consumer::RetryableIndex,
-    crossbeam_channel::{Receiver, RecvError, SendError, Sender},
+    crossbeam_channel::{Receiver, SendError, Sender, TryRecvError},
+    solana_clock::DEFAULT_MS_PER_SLOT,
     solana_measure::measure_us,
     solana_poh::leader_bank_notifier::LeaderBankNotifier,
     solana_runtime::bank::Bank,
@@ -17,7 +18,7 @@ use {
             atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
             Arc,
         },
-        time::Duration,
+        time::{Duration, Instant},
     },
     thiserror::Error,
 };
@@ -25,7 +26,7 @@ use {
 #[derive(Debug, Error)]
 pub enum ConsumeWorkerError<Tx> {
     #[error("Failed to receive work from scheduler: {0}")]
-    Recv(#[from] RecvError),
+    Recv(#[from] TryRecvError),
     #[error("Failed to send finalized consume work to scheduler: {0}")]
     Send(#[from] SendError<FinishedConsumeWork<Tx>>),
 }
@@ -61,9 +62,28 @@ impl<Tx: TransactionWithMeta> ConsumeWorker<Tx> {
     }
 
     pub fn run(self, reservation_cb: impl Fn(&Bank) -> u64) -> Result<(), ConsumeWorkerError<Tx>> {
+        let mut last_recv = Instant::now();
         loop {
-            let work = self.consume_receiver.recv()?;
-            self.consume_loop(work, &reservation_cb)?;
+            let now = Instant::now();
+            match self.consume_receiver.try_recv() {
+                Ok(work) => {
+                    last_recv = now;
+                    self.consume_loop(work, &reservation_cb)?;
+                }
+                Err(TryRecvError::Empty) => {
+                    // Don't sleep on empty immediately, only if we have not received
+                    // work for a while (1 slot).
+                    const SLEEP_THRESHOLD: Duration = Duration::from_millis(DEFAULT_MS_PER_SLOT);
+                    // Sleep a short duration between checks to avoid busy waiting.
+                    const SLEEP_DURATION: Duration = Duration::from_millis(1);
+                    if now.duration_since(last_recv) > SLEEP_THRESHOLD {
+                        std::thread::sleep(SLEEP_DURATION);
+                    }
+                }
+                Err(err) => {
+                    return Err(ConsumeWorkerError::from(err));
+                }
+            }
         }
     }
 
