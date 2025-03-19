@@ -2,7 +2,7 @@ use {
     crate::{
         address_table_lookup_frame::{AddressTableLookupFrame, AddressTableLookupIterator},
         bytes::advance_offset_for_type,
-        instructions_frame::{InstructionsFrame, InstructionsIterator},
+        instructions_frame::{InstructionOffsetAndLens, InstructionsFrame, InstructionsIterator},
         message_header_frame::MessageHeaderFrame,
         result::{Result, TransactionViewError},
         signature_frame::SignatureFrame,
@@ -12,6 +12,7 @@ use {
     solana_hash::Hash,
     solana_pubkey::Pubkey,
     solana_signature::Signature,
+    std::sync::Arc,
 };
 
 #[derive(Debug)]
@@ -34,6 +35,16 @@ impl TransactionFrame {
     /// Parse a serialized transaction and verify basic structure.
     /// The `bytes` parameter must have no trailing data.
     pub(crate) fn try_new(bytes: &[u8]) -> Result<Self> {
+        let mut cache = Arc::default();
+        Self::try_new_with_cache(bytes, &mut cache)
+    }
+
+    /// Parse a serialized transaction and verify basic structure.
+    /// The `bytes` parameter must have no trailing data.
+    pub(crate) fn try_new_with_cache(
+        bytes: &[u8],
+        cache: &mut Arc<Vec<InstructionOffsetAndLens>>,
+    ) -> Result<Self> {
         let mut offset = 0;
         let signature = SignatureFrame::try_new(bytes, &mut offset)?;
         let message_header = MessageHeaderFrame::try_new(bytes, &mut offset)?;
@@ -45,7 +56,7 @@ impl TransactionFrame {
         let recent_blockhash_offset = offset as u16;
         advance_offset_for_type::<Hash>(bytes, &mut offset)?;
 
-        let instructions = InstructionsFrame::try_new(bytes, &mut offset)?;
+        let instructions = InstructionsFrame::try_new_with_cache(bytes, &mut offset, cache)?;
         let address_table_lookup = match message_header.version {
             TransactionVersion::Legacy => AddressTableLookupFrame {
                 num_address_table_lookups: 0,

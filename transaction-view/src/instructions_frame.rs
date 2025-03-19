@@ -8,6 +8,7 @@ use {
     },
     core::fmt::{Debug, Formatter},
     solana_svm_transaction::instruction::SVMInstruction,
+    std::sync::Arc,
 };
 
 /// Contains metadata about the instructions in a transaction packet.
@@ -17,11 +18,11 @@ pub(crate) struct InstructionsFrame {
     pub(crate) num_instructions: u16,
     /// The offset to the first instruction in the transaction.
     pub(crate) offset: u16,
-    pub(crate) cached_offsets_and_lens: Vec<InstructionOffsetAndLens>,
+    pub(crate) cached_offsets_and_lens: Arc<Vec<InstructionOffsetAndLens>>,
 }
 
 #[derive(Debug)]
-pub(crate) struct InstructionOffsetAndLens {
+pub struct InstructionOffsetAndLens {
     num_accounts: u16,
     accounts_offset: u16,
     data_len: u16,
@@ -29,6 +30,12 @@ pub(crate) struct InstructionOffsetAndLens {
 }
 
 impl InstructionsFrame {
+    #[cfg(test)]
+    pub(crate) fn try_new(bytes: &[u8], offset: &mut usize) -> Result<Self> {
+        let mut cache = Arc::default();
+        Self::try_new_with_cache(bytes, offset, &mut cache)
+    }
+
     /// Get the number of instructions and offset to the first instruction.
     /// The offset will be updated to point to the first byte after the last
     /// instruction.
@@ -36,7 +43,11 @@ impl InstructionsFrame {
     /// instruction data is well-formed, but will not cache data related to
     /// these instructions.
     #[inline(always)]
-    pub(crate) fn try_new(bytes: &[u8], offset: &mut usize) -> Result<Self> {
+    pub(crate) fn try_new_with_cache(
+        bytes: &[u8],
+        offset: &mut usize,
+        cache: &mut Arc<Vec<InstructionOffsetAndLens>>,
+    ) -> Result<Self> {
         // Read the number of instructions at the current offset.
         // Each instruction needs at least 3 bytes, so do a sanity check here to
         // ensure we have enough bytes to read the number of instructions.
@@ -52,7 +63,7 @@ impl InstructionsFrame {
         let instructions_offset = *offset as u16;
 
         // Pre-allocate buffer for cached offsets and lengths.
-        let mut cached_offsets_and_lens = Vec::with_capacity(usize::from(num_instructions));
+        let cached_offsets_and_lens = Arc::get_mut(cache).expect("exclusive access");
 
         // The instructions do not have a fixed size. So we must iterate over
         // each instruction to find the total size of the instructions,
@@ -89,7 +100,7 @@ impl InstructionsFrame {
         Ok(Self {
             num_instructions,
             offset: instructions_offset,
-            cached_offsets_and_lens,
+            cached_offsets_and_lens: Arc::clone(cache),
         })
     }
 }

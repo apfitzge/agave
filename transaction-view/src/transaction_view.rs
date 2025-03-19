@@ -1,8 +1,11 @@
 use {
     crate::{
         address_table_lookup_frame::AddressTableLookupIterator,
-        instructions_frame::InstructionsIterator, result::Result, sanitize::sanitize,
-        transaction_data::TransactionData, transaction_frame::TransactionFrame,
+        instructions_frame::{InstructionOffsetAndLens, InstructionsIterator},
+        result::Result,
+        sanitize::sanitize,
+        transaction_data::TransactionData,
+        transaction_frame::TransactionFrame,
         transaction_version::TransactionVersion,
     },
     core::fmt::{Debug, Formatter},
@@ -10,6 +13,7 @@ use {
     solana_pubkey::Pubkey,
     solana_signature::Signature,
     solana_svm_transaction::instruction::SVMInstruction,
+    std::sync::Arc,
 };
 
 // alias for convenience
@@ -35,6 +39,15 @@ impl<D: TransactionData> TransactionView<false, D> {
         Ok(Self { data, frame })
     }
 
+    /// Creates a new `TransactionView` without running sanitization checks.
+    pub fn try_new_unsanitized_with_cache(
+        data: D,
+        cache: &mut Arc<Vec<InstructionOffsetAndLens>>,
+    ) -> Result<Self> {
+        let frame = TransactionFrame::try_new_with_cache(data.data(), cache)?;
+        Ok(Self { data, frame })
+    }
+
     /// Sanitizes the transaction view, returning a sanitized view on success.
     pub fn sanitize(self) -> Result<SanitizedTransactionView<D>> {
         sanitize(&self)?;
@@ -49,6 +62,15 @@ impl<D: TransactionData> TransactionView<true, D> {
     /// Creates a new `TransactionView`, running sanitization checks.
     pub fn try_new_sanitized(data: D) -> Result<Self> {
         let unsanitized_view = TransactionView::try_new_unsanitized(data)?;
+        unsanitized_view.sanitize()
+    }
+
+    /// Creates a new `TransactionView`, running sanitization checks.
+    pub fn try_new_sanitized_with_cache(
+        data: D,
+        cache: &mut Arc<Vec<InstructionOffsetAndLens>>,
+    ) -> Result<Self> {
+        let unsanitized_view = TransactionView::try_new_unsanitized_with_cache(data, cache)?;
         unsanitized_view.sanitize()
     }
 }
