@@ -64,6 +64,7 @@ impl InstructionsFrame {
 
         // Pre-allocate buffer for cached offsets and lengths.
         let cached_offsets_and_lens = Arc::get_mut(cache).expect("exclusive access");
+        cached_offsets_and_lens.clear();
 
         // The instructions do not have a fixed size. So we must iterate over
         // each instruction to find the total size of the instructions,
