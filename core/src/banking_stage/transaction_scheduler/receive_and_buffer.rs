@@ -18,6 +18,7 @@ use {
     },
     agave_banking_stage_ingress_types::{BankingPacketBatch, BankingPacketReceiver},
     agave_transaction_view::{
+        instructions_frame::InstructionOffsetAndLens,
         resolved_transaction_view::ResolvedTransactionView,
         transaction_version::TransactionVersion, transaction_view::SanitizedTransactionView,
     },
@@ -472,9 +473,10 @@ impl TransactionViewReceiveAndBuffer {
 
                 // Reserve free-space to copy packet into, run sanitization checks, and insert.
                 if let Some(transaction_id) =
-                    container.try_insert_map_only_with_data(packet_data, |bytes| {
+                    container.try_insert_map_only_with_data(packet_data, |bytes, cache| {
                         match Self::try_handle_packet(
                             bytes,
+                            cache,
                             root_bank,
                             working_bank,
                             alt_resolved_slot,
@@ -533,6 +535,7 @@ impl TransactionViewReceiveAndBuffer {
 
     fn try_handle_packet(
         bytes: SharedBytes,
+        cache: &mut Arc<Vec<InstructionOffsetAndLens>>,
         root_bank: &Bank,
         working_bank: &Bank,
         alt_resolved_slot: Slot,
@@ -540,7 +543,7 @@ impl TransactionViewReceiveAndBuffer {
         transaction_account_lock_limit: usize,
     ) -> Result<TransactionViewState, ()> {
         // Parsing and basic sanitization checks
-        let Ok(view) = SanitizedTransactionView::try_new_sanitized(bytes) else {
+        let Ok(view) = SanitizedTransactionView::try_new_sanitized_with_cache(bytes, cache) else {
             return Err(());
         };
 

@@ -3,7 +3,10 @@ use qualifier_attr::qualifiers;
 use {
     super::{transaction_priority_id::TransactionPriorityId, transaction_state::TransactionState},
     crate::banking_stage::scheduler_messages::{MaxAge, TransactionId},
-    agave_transaction_view::resolved_transaction_view::ResolvedTransactionView,
+    agave_transaction_view::{
+        instructions_frame::InstructionOffsetAndLens,
+        resolved_transaction_view::ResolvedTransactionView,
+    },
     itertools::MinMaxResult,
     min_max_heap::MinMaxHeap,
     slab::{Slab, VacantEntry},
@@ -223,7 +226,7 @@ pub(crate) type TransactionViewState = TransactionState<RuntimeTransactionView>;
 /// This is used to avoid allocations in parsing transactions.
 pub struct TransactionViewStateContainer {
     inner: TransactionStateContainer<RuntimeTransactionView>,
-    bytes_buffer: Box<[SharedBytes]>,
+    bytes_buffer: Box<[(SharedBytes, Arc<Vec<InstructionOffsetAndLens>>)]>,
 }
 
 impl TransactionViewStateContainer {
@@ -232,14 +235,17 @@ impl TransactionViewStateContainer {
     pub(crate) fn try_insert_map_only_with_data(
         &mut self,
         data: &[u8],
-        f: impl FnOnce(SharedBytes) -> Result<TransactionState<RuntimeTransactionView>, ()>,
+        f: impl FnOnce(
+            SharedBytes,
+            &mut Arc<Vec<InstructionOffsetAndLens>>,
+        ) -> Result<TransactionState<RuntimeTransactionView>, ()>,
     ) -> Option<usize> {
         // Get a vacant entry in the slab.
         let vacant_entry = self.inner.get_vacant_map_entry();
         let transaction_id = vacant_entry.key();
 
         // Get the vacant space in the bytes buffer.
-        let bytes_entry = &mut self.bytes_buffer[transaction_id];
+        let (bytes_entry, cache) = &mut self.bytes_buffer[transaction_id];
         // Assert the entry is unique, then copy the packet data.
         {
             // The strong count must be 1 here. These are only cloned into the
@@ -251,6 +257,7 @@ impl TransactionViewStateContainer {
             // indexing between the slab and our `bytes_buffer`, we know that
             // `vacant_entry` is not occupied.
             assert_eq!(Arc::strong_count(bytes_entry), 1, "entry must be unique");
+            assert_eq!(Arc::strong_count(cache), 1, "cache must be unique");
             let bytes = Arc::make_mut(bytes_entry);
 
             // Clear and copy the packet data into the bytes buffer.
@@ -259,7 +266,7 @@ impl TransactionViewStateContainer {
         }
 
         // Attempt to insert the transaction.
-        if let Ok(state) = f(Arc::clone(bytes_entry)) {
+        if let Ok(state) = f(Arc::clone(bytes_entry), cache) {
             vacant_entry.insert(state);
             Some(transaction_id)
         } else {
@@ -272,7 +279,12 @@ impl StateContainer<RuntimeTransactionView> for TransactionViewStateContainer {
     fn with_capacity(capacity: usize) -> Self {
         let inner = TransactionStateContainer::with_capacity(capacity);
         let bytes_buffer = (0..inner.id_to_transaction_state.capacity())
-            .map(|_| Arc::new(Vec::with_capacity(PACKET_DATA_SIZE)))
+            .map(|_| {
+                (
+                    Arc::new(Vec::with_capacity(PACKET_DATA_SIZE)),
+                    Arc::new(Vec::with_capacity(355)), // TODO: calculate and import constant
+                )
+            })
             .collect::<Vec<_>>()
             .into_boxed_slice();
         Self {
@@ -434,31 +446,34 @@ mod tests {
         let mut container = TransactionViewStateContainer::with_capacity(2);
 
         let reserved_addresses = HashSet::default();
-        let packet_parser = |data, priority, cost| {
-            let view = SanitizedTransactionView::try_new_sanitized(data).unwrap();
-            let view = RuntimeTransaction::<SanitizedTransactionView<_>>::try_from(
-                view,
-                MessageHash::Compute,
-                None,
-            )
-            .unwrap();
-            let view = RuntimeTransaction::<ResolvedTransactionView<_>>::try_from(
-                view,
-                None,
-                &reserved_addresses,
-            )
-            .unwrap();
+        macro_rules! parse_packet {
+            ($data:ident, $cache:ident, $priority:ident, $cost:ident) => {{
+                let view =
+                    SanitizedTransactionView::try_new_sanitized_with_cache($data, $cache).unwrap();
+                let view = RuntimeTransaction::<SanitizedTransactionView<_>>::try_from(
+                    view,
+                    MessageHash::Compute,
+                    None,
+                )
+                .unwrap();
+                let view = RuntimeTransaction::<ResolvedTransactionView<_>>::try_from(
+                    view,
+                    None,
+                    &reserved_addresses,
+                )
+                .unwrap();
 
-            Ok(TransactionState::new(view, MaxAge::MAX, priority, cost))
-        };
+                return Ok(TransactionState::new(view, MaxAge::MAX, $priority, $cost));
+            };};
+        }
 
         // Push 2 transactions into the queue so buffer is full.
         for priority in [4, 5] {
             let (transaction, _max_age, priority, cost) = test_transaction(priority);
             let packet = Packet::from_data(None, transaction.to_versioned_transaction()).unwrap();
             let id = container
-                .try_insert_map_only_with_data(packet.data(..).unwrap(), |data| {
-                    packet_parser(data, priority, cost)
+                .try_insert_map_only_with_data(packet.data(..).unwrap(), |data, cache| {
+                    parse_packet!(data, cache, priority, cost);
                 })
                 .unwrap();
             let priority_id = TransactionPriorityId::new(priority, id);
@@ -474,8 +489,8 @@ mod tests {
             let (transaction, _max_age, priority, cost) = test_transaction(priority);
             let packet = Packet::from_data(None, transaction.to_versioned_transaction()).unwrap();
             let id = container
-                .try_insert_map_only_with_data(packet.data(..).unwrap(), |data| {
-                    packet_parser(data, priority, cost)
+                .try_insert_map_only_with_data(packet.data(..).unwrap(), |data, cache| {
+                    parse_packet!(data, cache, priority, cost);
                 })
                 .unwrap();
             let priority_id = TransactionPriorityId::new(priority, id);
@@ -493,8 +508,8 @@ mod tests {
         let (transaction, _max_age, priority, cost) = test_transaction(priority);
         let packet = Packet::from_data(None, transaction.to_versioned_transaction()).unwrap();
         let id = container
-            .try_insert_map_only_with_data(packet.data(..).unwrap(), |data| {
-                packet_parser(data, priority, cost)
+            .try_insert_map_only_with_data(packet.data(..).unwrap(), |data, cache| {
+                parse_packet!(data, cache, priority, cost);
             })
             .unwrap();
         let priority_id = TransactionPriorityId::new(priority, id);
