@@ -125,10 +125,10 @@ impl Default for ValidatedTransactionDetails {
 
 #[derive(PartialEq, Eq, Debug, Clone)]
 #[cfg_attr(feature = "dev-context-only-utils", derive(Default))]
-pub(crate) struct LoadedTransactionAccount {
-    pub(crate) account: AccountSharedData,
-    pub(crate) loaded_size: usize,
-    pub(crate) rent_collected: u64,
+pub struct LoadedTransactionAccount {
+    pub account: AccountSharedData,
+    pub loaded_size: usize,
+    pub rent_collected: u64,
 }
 
 #[derive(PartialEq, Eq, Debug, Clone)]
@@ -160,7 +160,7 @@ pub struct FeesOnlyTransaction {
 }
 
 #[cfg_attr(feature = "dev-context-only-utils", derive(Clone))]
-pub(crate) struct AccountLoader<'a, CB: TransactionProcessingCallback> {
+pub struct AccountLoader<'a, CB: TransactionProcessingCallback> {
     account_cache: AHashMap<Pubkey, AccountSharedData>,
     callbacks: &'a CB,
     pub(crate) feature_set: Arc<FeatureSet>,
@@ -189,7 +189,7 @@ impl<'a, CB: TransactionProcessingCallback> AccountLoader<'a, CB> {
         }
     }
 
-    pub(crate) fn load_account(
+    pub fn load_account(
         &mut self,
         account_key: &Pubkey,
         is_writable: bool,

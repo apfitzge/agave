@@ -8,6 +8,9 @@ use {
             TransactionLoadResult, ValidatedTransactionDetails,
         },
         account_overrides::AccountOverrides,
+        loaded_account_inspector::{
+            inspect_loaded_accounts, inspect_processed_accounts, LoadedAccountInspector,
+        },
         message_processor::process_message,
         nonce_info::NonceInfo,
         program_loader::{get_program_modification_slot, load_program_with_pubkey},
@@ -328,6 +331,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
     pub fn load_and_execute_sanitized_transactions<CB: TransactionProcessingCallback>(
         &self,
         callbacks: &CB,
+        inspector: &mut impl LoadedAccountInspector,
         sanitized_txs: &[impl SVMTransaction],
         check_results: Vec<TransactionCheckResult>,
         environment: &TransactionProcessingEnvironment,
@@ -430,6 +434,9 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
             ));
             load_us = load_us.saturating_add(single_load_us);
 
+            // Inspect accounts before execution.
+            inspect_loaded_accounts(inspector, &mut account_loader, tx, &load_result);
+
             let (processing_result, single_execution_us) = measure_us!(match load_result {
                 TransactionLoadResult::NotLoaded(err) => Err(err),
                 TransactionLoadResult::FeesOnly(fees_only_tx) => {
@@ -463,6 +470,9 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                 }
             });
             execution_us = execution_us.saturating_add(single_execution_us);
+
+            // Inspect accounts before processing.
+            inspect_processed_accounts(inspector, &mut account_loader, &processing_result);
 
             processing_results.push(processing_result);
         }
@@ -1342,8 +1352,12 @@ mod tests {
         let batch_processor = TransactionBatchProcessor::<TestForkGraph>::default();
         let callback = MockBankCallback::default();
 
+        struct DummyInspector;
+        impl LoadedAccountInspector for DummyInspector {}
+
         batch_processor.load_and_execute_sanitized_transactions(
             &callback,
+            &mut DummyInspector,
             &sanitized_txs,
             check_results,
             &TransactionProcessingEnvironment::default(),

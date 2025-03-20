@@ -154,6 +154,7 @@ use {
     solana_svm::{
         account_loader::{collect_rent_from_account, LoadedTransaction},
         account_overrides::AccountOverrides,
+        loaded_account_inspector::LoadedAccountInspector,
         transaction_commit_result::{CommittedTransaction, TransactionCommitResult},
         transaction_error_metrics::TransactionErrorMetrics,
         transaction_execution_result::{
@@ -3224,6 +3225,9 @@ impl Bank {
         let batch = self.prepare_unlocked_batch_from_single_tx(transaction);
         let mut timings = ExecuteTimings::default();
 
+        struct DummyInspector;
+        impl LoadedAccountInspector for DummyInspector {}
+
         let LoadAndExecuteTransactionsOutput {
             mut processing_results,
             ..
@@ -3247,6 +3251,7 @@ impl Bank {
                 },
                 transaction_account_lock_limit: Some(self.get_transaction_account_lock_limit()),
             },
+            &mut DummyInspector,
         );
 
         let units_consumed =
@@ -3368,6 +3373,7 @@ impl Bank {
         timings: &mut ExecuteTimings,
         error_counters: &mut TransactionErrorMetrics,
         processing_config: TransactionProcessingConfig,
+        inspector: &mut impl LoadedAccountInspector,
     ) -> LoadAndExecuteTransactionsOutput {
         let sanitized_txs = batch.sanitized_transactions();
 
@@ -3396,6 +3402,7 @@ impl Bank {
             .transaction_processor
             .load_and_execute_sanitized_transactions(
                 self,
+                inspector,
                 sanitized_txs,
                 check_results,
                 &processing_environment,
