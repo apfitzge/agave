@@ -126,8 +126,14 @@ impl<const SANITIZED: bool, D: TransactionData> TransactionView<SANITIZED, D> {
     #[inline]
     pub fn static_account_keys(&self) -> &[Pubkey] {
         let data = self.data();
+
         // SAFETY: `frame` was created from `data`.
-        unsafe { self.frame.static_account_keys(data) }
+        unsafe {
+            let keys = self.frame.static_account_keys(data);
+
+            let ptr = keys.as_ptr() as *const Pubkey;
+            core::slice::from_raw_parts(ptr, keys.len())
+        }
     }
 
     /// Return the recent blockhash in the transaction.

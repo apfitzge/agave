@@ -14,6 +14,10 @@ use {
 pub const MAX_STATIC_ACCOUNTS_PER_PACKET: u8 =
     (PACKET_DATA_SIZE / core::mem::size_of::<Pubkey>()) as u8;
 
+#[derive(Debug)]
+#[repr(align(32))]
+pub(crate) struct AlignedPubkey(Pubkey);
+
 /// Contains metadata about the static account keys in a transaction packet.
 #[derive(Debug, Default)]
 pub(crate) struct StaticAccountKeysFrame {
@@ -21,7 +25,7 @@ pub(crate) struct StaticAccountKeysFrame {
     // pub(crate) num_static_accounts: u8,
     // /// The offset to the first static account in the transaction.
     // pub(crate) offset: u16,
-    pub(crate) keys: Vec<Pubkey>,
+    pub(crate) keys: Vec<AlignedPubkey>,
 }
 
 impl StaticAccountKeysFrame {
@@ -38,7 +42,7 @@ impl StaticAccountKeysFrame {
         // Update offset for array of static accounts.
         let pubkeys: &[Pubkey] =
             unsafe { read_slice_data(bytes, offset, u16::from(num_static_accounts)) }?;
-        let keys = pubkeys.to_vec();
+        let keys = pubkeys.into_iter().map(|k| AlignedPubkey(*k)).collect();
 
         Ok(Self { keys })
     }
