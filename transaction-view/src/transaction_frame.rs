@@ -104,7 +104,7 @@ impl TransactionFrame {
     /// Return the number of static account keys in the transaction.
     #[inline]
     pub(crate) fn num_static_account_keys(&self) -> u8 {
-        self.static_account_keys.num_static_accounts
+        self.static_account_keys.keys.len() as u8
     }
 
     /// Return the number of instructions in the transaction.
@@ -178,30 +178,14 @@ impl TransactionFrame {
     ///  - This function must be called with the same `bytes` slice that was
     ///    used to create the `TransactionFrame` instance.
     #[inline]
-    pub(crate) unsafe fn static_account_keys<'a>(&self, bytes: &'a [u8]) -> &'a [Pubkey] {
+    pub(crate) unsafe fn static_account_keys<'a>(&'a self, _bytes: &'a [u8]) -> &'a [Pubkey] {
         // Verify at compile time there are no alignment constraints.
         const _: () = assert!(core::mem::align_of::<Pubkey>() == 1, "Pubkey alignment");
         // The length of the slice is not greater than isize::MAX.
         const _: () =
             assert!(u8::MAX as usize * core::mem::size_of::<Pubkey>() <= isize::MAX as usize);
 
-        // SAFETY:
-        // - If this `TransactionFrame` was created from `bytes`:
-        //     - the pointer is valid for the range and is properly aligned.
-        // - `num_static_accounts` has been verified against the bounds if
-        //   `TransactionFrame` was created successfully.
-        // - `Pubkey` are just byte arrays; there is no possibility the
-        //   `Pubkey` are not initialized properly.
-        // - The lifetime of the returned slice is the same as the input
-        //   `bytes`. This means it will not be mutated or deallocated while
-        //   holding the slice.
-        // - The length does not overflow `isize`.
-        core::slice::from_raw_parts(
-            bytes
-                .as_ptr()
-                .add(usize::from(self.static_account_keys.offset)) as *const Pubkey,
-            usize::from(self.static_account_keys.num_static_accounts),
-        )
+        &self.static_account_keys.keys[..]
     }
 
     /// Return the recent blockhash in the transaction.
@@ -292,8 +276,8 @@ mod tests {
         );
 
         assert_eq!(
-            frame.static_account_keys.num_static_accounts,
-            tx.message.static_account_keys().len() as u8
+            frame.static_account_keys.keys.len(),
+            tx.message.static_account_keys().len()
         );
         assert_eq!(
             frame.instructions.num_instructions,

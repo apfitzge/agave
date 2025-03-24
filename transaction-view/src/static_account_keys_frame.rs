@@ -1,6 +1,6 @@
 use {
     crate::{
-        bytes::{advance_offset_for_array, read_byte},
+        bytes::{read_byte, read_slice_data},
         result::{Result, TransactionViewError},
     },
     solana_packet::PACKET_DATA_SIZE,
@@ -17,10 +17,11 @@ pub const MAX_STATIC_ACCOUNTS_PER_PACKET: u8 =
 /// Contains metadata about the static account keys in a transaction packet.
 #[derive(Debug, Default)]
 pub(crate) struct StaticAccountKeysFrame {
-    /// The number of static accounts in the transaction.
-    pub(crate) num_static_accounts: u8,
-    /// The offset to the first static account in the transaction.
-    pub(crate) offset: u16,
+    // /// The number of static accounts in the transaction.
+    // pub(crate) num_static_accounts: u8,
+    // /// The offset to the first static account in the transaction.
+    // pub(crate) offset: u16,
+    pub(crate) keys: Vec<Pubkey>,
 }
 
 impl StaticAccountKeysFrame {
@@ -34,17 +35,12 @@ impl StaticAccountKeysFrame {
             return Err(TransactionViewError::ParseError);
         }
 
-        // We also know that the offset must be less than 3 here, since the
-        // compressed u16 can only use up to 3 bytes, so there is no need to
-        // check if the offset is greater than u16::MAX.
-        let static_accounts_offset = *offset as u16;
         // Update offset for array of static accounts.
-        advance_offset_for_array::<Pubkey>(bytes, offset, u16::from(num_static_accounts))?;
+        let pubkeys: &[Pubkey] =
+            unsafe { read_slice_data(bytes, offset, u16::from(num_static_accounts)) }?;
+        let keys = pubkeys.to_vec();
 
-        Ok(Self {
-            num_static_accounts,
-            offset: static_accounts_offset,
-        })
+        Ok(Self { keys })
     }
 }
 
@@ -64,8 +60,7 @@ mod tests {
         let bytes = bincode::serialize(&ShortVec(vec![Pubkey::default()])).unwrap();
         let mut offset = 0;
         let frame = StaticAccountKeysFrame::try_new(&bytes, &mut offset).unwrap();
-        assert_eq!(frame.num_static_accounts, 1);
-        assert_eq!(frame.offset, 1);
+        assert_eq!(frame.keys.len(), 1);
         assert_eq!(offset, 1 + core::mem::size_of::<Pubkey>());
     }
 
@@ -75,8 +70,7 @@ mod tests {
         let bytes = bincode::serialize(&ShortVec(signatures)).unwrap();
         let mut offset = 0;
         let frame = StaticAccountKeysFrame::try_new(&bytes, &mut offset).unwrap();
-        assert_eq!(frame.num_static_accounts, 38);
-        assert_eq!(frame.offset, 1);
+        assert_eq!(frame.keys.len(), 38);
         assert_eq!(offset, 1 + 38 * core::mem::size_of::<Pubkey>());
     }
 
