@@ -4037,8 +4037,7 @@ mod tests {
         poh_recorder
             .write()
             .unwrap()
-            .reset(bank.clone(), Some((bank.slot(), bank.slot() + 1)));
-
+            .reset_for_test(bank.clone(), Some((bank.slot(), bank.slot() + 1)));
         pool.register_banking_stage(
             None,
             banking_packet_receiver,
@@ -4079,7 +4078,7 @@ mod tests {
         poh_recorder
             .write()
             .unwrap()
-            .reset(bank.clone(), Some((bank.slot(), bank.slot() + 1)));
+            .reset_for_test(bank.clone(), Some((bank.slot(), bank.slot() + 1)));
         let bank = Arc::new(Bank::new_from_parent(
             bank.clone_without_scheduler(),
             &Pubkey::default(),
