@@ -12,6 +12,5 @@ pub enum BankMessage {
     },
     SetBank {
         bank: BankWithScheduler,
-        track_transaction_indexes: bool,
     },
 }
