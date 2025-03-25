@@ -54,7 +54,10 @@ use {
         leader_schedule_utils::first_of_consecutive_leader_slots,
     },
     solana_measure::measure::Measure,
-    solana_poh::poh_recorder::{PohLeaderStatus, PohRecorder, GRACE_TICKS_FACTOR, MAX_GRACE_SLOTS},
+    solana_poh::{
+        poh_controller::PohController,
+        poh_recorder::{PohLeaderStatus, PohRecorder, GRACE_TICKS_FACTOR, MAX_GRACE_SLOTS},
+    },
     solana_pubkey::Pubkey,
     solana_rpc::{
         optimistically_confirmed_bank_tracker::{BankNotification, BankNotificationSenderConfig},
@@ -279,6 +282,7 @@ pub struct ReplayStageConfig {
     pub bank_forks: Arc<RwLock<BankForks>>,
     pub cluster_info: Arc<ClusterInfo>,
     pub poh_recorder: Arc<RwLock<PohRecorder>>,
+    pub poh_controller: PohController,
     pub tower: Tower,
     pub vote_tracker: Arc<VoteTracker>,
     pub cluster_slots: Arc<ClusterSlots>,
@@ -579,6 +583,7 @@ impl ReplayStage {
             bank_forks,
             cluster_info,
             poh_recorder,
+            poh_controller,
             mut tower,
             vote_tracker,
             cluster_slots,
@@ -712,7 +717,7 @@ impl ReplayStage {
                 &my_pubkey,
                 &blockstore,
                 working_bank,
-                &poh_recorder,
+                &poh_controller,
                 &leader_schedule_cache,
             );
 
@@ -1090,7 +1095,7 @@ impl ReplayStage {
                             &my_pubkey,
                             &blockstore,
                             reset_bank.clone(),
-                            &poh_recorder,
+                            &poh_controller,
                             &leader_schedule_cache,
                         );
                         last_reset = reset_bank.last_blockhash();
@@ -2828,7 +2833,7 @@ impl ReplayStage {
         my_pubkey: &Pubkey,
         blockstore: &Blockstore,
         bank: Arc<Bank>,
-        poh_recorder: &RwLock<PohRecorder>,
+        poh_controller: &PohController,
         leader_schedule_cache: &LeaderScheduleCache,
     ) {
         let slot = bank.slot();
@@ -2842,7 +2847,9 @@ impl ReplayStage {
             GRACE_TICKS_FACTOR * MAX_GRACE_SLOTS,
         );
 
-        poh_recorder.write().unwrap().reset(bank, next_leader_slot);
+        poh_controller
+            .reset(bank, next_leader_slot)
+            .expect("poh service exists");
 
         let next_leader_msg = if let Some(next_leader_slot) = next_leader_slot {
             format!("My next leader slot is {}", next_leader_slot.0)
@@ -4329,6 +4336,7 @@ pub(crate) mod tests {
             get_tmp_ledger_path, get_tmp_ledger_path_auto_delete,
             shred::{ProcessShredsStats, ReedSolomonCache, Shred, Shredder},
         },
+        solana_poh::{poh_recorder::create_test_recorder, poh_service::PohService},
         solana_poh_config::PohConfig,
         solana_rpc::{
             optimistically_confirmed_bank_tracker::OptimisticallyConfirmedBank,
@@ -4394,7 +4402,10 @@ pub(crate) mod tests {
         pub(crate) my_pubkey: Pubkey,
         cluster_info: ClusterInfo,
         pub(crate) leader_schedule_cache: Arc<LeaderScheduleCache>,
-        poh_recorder: RwLock<PohRecorder>,
+        poh_recorder: Arc<RwLock<PohRecorder>>,
+        poh_controller: PohController,
+        _poh_service: PohService,
+        _exit: Arc<AtomicBool>,
         tower: Tower,
         rpc_subscriptions: Arc<RpcSubscriptions>,
         pub vote_simulator: VoteSimulator,
@@ -4443,22 +4454,14 @@ pub(crate) mod tests {
         let root_bank = bank_forks.read().unwrap().root_bank();
         let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(&root_bank));
 
-        // PohRecorder
         let working_bank = bank_forks.read().unwrap().working_bank();
-        let poh_recorder = RwLock::new(
-            PohRecorder::new(
-                working_bank.tick_height(),
-                working_bank.last_blockhash(),
-                working_bank.clone(),
-                None,
-                working_bank.ticks_per_slot(),
+        let (exit, poh_recorder, poh_controller, _transaction_recorder, poh_service, _) =
+            create_test_recorder(
+                working_bank,
                 blockstore.clone(),
-                &leader_schedule_cache,
-                &PohConfig::default(),
-                Arc::new(AtomicBool::new(false)),
-            )
-            .0,
-        );
+                Some(PohConfig::default()),
+                Some(leader_schedule_cache.clone()),
+            );
 
         // Tower
         let my_vote_pubkey = my_keypairs.vote_keypair.pubkey();
@@ -4471,10 +4474,9 @@ pub(crate) mod tests {
         // RpcSubscriptions
         let optimistically_confirmed_bank =
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(bank_forks);
-        let exit = Arc::new(AtomicBool::new(false));
         let max_complete_transaction_status_slot = Arc::new(AtomicU64::default());
         let rpc_subscriptions = Arc::new(RpcSubscriptions::new_for_tests(
-            exit,
+            exit.clone(),
             max_complete_transaction_status_slot,
             bank_forks.clone(),
             Arc::new(RwLock::new(BlockCommitmentCache::default())),
@@ -4488,6 +4490,9 @@ pub(crate) mod tests {
             cluster_info,
             leader_schedule_cache,
             poh_recorder,
+            poh_controller,
+            _poh_service: poh_service,
+            _exit: exit,
             tower,
             rpc_subscriptions,
             vote_simulator,
@@ -9249,6 +9254,7 @@ pub(crate) mod tests {
             my_pubkey,
             leader_schedule_cache,
             poh_recorder,
+            poh_controller,
             vote_simulator,
             rpc_subscriptions,
             ..
@@ -9281,7 +9287,7 @@ pub(crate) mod tests {
             &my_pubkey,
             &blockstore,
             working_bank.clone(),
-            &poh_recorder,
+            &poh_controller,
             &leader_schedule_cache,
         );
 
