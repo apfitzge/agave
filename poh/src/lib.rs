@@ -1,4 +1,5 @@
 #![allow(clippy::arithmetic_side_effects)]
+pub mod bank_message;
 pub mod poh_recorder;
 pub mod poh_service;
 pub mod transaction_recorder;
