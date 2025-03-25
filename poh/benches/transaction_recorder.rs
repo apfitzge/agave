@@ -47,7 +47,7 @@ fn bench_record_transactions(c: &mut Criterion) {
     let blockstore = Arc::new(
         Blockstore::open(ledger_path.path()).expect("Expected to be able to open database ledger"),
     );
-    let (mut poh_recorder, _entry_receiver) = PohRecorder::new(
+    let (poh_recorder, _entry_receiver) = PohRecorder::new(
         bank.tick_height(),
         bank.last_blockhash(),
         bank.clone(),
@@ -58,7 +58,6 @@ fn bench_record_transactions(c: &mut Criterion) {
         &genesis_config_info.genesis_config.poh_config,
         exit.clone(),
     );
-    poh_recorder.set_bank(BankWithScheduler::new_without_scheduler(bank.clone()));
 
     let (record_sender, record_receiver) = crossbeam_channel::unbounded();
     let transaction_recorder = TransactionRecorder::new(record_sender, exit.clone());
@@ -74,7 +73,7 @@ fn bench_record_transactions(c: &mut Criterion) {
         })
         .collect();
 
-    let (_poh_controller, bank_message_receiver) = PohController::new();
+    let (poh_controller, bank_message_receiver) = PohController::new();
     let poh_recorder = Arc::new(RwLock::new(poh_recorder));
     let poh_service = PohService::new(
         poh_recorder.clone(),
@@ -86,6 +85,9 @@ fn bench_record_transactions(c: &mut Criterion) {
         record_receiver,
         bank_message_receiver,
     );
+    poh_controller
+        .set_bank(BankWithScheduler::new_without_scheduler(bank.clone()))
+        .unwrap();
 
     let mut group = c.benchmark_group("record_transactions");
     group.throughput(criterion::Throughput::Elements(
@@ -103,10 +105,9 @@ fn bench_record_transactions(c: &mut Criterion) {
                     &Pubkey::default(),
                     bank.slot().wrapping_add(1),
                 ));
-                poh_recorder
-                    .write()
-                    .unwrap()
-                    .set_bank(BankWithScheduler::new_without_scheduler(bank.clone()));
+                poh_controller
+                    .set_bank(BankWithScheduler::new_without_scheduler(bank.clone()))
+                    .unwrap();
 
                 let start = Instant::now();
                 for txs in tx_batches {

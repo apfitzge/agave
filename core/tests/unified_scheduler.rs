@@ -224,7 +224,7 @@ fn test_scheduler_producing_blocks() {
     let genesis_bank = bank_forks.read().unwrap().working_bank_with_scheduler();
     genesis_bank.set_fork_graph_in_program_cache(Arc::downgrade(&bank_forks));
     let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(&genesis_bank));
-    let (exit, poh_recorder, _poh_controller, transaction_recorder, poh_service, signal_receiver) =
+    let (exit, poh_recorder, poh_controller, transaction_recorder, poh_service, signal_receiver) =
         create_test_recorder(
             genesis_bank.clone(),
             blockstore.clone(),
@@ -267,10 +267,9 @@ fn test_scheduler_producing_blocks() {
         .write()
         .unwrap()
         .insert_with_scheduling_mode(SchedulingMode::BlockProduction, tpu_bank);
-    poh_recorder
-        .write()
-        .unwrap()
-        .set_bank(tpu_bank.clone_with_scheduler());
+    poh_controller
+        .set_bank(tpu_bank.clone_with_scheduler())
+        .unwrap();
     tpu_bank.unpause_new_block_production_scheduler();
     let tpu_bank = bank_forks.read().unwrap().working_bank_with_scheduler();
     assert_eq!(tpu_bank.transaction_count(), 0);

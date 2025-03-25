@@ -435,7 +435,7 @@ impl PohRecorder {
         }
     }
 
-    pub fn set_bank(&mut self, bank: BankWithScheduler) {
+    pub(crate) fn set_bank(&mut self, bank: BankWithScheduler) {
         self.handle_set_bank(bank);
     }
 

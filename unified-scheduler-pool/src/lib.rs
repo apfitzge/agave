@@ -4022,7 +4022,7 @@ mod tests {
         let (
             exit,
             poh_recorder,
-            _poh_controller,
+            poh_controller,
             transaction_recorder,
             poh_service,
             _signal_receiver,
@@ -4058,10 +4058,9 @@ mod tests {
         let scheduler = pool.take_scheduler(context);
         let old_scheduler_id = scheduler.id();
         let bank = BankWithScheduler::new(bank, Some(scheduler));
-        poh_recorder
-            .write()
-            .unwrap()
-            .set_bank(bank.clone_with_scheduler());
+        poh_controller
+            .set_bank(bank.clone_with_scheduler())
+            .unwrap();
         bank.schedule_transaction_executions([(tx, ORIGINAL_TRANSACTION_INDEX)].into_iter())
             .unwrap();
         bank.unpause_new_block_production_scheduler();
@@ -4094,10 +4093,9 @@ mod tests {
         // Make sure the same scheduler is used to test its internal cross-session behavior
         assert_eq!(scheduler.id(), old_scheduler_id);
         let bank = BankWithScheduler::new(bank, Some(scheduler));
-        poh_recorder
-            .write()
-            .unwrap()
-            .set_bank(bank.clone_with_scheduler());
+        poh_controller
+            .set_bank(bank.clone_with_scheduler())
+            .unwrap();
         bank.unpause_new_block_production_scheduler();
 
         // Calling wait_for_completed_scheduler() for block production scheduler causes it to be
