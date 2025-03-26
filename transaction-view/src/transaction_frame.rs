@@ -234,8 +234,8 @@ impl TransactionFrame {
         bytes: &'a [u8],
     ) -> InstructionsIterator<'a> {
         InstructionsIterator {
-            bytes,
-            offset: usize::from(self.instructions.offset),
+            bytes: bytes.as_ptr().add(usize::from(self.instructions.offset)),
+            // offset: usize::from(self.instructions.offset),
             num_instructions: self.instructions.num_instructions,
             index: 0,
             frames: &self.instructions.frames,

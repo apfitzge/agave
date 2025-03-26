@@ -98,8 +98,7 @@ impl InstructionsFrame {
 
 #[derive(Clone)]
 pub struct InstructionsIterator<'a> {
-    pub(crate) bytes: &'a [u8],
-    pub(crate) offset: usize,
+    pub(crate) bytes: *const u8,
     pub(crate) num_instructions: u16,
     pub(crate) index: u16,
     pub(crate) frames: &'a [InstructionFrame],
@@ -116,7 +115,7 @@ impl<'a> Iterator for InstructionsIterator<'a> {
                 num_accounts_len,
                 data_len,
                 data_len_len,
-            } = self.frames[usize::from(self.index)];
+            } = unsafe { self.frames.get_unchecked(usize::from(self.index)) };
 
             self.index = self.index.wrapping_add(1);
 
@@ -127,10 +126,13 @@ impl<'a> Iterator for InstructionsIterator<'a> {
 
             // Read the program ID index.
             // SAFETY: Offset and length checks have been done in the initial parsing.
-            let program_id_index = unsafe { unchecked_read_byte(self.bytes, &mut self.offset) };
+            let program_id_index = unsafe { *self.bytes };
+            unsafe {
+                self.bytes = self.bytes.add(1);
+            }
 
             // Move offset to accounts offset - do not re-parse u16.
-            self.offset = self.offset.wrapping_add(usize::from(num_accounts_len));
+            self.bytes = unsafe { self.bytes.add(usize::from(*num_accounts_len)) };
             const _: () = assert!(core::mem::align_of::<u8>() == 1, "u8 alignment");
             // SAFETY:
             // - The offset is checked to be valid in the byte slice.
@@ -138,12 +140,12 @@ impl<'a> Iterator for InstructionsIterator<'a> {
             // - The slice length is checked to be valid.
             // - `u8` cannot be improperly initialized.
             // - Offset and length checks have been done in the initial parsing.
-            let accounts = unsafe {
-                unchecked_read_slice_data::<u8>(self.bytes, &mut self.offset, num_accounts)
-            };
+            let num_accounts = usize::from(*num_accounts);
+            let accounts = unsafe { core::slice::from_raw_parts(self.bytes, num_accounts) };
+            self.bytes = unsafe { self.bytes.add(num_accounts) };
 
             // Move offset to accounts offset - do not re-parse u16.
-            self.offset = self.offset.wrapping_add(usize::from(data_len_len));
+            self.bytes = unsafe { self.bytes.add(usize::from(*data_len_len)) };
             const _: () = assert!(core::mem::align_of::<u8>() == 1, "u8 alignment");
             // SAFETY:
             // - The offset is checked to be valid in the byte slice.
@@ -151,8 +153,9 @@ impl<'a> Iterator for InstructionsIterator<'a> {
             // - The slice length is checked to be valid.
             // - `u8` cannot be improperly initialized.
             // - Offset and length checks have been done in the initial parsing.
-            let data =
-                unsafe { unchecked_read_slice_data::<u8>(self.bytes, &mut self.offset, data_len) };
+            let data_len = usize::from(*data_len);
+            let data = unsafe { core::slice::from_raw_parts(self.bytes, data_len) };
+            self.bytes = unsafe { self.bytes.add(data_len) };
 
             Some(SVMInstruction {
                 program_id_index,
