@@ -30,7 +30,10 @@ use {
     solana_transaction::versioned::VersionedTransaction,
     std::{
         cmp,
-        sync::{atomic::AtomicBool, Arc, Mutex, RwLock},
+        sync::{
+            atomic::{AtomicBool, AtomicU64, Ordering},
+            Arc, Mutex, RwLock,
+        },
         time::Instant,
     },
     thiserror::Error,
@@ -38,6 +41,7 @@ use {
 
 pub const GRACE_TICKS_FACTOR: u64 = 2;
 pub const MAX_GRACE_SLOTS: u64 = 2;
+const NO_WORKING_BANK: u64 = u64::MAX;
 
 #[derive(Error, Debug, Clone)]
 pub enum PohRecorderError {
@@ -175,6 +179,7 @@ pub struct PohRecorder {
     start_tick_height: u64, // first tick_height this recorder will observe
     tick_cache: Vec<(Entry, u64)>, // cache of entry and its tick_height
     working_bank: Option<WorkingBank>,
+    working_bank_slot: Arc<AtomicU64>,
     working_bank_sender: Sender<WorkingBankEntry>,
     leader_first_tick_height: Option<u64>,
     leader_last_tick_height: u64, // zero if none
@@ -255,6 +260,7 @@ impl PohRecorder {
                 tick_height,
                 tick_cache: vec![],
                 working_bank: None,
+                working_bank_slot: Arc::new(AtomicU64::new(NO_WORKING_BANK)),
                 working_bank_sender,
                 clear_bank_signal,
                 start_bank,
@@ -405,6 +411,7 @@ impl PohRecorder {
     pub fn set_bank(&mut self, bank: BankWithScheduler, track_transaction_indexes: bool) {
         assert!(self.working_bank.is_none());
         self.leader_bank_notifier.set_in_progress(&bank);
+        let working_bank_slot = bank.slot();
         let working_bank = WorkingBank {
             min_tick_height: bank.tick_height(),
             max_tick_height: bank.max_tick_height(),
@@ -428,6 +435,8 @@ impl PohRecorder {
             }
         }
         self.working_bank = Some(working_bank);
+        self.working_bank_slot
+            .store(working_bank_slot, Ordering::Release);
 
         // TODO: adjust the working_bank.start time based on number of ticks
         // that have already elapsed based on current tick height.
@@ -436,6 +445,8 @@ impl PohRecorder {
 
     fn clear_bank(&mut self) {
         if let Some(WorkingBank { bank, start, .. }) = self.working_bank.take() {
+            self.working_bank_slot
+                .store(NO_WORKING_BANK, Ordering::Release);
             self.leader_bank_notifier.set_completed(bank.slot());
             let next_leader_slot = self.leader_schedule_cache.next_leader_slot(
                 bank.collector_id(),
@@ -619,7 +630,7 @@ impl PohRecorder {
     }
 
     pub fn has_bank(&self) -> bool {
-        self.working_bank.is_some()
+        self.working_bank_slot.load(Ordering::Acquire) != NO_WORKING_BANK
     }
 
     pub fn tick_height(&self) -> u64 {
