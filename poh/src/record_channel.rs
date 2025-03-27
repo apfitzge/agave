@@ -75,6 +75,14 @@ pub struct RecordReceiver {
 }
 
 impl RecordReceiver {
+    pub fn should_shutdown(&self, remaining_hashes: u64, ticks_per_slot: u64) -> bool {
+        // Make sure we **always** have enough space to record `capacity`
+        // entries, where each entry results in 1 hash.
+        // This is very conservative and does not assume we have already
+        // included ANY ticks.
+        remaining_hashes.saturating_sub(ticks_per_slot) < self.capacity
+    }
+
     /// Shut the channel down immediately.
     pub fn shutdown(&mut self) {
         self.is_shutdown = true;

@@ -145,6 +145,10 @@ impl Poh {
             hash: self.hash,
         })
     }
+
+    pub fn remaining_hashes(&self) -> u64 {
+        self.remaining_hashes
+    }
 }
 
 pub fn compute_hash_time(hashes_sample_size: u64) -> Duration {

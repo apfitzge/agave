@@ -225,11 +225,13 @@ impl PohService {
         if let Ok(record) = record {
             if record
                 .sender
-                .send(poh_recorder.write().unwrap().record(
-                    record.slot,
-                    record.mixins,
-                    record.transaction_batches,
-                ))
+                .send(
+                    poh_recorder
+                        .write()
+                        .unwrap()
+                        .record(record.slot, record.mixins, record.transaction_batches)
+                        .map(|record_summary| record_summary.starting_transaction_index),
+                )
                 .is_err()
             {
                 panic!("Error returning mixin hash");
@@ -291,7 +293,8 @@ impl PohService {
         next_record: &mut Option<Record>,
         poh_recorder: &Arc<RwLock<PohRecorder>>,
         timing: &mut PohTiming,
-        record_receiver: &RecordReceiver,
+        record_receiver: &mut RecordReceiver,
+        ticks_per_slot: u64,
         hashes_per_batch: u64,
         poh: &Arc<Mutex<Poh>>,
         target_ns_per_tick: u64,
@@ -306,11 +309,22 @@ impl PohService {
                 timing.total_lock_time_ns += lock_time.as_ns();
                 let mut record_time = Measure::start("record");
                 loop {
-                    let res = poh_recorder_l.record(
-                        record.slot,
-                        record.mixins,
-                        std::mem::take(&mut record.transaction_batches),
-                    );
+                    let res = poh_recorder_l
+                        .record(
+                            record.slot,
+                            record.mixins,
+                            std::mem::take(&mut record.transaction_batches),
+                        )
+                        .map(|record_summary| {
+                            if record_receiver
+                                .should_shutdown(record_summary.remaining_hashes, ticks_per_slot)
+                            {
+                                record_receiver.shutdown();
+                            }
+
+                            record_summary.starting_transaction_index
+                        });
+
                     let (send_res, send_record_result_us) = measure_us!(record.sender.send(res));
                     debug_assert!(send_res.is_ok(), "Record wasn't sent.");
 
@@ -339,6 +353,9 @@ impl PohService {
                     let should_tick = poh_l.hash(hashes_per_batch);
                     let ideal_time = poh_l.target_poh_time(target_ns_per_tick);
                     hash_time.stop();
+                    if record_receiver.should_shutdown(poh_l.remaining_hashes(), ticks_per_slot) {
+                        record_receiver.shutdown();
+                    }
                     timing.total_hash_time_ns += hash_time.as_ns();
                     if should_tick {
                         // nothing else can be done. tick required.
@@ -396,7 +413,8 @@ impl PohService {
                     &mut next_record,
                     &poh_recorder,
                     &mut timing,
-                    &record_receiver,
+                    &mut record_receiver,
+                    ticks_per_slot,
                     hashes_per_batch,
                     &poh,
                     target_ns_per_tick,

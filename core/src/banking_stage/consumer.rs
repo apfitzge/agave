@@ -840,11 +840,11 @@ mod tests {
                     let timeout = Duration::from_millis(10);
                     let record = record_receiver.recv_timeout(timeout);
                     if let Ok(record) = record {
-                        let record_response = poh_recorder.write().unwrap().record(
-                            record.slot,
-                            record.mixins,
-                            record.transaction_batches,
-                        );
+                        let record_response = poh_recorder
+                            .write()
+                            .unwrap()
+                            .record(record.slot, record.mixins, record.transaction_batches)
+                            .map(|record_summary| record_summary.starting_transaction_index);
                         poh_recorder.write().unwrap().tick();
                         if record.sender.send(record_response).is_err() {
                             panic!("Error returning mixin hash");
