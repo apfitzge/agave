@@ -96,6 +96,12 @@ impl RecordReceiver {
         std::iter::from_fn(|| self.try_recv().ok())
     }
 
+    /// Check if the channel is empty.
+    /// This is only accurate if the channel is shutdown.
+    pub fn is_empty(&self) -> bool {
+        self.receiver.is_empty()
+    }
+
     /// Try to receive a record from the channel.
     pub fn try_recv(&self) -> Result<Record, TryRecvError> {
         let record = self.receiver.try_recv()?;
