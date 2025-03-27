@@ -3,6 +3,7 @@ pub mod bank_message;
 pub mod poh_controller;
 pub mod poh_recorder;
 pub mod poh_service;
+pub mod record_channel;
 pub mod transaction_recorder;
 
 #[macro_use]
