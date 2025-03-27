@@ -212,6 +212,7 @@ impl PohService {
             }
             if let Some(bank_message) = bank_message {
                 Self::handle_bank_message(&poh_recorder, bank_message, &pending_bank_message);
+                record_receiver.restart();
             }
         }
     }
@@ -284,6 +285,7 @@ impl PohService {
             }
             if let Some(bank_message) = bank_message {
                 Self::handle_bank_message(&poh_recorder, bank_message, &pending_bank_message);
+                record_receiver.restart();
             }
         }
     }
