@@ -4,6 +4,7 @@ use {
     crate::{
         bank_message::BankMessage,
         poh_recorder::{PohRecorder, Record},
+        record_channel::RecordReceiver,
     },
     crossbeam_channel::Receiver,
     log::*,
@@ -107,7 +108,7 @@ impl PohService {
         ticks_per_slot: u64,
         pinned_cpu_core: usize,
         hashes_per_batch: u64,
-        record_receiver: Receiver<Record>,
+        record_receiver: RecordReceiver,
         bank_message_receiver: Receiver<BankMessage>,
         pending_bank_message: Arc<AtomicBool>,
     ) -> Self {
@@ -178,7 +179,7 @@ impl PohService {
         poh_recorder: Arc<RwLock<PohRecorder>>,
         poh_config: &PohConfig,
         poh_exit: &AtomicBool,
-        record_receiver: Receiver<Record>,
+        record_receiver: RecordReceiver,
         bank_message_receiver: Receiver<BankMessage>,
         pending_bank_message: Arc<AtomicBool>,
     ) {
@@ -206,7 +207,7 @@ impl PohService {
 
     pub fn read_record_receiver_and_process(
         poh_recorder: &Arc<RwLock<PohRecorder>>,
-        record_receiver: &Receiver<Record>,
+        record_receiver: &RecordReceiver,
         timeout: Duration,
     ) {
         let record = record_receiver.recv_timeout(timeout);
@@ -229,7 +230,7 @@ impl PohService {
         poh_recorder: Arc<RwLock<PohRecorder>>,
         poh_config: &PohConfig,
         poh_exit: &AtomicBool,
-        record_receiver: Receiver<Record>,
+        record_receiver: RecordReceiver,
         bank_message_receiver: Receiver<BankMessage>,
         pending_bank_message: Arc<AtomicBool>,
     ) {
@@ -268,7 +269,7 @@ impl PohService {
         next_record: &mut Option<Record>,
         poh_recorder: &Arc<RwLock<PohRecorder>>,
         timing: &mut PohTiming,
-        record_receiver: &Receiver<Record>,
+        record_receiver: &RecordReceiver,
         hashes_per_batch: u64,
         poh: &Arc<Mutex<Poh>>,
         target_ns_per_tick: u64,
@@ -357,7 +358,7 @@ impl PohService {
         poh_exit: &AtomicBool,
         ticks_per_slot: u64,
         hashes_per_batch: u64,
-        record_receiver: Receiver<Record>,
+        record_receiver: RecordReceiver,
         bank_message_receiver: Receiver<BankMessage>,
         pending_bank_message: Arc<AtomicBool>,
         target_ns_per_tick: u64,
@@ -429,8 +430,10 @@ impl PohService {
 mod tests {
     use {
         super::*,
-        crate::{poh_controller::PohController, poh_recorder::PohRecorderError::MaxHeightReached},
-        crossbeam_channel::unbounded,
+        crate::{
+            poh_controller::PohController, poh_recorder::PohRecorderError::MaxHeightReached,
+            record_channel::record_channels,
+        },
         rand::{thread_rng, Rng},
         solana_clock::{DEFAULT_HASHES_PER_TICK, DEFAULT_MS_PER_SLOT},
         solana_ledger::{
@@ -559,7 +562,7 @@ mod tests {
         let hashes_per_batch = std::env::var("HASHES_PER_BATCH")
             .map(|x| x.parse().unwrap())
             .unwrap_or(DEFAULT_HASHES_PER_BATCH);
-        let (_record_sender, record_receiver) = unbounded();
+        let (_record_sender, record_receiver) = record_channels();
         let (controller, bank_message_receiver) = PohController::new();
         let poh_service = PohService::new(
             poh_recorder.clone(),

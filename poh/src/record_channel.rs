@@ -1,16 +1,20 @@
 use {
     crate::poh_recorder::Record,
-    crossbeam_channel::{bounded, Receiver, Sender, TryRecvError, TrySendError},
-    std::sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
+    crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError},
+    std::{
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        },
+        time::Duration,
     },
 };
 
 /// Create a channel pair for communicating `Record`s.
-pub fn record_channels(capacity: u64) -> (RecordSender, RecordReceiver) {
-    let (sender, receiver) = bounded(capacity as usize);
-    let allowed_insertions = Arc::new(AtomicU64::new(capacity));
+pub fn record_channels() -> (RecordSender, RecordReceiver) {
+    const CAPACITY: u64 = 1024;
+    let (sender, receiver) = bounded(CAPACITY as usize);
+    let allowed_insertions = Arc::new(AtomicU64::new(CAPACITY));
     (
         RecordSender {
             allowed_insertions: allowed_insertions.clone(),
@@ -18,14 +22,14 @@ pub fn record_channels(capacity: u64) -> (RecordSender, RecordReceiver) {
         },
         RecordReceiver {
             is_shutdown: false,
-            capacity,
+            capacity: CAPACITY,
             allowed_insertions,
             receiver,
         },
     )
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RecordSender {
     allowed_insertions: Arc<AtomicU64>,
     sender: Sender<Record>,
@@ -62,6 +66,7 @@ impl RecordSender {
     }
 }
 
+#[derive(Debug)]
 pub struct RecordReceiver {
     is_shutdown: bool,
     capacity: u64,
@@ -78,6 +83,8 @@ impl RecordReceiver {
 
     /// Re-enable the channel after a shutdown.
     pub fn restart(&mut self) {
+        assert!(self.is_shutdown);
+        assert!(self.receiver.is_empty());
         self.is_shutdown = false;
         self.allowed_insertions
             .store(self.capacity, Ordering::Release);
@@ -92,12 +99,20 @@ impl RecordReceiver {
     /// Try to receive a record from the channel.
     pub fn try_recv(&self) -> Result<Record, TryRecvError> {
         let record = self.receiver.try_recv()?;
+        self.on_received_record();
+        Ok(record)
+    }
 
+    pub fn recv_timeout(&self, duration: Duration) -> Result<Record, RecvTimeoutError> {
+        let record = self.receiver.recv_timeout(duration)?;
+        self.on_received_record();
+        Ok(record)
+    }
+
+    fn on_received_record(&self) {
         // If we received a record AND are not shutdown, increment the allowed insertions.
         if !self.is_shutdown {
             self.allowed_insertions.fetch_add(1, Ordering::AcqRel);
         }
-
-        Ok(record)
     }
 }

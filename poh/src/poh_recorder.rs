@@ -14,7 +14,7 @@
 use qualifier_attr::qualifiers;
 use {
     crate::{
-        poh_controller::PohController, poh_service::PohService,
+        poh_controller::PohController, poh_service::PohService, record_channel::record_channels,
         transaction_recorder::TransactionRecorder,
     },
     arc_swap::ArcSwapOption,
@@ -949,7 +949,7 @@ fn do_create_test_recorder(
 
     poh_recorder.set_bank(BankWithScheduler::new_without_scheduler(bank));
 
-    let (record_sender, record_receiver) = unbounded();
+    let (record_sender, record_receiver) = record_channels();
     let transaction_recorder = TransactionRecorder::new(record_sender, exit.clone());
     let (poh_controller, bank_message_receiver) = PohController::new();
 
