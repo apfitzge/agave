@@ -84,6 +84,7 @@ fn bench_record_transactions(c: &mut Criterion) {
         DEFAULT_HASHES_PER_BATCH,
         record_receiver,
         bank_message_receiver,
+        poh_controller.pending_message(),
     );
     poh_controller
         .set_bank(BankWithScheduler::new_without_scheduler(bank.clone()))

@@ -109,6 +109,7 @@ impl PohService {
         hashes_per_batch: u64,
         record_receiver: Receiver<Record>,
         bank_message_receiver: Receiver<BankMessage>,
+        pending_bank_message: Arc<AtomicBool>,
     ) -> Self {
         let poh_config = poh_config.clone();
         let tick_producer = Builder::new()
@@ -122,6 +123,7 @@ impl PohService {
                             &poh_exit,
                             record_receiver,
                             bank_message_receiver,
+                            pending_bank_message,
                         );
                     } else {
                         Self::short_lived_low_power_tick_producer(
@@ -130,6 +132,7 @@ impl PohService {
                             &poh_exit,
                             record_receiver,
                             bank_message_receiver,
+                            pending_bank_message,
                         );
                     }
                 } else {
@@ -146,6 +149,7 @@ impl PohService {
                         hashes_per_batch,
                         record_receiver,
                         bank_message_receiver,
+                        pending_bank_message,
                         Self::target_ns_per_tick(
                             ticks_per_slot,
                             poh_config.target_tick_duration.as_nanos() as u64,
@@ -176,10 +180,15 @@ impl PohService {
         poh_exit: &AtomicBool,
         record_receiver: Receiver<Record>,
         bank_message_receiver: Receiver<BankMessage>,
+        pending_bank_message: Arc<AtomicBool>,
     ) {
         let mut last_tick = Instant::now();
         while !poh_exit.load(Ordering::Relaxed) {
-            Self::check_and_handle_bank_messages(&poh_recorder, &bank_message_receiver);
+            Self::check_and_handle_bank_messages(
+                &poh_recorder,
+                &bank_message_receiver,
+                &pending_bank_message,
+            );
             let remaining_tick_time = poh_config
                 .target_tick_duration
                 .saturating_sub(last_tick.elapsed());
@@ -222,13 +231,18 @@ impl PohService {
         poh_exit: &AtomicBool,
         record_receiver: Receiver<Record>,
         bank_message_receiver: Receiver<BankMessage>,
+        pending_bank_message: Arc<AtomicBool>,
     ) {
         let mut warned = false;
         let mut elapsed_ticks = 0;
         let mut last_tick = Instant::now();
         let num_ticks = poh_config.target_tick_count.unwrap();
         while elapsed_ticks < num_ticks {
-            Self::check_and_handle_bank_messages(&poh_recorder, &bank_message_receiver);
+            Self::check_and_handle_bank_messages(
+                &poh_recorder,
+                &bank_message_receiver,
+                &pending_bank_message,
+            );
             let remaining_tick_time = poh_config
                 .target_tick_duration
                 .saturating_sub(last_tick.elapsed());
@@ -345,13 +359,18 @@ impl PohService {
         hashes_per_batch: u64,
         record_receiver: Receiver<Record>,
         bank_message_receiver: Receiver<BankMessage>,
+        pending_bank_message: Arc<AtomicBool>,
         target_ns_per_tick: u64,
     ) {
         let poh = poh_recorder.read().unwrap().poh.clone();
         let mut timing = PohTiming::new();
         let mut next_record = None;
         loop {
-            Self::check_and_handle_bank_messages(&poh_recorder, &bank_message_receiver);
+            Self::check_and_handle_bank_messages(
+                &poh_recorder,
+                &bank_message_receiver,
+                &pending_bank_message,
+            );
             let should_tick = Self::record_or_hash(
                 &mut next_record,
                 &poh_recorder,
@@ -386,6 +405,7 @@ impl PohService {
     fn check_and_handle_bank_messages(
         poh_recorder: &RwLock<PohRecorder>,
         bank_message_receiver: &Receiver<BankMessage>,
+        pending_bank_message: &AtomicBool,
     ) {
         for bank_message in bank_message_receiver.try_iter() {
             let mut recorder = poh_recorder.write().unwrap();
@@ -396,6 +416,7 @@ impl PohService {
                 } => recorder.reset(reset_bank, next_leader_slot),
                 BankMessage::SetBank { bank } => recorder.set_bank(bank),
             }
+            pending_bank_message.store(false, Ordering::Release);
         }
     }
 
@@ -539,7 +560,7 @@ mod tests {
             .map(|x| x.parse().unwrap())
             .unwrap_or(DEFAULT_HASHES_PER_BATCH);
         let (_record_sender, record_receiver) = unbounded();
-        let (_controller, bank_message_receiver) = PohController::new();
+        let (controller, bank_message_receiver) = PohController::new();
         let poh_service = PohService::new(
             poh_recorder.clone(),
             &poh_config,
@@ -549,6 +570,7 @@ mod tests {
             hashes_per_batch,
             record_receiver,
             bank_message_receiver,
+            controller.pending_message(),
         );
         poh_recorder.write().unwrap().set_bank_for_test(bank);
 
