@@ -42,7 +42,7 @@ impl RecordSender {
             // If it's 0, the channel is either full or closed - just return immediately.
             let remaining_capacity = self.allowed_insertions.load(Ordering::Acquire);
             if remaining_capacity == 0 {
-                return Ok(());
+                return Err(TrySendError::Full(record));
             }
 
             // Decrement the remaining capacity.
