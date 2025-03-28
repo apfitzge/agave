@@ -1,7 +1,9 @@
 use {
     crate::poh_recorder::Record,
     crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError},
+    solana_clock::Slot,
     std::{
+        ops::Deref,
         sync::{
             atomic::{AtomicU64, Ordering},
             Arc, RwLock,
@@ -14,7 +16,7 @@ use {
 pub fn record_channels(track_transaction_indexes: bool) -> (RecordSender, RecordReceiver) {
     const CAPACITY: u64 = 1024;
     let (sender, receiver) = bounded(CAPACITY as usize);
-    let allowed_insertions = Arc::new(AtomicU64::new(CAPACITY));
+    let slot_allowed_insertions = SlotAllowedInsertions::new(0, CAPACITY);
     let transaction_indexes = if track_transaction_indexes {
         Some(Arc::new(RwLock::new(0)))
     } else {
@@ -22,14 +24,14 @@ pub fn record_channels(track_transaction_indexes: bool) -> (RecordSender, Record
     };
     (
         RecordSender {
-            allowed_insertions: allowed_insertions.clone(),
+            slot_allowed_insertions: slot_allowed_insertions.clone(),
             sender,
             transaction_indexes: transaction_indexes.clone(),
         },
         RecordReceiver {
             is_shutdown: false,
             capacity: CAPACITY,
-            allowed_insertions,
+            slot_allowed_insertions,
             receiver,
             transaction_indexes,
         },
@@ -38,7 +40,7 @@ pub fn record_channels(track_transaction_indexes: bool) -> (RecordSender, Record
 
 #[derive(Clone, Debug)]
 pub struct RecordSender {
-    allowed_insertions: Arc<AtomicU64>,
+    slot_allowed_insertions: SlotAllowedInsertions,
     sender: Sender<Record>,
     transaction_indexes: Option<Arc<RwLock<usize>>>,
 }
@@ -57,17 +59,26 @@ impl RecordSender {
                 .transaction_indexes
                 .as_ref()
                 .map(|transaction_indexes| transaction_indexes.write().unwrap());
-            // Get the current remaining capacity.
-            // If it's 0, the channel is either full or closed - just return immediately.
-            let remaining_capacity = self.allowed_insertions.load(Ordering::Acquire);
-            if remaining_capacity == 0 {
+
+            // Get the current slot and allowed insertions.
+            // If the number of allowed insertions is 0, the channel is full - just return immediately.
+            // If the `record`'s slot is different from the current slot, return immediately.
+            let current_slot_allowed_insertions =
+                self.slot_allowed_insertions.load(Ordering::Acquire);
+            let slot = SlotAllowedInsertions::slot(current_slot_allowed_insertions);
+            let allowed_insertions =
+                SlotAllowedInsertions::allowed_insertions(current_slot_allowed_insertions);
+            if slot != record.slot || allowed_insertions == 0 {
                 return Err(TrySendError::Full(record));
             }
 
+            let slot_allowed_insertions =
+                SlotAllowedInsertions::encoded_value(slot, allowed_insertions - 1);
+
             // Decrement the remaining capacity.
-            match self.allowed_insertions.compare_exchange(
-                remaining_capacity,
-                remaining_capacity - 1,
+            match self.slot_allowed_insertions.compare_exchange(
+                current_slot_allowed_insertions,
+                slot_allowed_insertions,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
@@ -93,7 +104,7 @@ impl RecordSender {
 pub struct RecordReceiver {
     is_shutdown: bool,
     capacity: u64,
-    allowed_insertions: Arc<AtomicU64>,
+    slot_allowed_insertions: SlotAllowedInsertions,
     receiver: Receiver<Record>,
     transaction_indexes: Option<Arc<RwLock<usize>>>,
 }
@@ -110,16 +121,20 @@ impl RecordReceiver {
     /// Shut the channel down immediately.
     pub fn shutdown(&mut self) {
         self.is_shutdown = true;
-        self.allowed_insertions.store(0, Ordering::Release);
+        // The slot value doesn't matter here because we are done with whatever
+        // slot we were on.
+        self.slot_allowed_insertions.store(0, Ordering::Release);
     }
 
     /// Re-enable the channel after a shutdown.
-    pub fn restart(&mut self) {
+    pub fn restart(&mut self, slot: Slot) {
         assert!(self.is_shutdown);
         assert!(self.receiver.is_empty());
         self.is_shutdown = false;
-        self.allowed_insertions
-            .store(self.capacity, Ordering::Release);
+        self.slot_allowed_insertions.store(
+            SlotAllowedInsertions::encoded_value(slot, self.capacity),
+            Ordering::Release,
+        );
         if let Some(transaction_indexes) = self.transaction_indexes.as_ref() {
             *transaction_indexes.write().unwrap() = 0;
         }
@@ -153,7 +168,50 @@ impl RecordReceiver {
     fn on_received_record(&self) {
         // If we received a record AND are not shutdown, increment the allowed insertions.
         if !self.is_shutdown {
-            self.allowed_insertions.fetch_add(1, Ordering::AcqRel);
+            self.slot_allowed_insertions.fetch_add(1, Ordering::AcqRel);
         }
+    }
+}
+
+/// AtomicU64 that represents a combination of the current `slot` and the
+/// number of allowed insertions into the record channel.
+/// This is done because we need to ensure that the record insertion is
+/// done atomically wrt channel shutdown/capacity, but we also need to know
+/// the slot.
+///
+/// The `slot` is stored in the upper 48 bits, and the `allowed_insertions` in
+/// the lower 16 bits.
+#[derive(Clone, Debug)]
+struct SlotAllowedInsertions(Arc<AtomicU64>);
+
+impl SlotAllowedInsertions {
+    const MAX_SLOT: Slot = (1 << 48) - 1;
+    const MAX_ALLOWED_INSERTIONS: u64 = (1 << 16) - 1;
+
+    fn new(slot: Slot, allowed_insertions: u64) -> Self {
+        let value = Self::encoded_value(slot, allowed_insertions);
+        Self(Arc::new(AtomicU64::new(value)))
+    }
+
+    fn encoded_value(slot: Slot, allowed_insertions: u64) -> u64 {
+        assert!(slot <= Self::MAX_SLOT);
+        assert!(allowed_insertions <= Self::MAX_ALLOWED_INSERTIONS);
+        slot << 16 | allowed_insertions
+    }
+
+    fn slot(value: u64) -> Slot {
+        (value >> 16) as Slot
+    }
+
+    fn allowed_insertions(value: u64) -> u64 {
+        value & 0xffff
+    }
+}
+
+impl Deref for SlotAllowedInsertions {
+    type Target = AtomicU64;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }

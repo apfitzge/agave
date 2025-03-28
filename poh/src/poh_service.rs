@@ -203,8 +203,12 @@ impl PohService {
                 }
             }
             if let Some(bank_message) = bank_message {
-                Self::handle_bank_message(&poh_recorder, bank_message, &pending_bank_message);
-                record_receiver.restart();
+                Self::handle_bank_message(
+                    &poh_recorder,
+                    bank_message,
+                    &pending_bank_message,
+                    &mut record_receiver,
+                );
             }
         }
     }
@@ -271,8 +275,12 @@ impl PohService {
                 warn!("exit signal is ignored because PohService is scheduled to exit soon");
             }
             if let Some(bank_message) = bank_message {
-                Self::handle_bank_message(&poh_recorder, bank_message, &pending_bank_message);
-                record_receiver.restart();
+                Self::handle_bank_message(
+                    &poh_recorder,
+                    bank_message,
+                    &pending_bank_message,
+                    &mut record_receiver,
+                );
             }
         }
     }
@@ -436,8 +444,12 @@ impl PohService {
             }
 
             if let Some(bank_message) = bank_message {
-                Self::handle_bank_message(&poh_recorder, bank_message, &pending_bank_message);
-                record_receiver.restart();
+                Self::handle_bank_message(
+                    &poh_recorder,
+                    bank_message,
+                    &pending_bank_message,
+                    &mut record_receiver,
+                );
             }
         }
     }
@@ -460,18 +472,28 @@ impl PohService {
         poh_recorder: &RwLock<PohRecorder>,
         bank_message: BankMessage,
         pending_bank_message: &AtomicBool,
+        record_receiver: &mut RecordReceiver,
     ) {
-        {
+        let reset_slot = {
             let mut recorder = poh_recorder.write().unwrap();
             match bank_message {
                 BankMessage::Reset {
                     reset_bank,
                     next_leader_slot,
-                } => recorder.reset(reset_bank, next_leader_slot),
-                BankMessage::SetBank { bank } => recorder.set_bank(bank),
+                } => {
+                    let slot = reset_bank.slot();
+                    recorder.reset(reset_bank, next_leader_slot);
+                    slot
+                }
+                BankMessage::SetBank { bank } => {
+                    let slot = bank.slot();
+                    recorder.set_bank(bank);
+                    slot
+                }
             }
-        }
+        };
         pending_bank_message.store(false, Ordering::Release);
+        record_receiver.restart(reset_slot);
     }
 
     pub fn join(self) -> thread::Result<()> {
