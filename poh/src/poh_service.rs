@@ -196,8 +196,19 @@ impl PohService {
                 if remaining_tick_time.is_zero() {
                     last_tick = Instant::now();
                     poh_recorder.write().unwrap().tick();
-                    if record_receiver
-                        .should_shutdown(poh.lock().unwrap().remaining_hashes(), ticks_per_slot)
+                    let last_tick = {
+                        let poh_recorder = poh_recorder.read().unwrap();
+                        poh_recorder
+                            .bank()
+                            .map(|bank| {
+                                bank.max_tick_height().wrapping_sub(1) == poh_recorder.tick_height()
+                            })
+                            .unwrap_or(false)
+                    };
+
+                    if last_tick
+                        || record_receiver
+                            .should_shutdown(poh.lock().unwrap().remaining_hashes(), ticks_per_slot)
                     {
                         record_receiver.shutdown();
                     }
@@ -280,8 +291,20 @@ impl PohService {
                 if remaining_tick_time.is_zero() {
                     last_tick = Instant::now();
                     poh_recorder.write().unwrap().tick();
-                    if record_receiver
-                        .should_shutdown(poh.lock().unwrap().remaining_hashes(), ticks_per_slot)
+
+                    let last_tick = {
+                        let poh_recorder = poh_recorder.read().unwrap();
+                        poh_recorder
+                            .bank()
+                            .map(|bank| {
+                                bank.max_tick_height().wrapping_sub(1) == poh_recorder.tick_height()
+                            })
+                            .unwrap_or(false)
+                    };
+
+                    if last_tick
+                        || record_receiver
+                            .should_shutdown(poh.lock().unwrap().remaining_hashes(), ticks_per_slot)
                     {
                         record_receiver.shutdown();
                     }
