@@ -880,11 +880,6 @@ impl PohRecorder {
     }
 
     #[cfg(feature = "dev-context-only-utils")]
-    pub fn set_bank_with_transaction_index_for_test(&mut self, bank: Arc<Bank>) {
-        self.set_bank(BankWithScheduler::new_without_scheduler(bank))
-    }
-
-    #[cfg(feature = "dev-context-only-utils")]
     pub fn clear_bank_for_test(&mut self) {
         self.clear_bank();
     }
