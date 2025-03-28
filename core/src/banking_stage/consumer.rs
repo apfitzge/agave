@@ -846,8 +846,8 @@ mod tests {
                             .record(record.slot, record.mixins, record.transaction_batches)
                             .map(|record_summary| record_summary.starting_transaction_index);
                         poh_recorder.write().unwrap().tick();
-                        if record.sender.send(record_response).is_err() {
-                            panic!("Error returning mixin hash");
+                        if let Err(err) = record_response {
+                            panic!("record failed: {:?}", err);
                         }
                     }
                     if is_exited.load(Ordering::Relaxed) {

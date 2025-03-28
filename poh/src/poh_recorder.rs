@@ -70,28 +70,21 @@ pub(crate) type Result<T> = std::result::Result<T, PohRecorderError>;
 
 pub type WorkingBankEntry = (Arc<Bank>, (Entry, u64));
 
-// Sends the Result of the record operation, including the index in the slot of the first
-// transaction, if being tracked by WorkingBank
-type RecordResultSender = Sender<Result<Option<usize>>>;
-
 pub struct Record {
     pub mixins: Vec<Hash>,
     pub transaction_batches: Vec<Vec<VersionedTransaction>>,
     pub slot: Slot,
-    pub sender: RecordResultSender,
 }
 impl Record {
     pub fn new(
         mixins: Vec<Hash>,
         transaction_batches: Vec<Vec<VersionedTransaction>>,
         slot: Slot,
-        sender: RecordResultSender,
     ) -> Self {
         Self {
             mixins,
             transaction_batches,
             slot,
-            sender,
         }
     }
 }

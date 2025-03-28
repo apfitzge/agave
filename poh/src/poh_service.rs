@@ -10,7 +10,7 @@ use {
     log::*,
     solana_clock::DEFAULT_HASHES_PER_SECOND,
     solana_entry::poh::Poh,
-    solana_measure::{measure::Measure, measure_us},
+    solana_measure::measure::Measure,
     solana_poh_config::PohConfig,
     std::{
         sync::{
@@ -50,7 +50,6 @@ struct PohTiming {
     total_tick_time_ns: u64,
     last_metric: Instant,
     total_record_time_us: u64,
-    total_send_record_result_us: u64,
 }
 
 impl PohTiming {
@@ -64,7 +63,6 @@ impl PohTiming {
             total_tick_time_ns: 0,
             last_metric: Instant::now(),
             total_record_time_us: 0,
-            total_send_record_result_us: 0,
         }
     }
     fn report(&mut self, ticks_per_slot: u64) {
@@ -81,11 +79,6 @@ impl PohTiming {
                 ("total_lock_time_us", self.total_lock_time_ns / 1000, i64),
                 ("total_hash_time_us", self.total_hash_time_ns / 1000, i64),
                 ("total_record_time_us", self.total_record_time_us, i64),
-                (
-                    "total_send_record_result_us",
-                    self.total_send_record_result_us,
-                    i64
-                ),
             );
             self.total_sleep_us = 0;
             self.num_ticks = 0;
@@ -95,7 +88,6 @@ impl PohTiming {
             self.total_hash_time_ns = 0;
             self.last_metric = Instant::now();
             self.total_record_time_us = 0;
-            self.total_send_record_result_us = 0;
         }
     }
 }
@@ -224,18 +216,13 @@ impl PohService {
     ) {
         let record = record_receiver.recv_timeout(timeout);
         if let Ok(record) = record {
-            if record
-                .sender
-                .send(
-                    poh_recorder
-                        .write()
-                        .unwrap()
-                        .record(record.slot, record.mixins, record.transaction_batches)
-                        .map(|record_summary| record_summary.starting_transaction_index),
-                )
+            if poh_recorder
+                .write()
+                .unwrap()
+                .record(record.slot, record.mixins, record.transaction_batches)
                 .is_err()
             {
-                panic!("Error returning mixin hash");
+                panic!("PohRecorder::record failed");
             }
         }
     }
@@ -311,26 +298,23 @@ impl PohService {
                 timing.total_lock_time_ns += lock_time.as_ns();
                 let mut record_time = Measure::start("record");
                 loop {
-                    let res = poh_recorder_l
-                        .record(
-                            record.slot,
-                            record.mixins,
-                            std::mem::take(&mut record.transaction_batches),
-                        )
-                        .map(|record_summary| {
+                    match poh_recorder_l.record(
+                        record.slot,
+                        record.mixins,
+                        std::mem::take(&mut record.transaction_batches),
+                    ) {
+                        Ok(record_summary) => {
                             if record_receiver
                                 .should_shutdown(record_summary.remaining_hashes, ticks_per_slot)
                             {
                                 record_receiver.shutdown();
                             }
+                        }
+                        Err(_) => {
+                            panic!("PohRecorder::record failed");
+                        }
+                    }
 
-                            record_summary.starting_transaction_index
-                        });
-
-                    let (send_res, send_record_result_us) = measure_us!(record.sender.send(res));
-                    debug_assert!(send_res.is_ok(), "Record wasn't sent.");
-
-                    timing.total_send_record_result_us += send_record_result_us;
                     timing.num_hashes += 1; // note: may have also ticked inside record
                     if let Ok(new_record) = record_receiver.try_recv() {
                         // we already have second request to record, so record again while we still have the mutex
