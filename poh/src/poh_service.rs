@@ -114,6 +114,7 @@ impl PohService {
                             poh_recorder,
                             &poh_config,
                             &poh_exit,
+                            ticks_per_slot,
                             record_receiver,
                             bank_message_receiver,
                             pending_bank_message,
@@ -123,6 +124,7 @@ impl PohService {
                             poh_recorder,
                             &poh_config,
                             &poh_exit,
+                            ticks_per_slot,
                             record_receiver,
                             bank_message_receiver,
                             pending_bank_message,
@@ -171,10 +173,12 @@ impl PohService {
         poh_recorder: Arc<RwLock<PohRecorder>>,
         poh_config: &PohConfig,
         poh_exit: &AtomicBool,
+        ticks_per_slot: u64,
         mut record_receiver: RecordReceiver,
         bank_message_receiver: Receiver<BankMessage>,
         pending_bank_message: Arc<AtomicBool>,
     ) {
+        let poh = poh_recorder.read().unwrap().poh.clone();
         let mut last_tick = Instant::now();
         while !poh_exit.load(Ordering::Relaxed) {
             let bank_message =
@@ -185,12 +189,18 @@ impl PohService {
                     .saturating_sub(last_tick.elapsed());
                 Self::read_record_receiver_and_process(
                     &poh_recorder,
-                    &record_receiver,
+                    &mut record_receiver,
+                    ticks_per_slot,
                     remaining_tick_time,
                 );
                 if remaining_tick_time.is_zero() {
                     last_tick = Instant::now();
                     poh_recorder.write().unwrap().tick();
+                    if record_receiver
+                        .should_shutdown(poh.lock().unwrap().remaining_hashes(), ticks_per_slot)
+                    {
+                        record_receiver.shutdown();
+                    }
                 }
 
                 // If there is a bank message (channel is shut down), and there
@@ -215,18 +225,27 @@ impl PohService {
 
     pub fn read_record_receiver_and_process(
         poh_recorder: &Arc<RwLock<PohRecorder>>,
-        record_receiver: &RecordReceiver,
+        record_receiver: &mut RecordReceiver,
+        ticks_per_slot: u64,
         timeout: Duration,
     ) {
         let record = record_receiver.recv_timeout(timeout);
         if let Ok(record) = record {
-            if poh_recorder
-                .write()
-                .unwrap()
-                .record(record.slot, record.mixins, record.transaction_batches)
-                .is_err()
-            {
-                panic!("PohRecorder::record failed");
+            match poh_recorder.write().unwrap().record(
+                record.slot,
+                record.mixins,
+                record.transaction_batches,
+            ) {
+                Ok(record_summary) => {
+                    if record_receiver
+                        .should_shutdown(record_summary.remaining_hashes, ticks_per_slot)
+                    {
+                        record_receiver.shutdown();
+                    }
+                }
+                Err(e) => {
+                    panic!("PohRecorder::record failed: {:?}", e);
+                }
             }
         }
     }
@@ -235,6 +254,7 @@ impl PohService {
         poh_recorder: Arc<RwLock<PohRecorder>>,
         poh_config: &PohConfig,
         poh_exit: &AtomicBool,
+        ticks_per_slot: u64,
         mut record_receiver: RecordReceiver,
         bank_message_receiver: Receiver<BankMessage>,
         pending_bank_message: Arc<AtomicBool>,
@@ -243,6 +263,7 @@ impl PohService {
         let mut elapsed_ticks = 0;
         let mut last_tick = Instant::now();
         let num_ticks = poh_config.target_tick_count.unwrap();
+        let poh = poh_recorder.read().unwrap().poh.clone();
         while elapsed_ticks < num_ticks {
             let bank_message =
                 Self::check_for_bank_message(&bank_message_receiver, &mut record_receiver);
@@ -252,12 +273,18 @@ impl PohService {
                     .saturating_sub(last_tick.elapsed());
                 Self::read_record_receiver_and_process(
                     &poh_recorder,
-                    &record_receiver,
+                    &mut record_receiver,
+                    ticks_per_slot,
                     Duration::from_millis(0),
                 );
                 if remaining_tick_time.is_zero() {
                     last_tick = Instant::now();
                     poh_recorder.write().unwrap().tick();
+                    if record_receiver
+                        .should_shutdown(poh.lock().unwrap().remaining_hashes(), ticks_per_slot)
+                    {
+                        record_receiver.shutdown();
+                    }
                     elapsed_ticks += 1;
                 }
 

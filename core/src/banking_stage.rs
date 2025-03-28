@@ -1089,7 +1089,11 @@ mod tests {
         let recorder = TransactionRecorder::new(record_sender, poh_recorder.is_exited.clone());
         let poh_recorder = Arc::new(RwLock::new(poh_recorder));
 
-        let poh_simulator = simulate_poh(record_receiver, &poh_recorder);
+        let poh_simulator = simulate_poh(
+            genesis_config.ticks_per_slot,
+            record_receiver,
+            &poh_recorder,
+        );
 
         poh_recorder
             .write()
@@ -1145,7 +1149,8 @@ mod tests {
     }
 
     pub(crate) fn simulate_poh(
-        record_receiver: RecordReceiver,
+        ticks_per_slot: u64,
+        mut record_receiver: RecordReceiver,
         poh_recorder: &Arc<RwLock<PohRecorder>>,
     ) -> JoinHandle<()> {
         let poh_recorder = poh_recorder.clone();
@@ -1155,7 +1160,8 @@ mod tests {
             .spawn(move || loop {
                 PohService::read_record_receiver_and_process(
                     &poh_recorder,
-                    &record_receiver,
+                    &mut record_receiver,
+                    ticks_per_slot,
                     Duration::from_millis(10),
                 );
                 if is_exited.load(Ordering::Relaxed) {

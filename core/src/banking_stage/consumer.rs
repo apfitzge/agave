@@ -588,7 +588,7 @@ mod tests {
             .unwrap()
             .set_bank_for_test(bank.clone());
 
-        let poh_simulator = simulate_poh(record_receiver, &poh_recorder);
+        let poh_simulator = simulate_poh(bank.ticks_per_slot(), record_receiver, &poh_recorder);
 
         let (replay_vote_sender, _replay_vote_receiver) = unbounded();
         let committer = Committer::new(
@@ -694,7 +694,7 @@ mod tests {
         let recorder = TransactionRecorder::new(record_sender, poh_recorder.is_exited.clone());
         let poh_recorder = Arc::new(RwLock::new(poh_recorder));
 
-        let poh_simulator = simulate_poh(record_receiver, &poh_recorder);
+        let poh_simulator = simulate_poh(bank.ticks_per_slot(), record_receiver, &poh_recorder);
 
         poh_recorder
             .write()
@@ -988,7 +988,7 @@ mod tests {
         let recorder = TransactionRecorder::new(record_sender, poh_recorder.is_exited.clone());
         let poh_recorder = Arc::new(RwLock::new(poh_recorder));
 
-        let poh_simulator = simulate_poh(record_receiver, &poh_recorder);
+        let poh_simulator = simulate_poh(bank.ticks_per_slot(), record_receiver, &poh_recorder);
 
         poh_recorder
             .write()
@@ -1076,7 +1076,7 @@ mod tests {
         let recorder = TransactionRecorder::new(record_sender, poh_recorder.is_exited.clone());
         let poh_recorder = Arc::new(RwLock::new(poh_recorder));
 
-        let poh_simulator = simulate_poh(record_receiver, &poh_recorder);
+        let poh_simulator = simulate_poh(bank.ticks_per_slot(), record_receiver, &poh_recorder);
 
         poh_recorder
             .write()
@@ -1273,7 +1273,7 @@ mod tests {
             .unwrap()
             .set_bank_for_test(bank.clone());
 
-        let poh_simulator = simulate_poh(record_receiver, &poh_recorder);
+        let poh_simulator = simulate_poh(bank.ticks_per_slot(), record_receiver, &poh_recorder);
 
         let (replay_vote_sender, _replay_vote_receiver) = unbounded();
         let committer = Committer::new(
@@ -1519,7 +1519,11 @@ mod tests {
         let (record_sender, record_receiver) = record_channels(false);
         let recorder = TransactionRecorder::new(record_sender, poh_recorder.is_exited.clone());
 
-        let poh_simulator = simulate_poh(record_receiver, &Arc::new(RwLock::new(poh_recorder)));
+        let poh_simulator = simulate_poh(
+            bank.ticks_per_slot(),
+            record_receiver,
+            &Arc::new(RwLock::new(poh_recorder)),
+        );
 
         let (replay_vote_sender, _replay_vote_receiver) = unbounded();
         let committer = Committer::new(
@@ -1631,7 +1635,7 @@ mod tests {
         let recorder = TransactionRecorder::new(record_sender, poh_recorder.is_exited.clone());
         let poh_recorder = Arc::new(RwLock::new(poh_recorder));
 
-        let poh_simulator = simulate_poh(record_receiver, &poh_recorder);
+        let poh_simulator = simulate_poh(bank.ticks_per_slot(), record_receiver, &poh_recorder);
 
         poh_recorder
             .write()
@@ -1777,7 +1781,7 @@ mod tests {
         let recorder = TransactionRecorder::new(record_sender, poh_recorder.is_exited.clone());
         let poh_recorder = Arc::new(RwLock::new(poh_recorder));
 
-        let poh_simulator = simulate_poh(record_receiver, &poh_recorder);
+        let poh_simulator = simulate_poh(bank.ticks_per_slot(), record_receiver, &poh_recorder);
 
         poh_recorder
             .write()

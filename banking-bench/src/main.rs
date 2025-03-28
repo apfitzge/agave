@@ -532,10 +532,9 @@ fn main() {
             tx_total_us += now.elapsed().as_micros() as u64;
 
             let mut poh_time = Measure::start("poh_time");
-            poh_recorder
-                .write()
-                .unwrap()
-                .reset_for_test(bank.clone(), Some((bank.slot(), bank.slot() + 1)));
+            poh_controller
+                .reset(bank.clone(), Some((bank.slot(), bank.slot() + 1)))
+                .unwrap();
             poh_time.stop();
 
             let mut new_bank_time = Measure::start("new_bank");
