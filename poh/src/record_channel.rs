@@ -4,7 +4,7 @@ use {
     std::{
         sync::{
             atomic::{AtomicU64, Ordering},
-            Arc,
+            Arc, RwLock,
         },
         time::Duration,
     },
@@ -15,16 +15,19 @@ pub fn record_channels() -> (RecordSender, RecordReceiver) {
     const CAPACITY: u64 = 1024;
     let (sender, receiver) = bounded(CAPACITY as usize);
     let allowed_insertions = Arc::new(AtomicU64::new(CAPACITY));
+    let transaction_indexes = None;
     (
         RecordSender {
             allowed_insertions: allowed_insertions.clone(),
             sender,
+            transaction_indexes: transaction_indexes.clone(),
         },
         RecordReceiver {
             is_shutdown: false,
             capacity: CAPACITY,
             allowed_insertions,
             receiver,
+            transaction_indexes,
         },
     )
 }
@@ -33,11 +36,19 @@ pub fn record_channels() -> (RecordSender, RecordReceiver) {
 pub struct RecordSender {
     allowed_insertions: Arc<AtomicU64>,
     sender: Sender<Record>,
+    transaction_indexes: Option<Arc<RwLock<usize>>>,
 }
 
 impl RecordSender {
-    pub fn try_send(&self, record: Record) -> Result<(), TrySendError<Record>> {
+    pub fn try_send(&self, record: Record) -> Result<Option<usize>, TrySendError<Record>> {
+        let num_transactions = record.transactions.len();
         loop {
+            // Grab lock on transaction_indexes here to ensure we are sequential sending,
+            // ONLY if this exists.
+            let transaction_indexes = self
+                .transaction_indexes
+                .as_ref()
+                .map(|transaction_indexes| transaction_indexes.write().unwrap());
             // Get the current remaining capacity.
             // If it's 0, the channel is either full or closed - just return immediately.
             let remaining_capacity = self.allowed_insertions.load(Ordering::Acquire);
@@ -55,7 +66,11 @@ impl RecordSender {
                 Ok(_) => {
                     // Send the value over the channel, space has been reserved successfully.
                     self.sender.try_send(record)?;
-                    return Ok(());
+                    return Ok(transaction_indexes.map(|mut transaction_indexes| {
+                        let transaction_starting_index = *transaction_indexes;
+                        *transaction_indexes = transaction_starting_index + num_transactions;
+                        transaction_starting_index
+                    }));
                 }
                 Err(_) => {
                     // Value was changed by another thread (producer or consumer).
@@ -72,6 +87,7 @@ pub struct RecordReceiver {
     capacity: u64,
     allowed_insertions: Arc<AtomicU64>,
     receiver: Receiver<Record>,
+    transaction_indexes: Option<Arc<RwLock<usize>>>,
 }
 
 impl RecordReceiver {
@@ -96,6 +112,9 @@ impl RecordReceiver {
         self.is_shutdown = false;
         self.allowed_insertions
             .store(self.capacity, Ordering::Release);
+        if let Some(transaction_indexes) = self.transaction_indexes.as_ref() {
+            *transaction_indexes.write().unwrap() = 0;
+        }
     }
 
     /// Drain the channel - this should only be called if the channel is shutdown.
