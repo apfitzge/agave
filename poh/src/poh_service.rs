@@ -207,8 +207,10 @@ impl PohService {
                     };
 
                     if last_tick
-                        || record_receiver
-                            .should_shutdown(poh.lock().unwrap().remaining_hashes(), ticks_per_slot)
+                        || record_receiver.should_shutdown(
+                            poh.lock().unwrap().remaining_hashes_in_slot(ticks_per_slot),
+                            ticks_per_slot,
+                        )
                     {
                         record_receiver.shutdown();
                     }
@@ -303,8 +305,10 @@ impl PohService {
                     };
 
                     if last_tick
-                        || record_receiver
-                            .should_shutdown(poh.lock().unwrap().remaining_hashes(), ticks_per_slot)
+                        || record_receiver.should_shutdown(
+                            poh.lock().unwrap().remaining_hashes_in_slot(ticks_per_slot),
+                            ticks_per_slot,
+                        )
                     {
                         record_receiver.shutdown();
                     }
@@ -397,7 +401,10 @@ impl PohService {
                     let should_tick = poh_l.hash(hashes_per_batch);
                     let ideal_time = poh_l.target_poh_time(target_ns_per_tick);
                     hash_time.stop();
-                    if record_receiver.should_shutdown(poh_l.remaining_hashes(), ticks_per_slot) {
+                    if record_receiver.should_shutdown(
+                        poh_l.remaining_hashes_in_slot(ticks_per_slot),
+                        ticks_per_slot,
+                    ) {
                         record_receiver.shutdown();
                     }
                     timing.total_hash_time_ns += hash_time.as_ns();

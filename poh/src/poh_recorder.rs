@@ -344,7 +344,8 @@ impl PohRecorder {
             let (mixed_in, record_mixin_us) =
                 measure_us!(poh_lock.record_batches(&mixins, &mut self.entries));
             self.metrics.record_us += record_mixin_us;
-            let remaining_hashes = poh_lock.remaining_hashes();
+            let remaining_hashes =
+                poh_lock.remaining_hashes_in_slot(working_bank.bank.ticks_per_slot());
 
             drop(poh_lock);
 
