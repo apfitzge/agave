@@ -742,7 +742,7 @@ impl BankingSimulator {
             exit.clone(),
         );
         let poh_recorder = Arc::new(RwLock::new(poh_recorder));
-        let (record_sender, record_receiver) = record_channels();
+        let (record_sender, record_receiver) = record_channels(false);
         let transaction_recorder = TransactionRecorder::new(record_sender, exit.clone());
         let (poh_controller, bank_message_receiver) = PohController::new();
         let poh_service = PohService::new(

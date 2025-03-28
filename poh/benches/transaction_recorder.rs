@@ -60,7 +60,7 @@ fn bench_record_transactions(c: &mut Criterion) {
         exit.clone(),
     );
 
-    let (record_sender, record_receiver) = record_channels();
+    let (record_sender, record_receiver) = record_channels(false);
     let transaction_recorder = TransactionRecorder::new(record_sender, exit.clone());
 
     let txs: Vec<_> = (0..NUM_TRANSACTIONS)

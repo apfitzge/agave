@@ -631,7 +631,7 @@ mod tests {
         let hashes_per_batch = std::env::var("HASHES_PER_BATCH")
             .map(|x| x.parse().unwrap())
             .unwrap_or(DEFAULT_HASHES_PER_BATCH);
-        let (_record_sender, record_receiver) = record_channels();
+        let (_record_sender, record_receiver) = record_channels(false);
         let (controller, bank_message_receiver) = PohController::new();
         let poh_service = PohService::new(
             poh_recorder.clone(),

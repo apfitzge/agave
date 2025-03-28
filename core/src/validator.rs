@@ -909,7 +909,7 @@ impl Validator {
 
         let leader_schedule_cache = Arc::new(leader_schedule_cache);
         let startup_verification_complete;
-        let (mut poh_recorder, entry_receiver) = {
+        let (poh_recorder, entry_receiver) = {
             let bank = &bank_forks.read().unwrap().working_bank();
             startup_verification_complete = Arc::clone(bank.get_startup_verification_complete());
             PohRecorder::new_with_clear_signal(
@@ -926,10 +926,7 @@ impl Validator {
                 exit.clone(),
             )
         };
-        if transaction_status_sender.is_some() {
-            poh_recorder.track_transaction_indexes();
-        }
-        let (record_sender, record_receiver) = record_channels();
+        let (record_sender, record_receiver) = record_channels(transaction_status_sender.is_some());
         let transaction_recorder =
             TransactionRecorder::new(record_sender, poh_recorder.is_exited.clone());
         let (poh_controller, bank_message_receiver) = PohController::new();

@@ -562,7 +562,7 @@ mod tests {
             &PohConfig::default(),
             Arc::new(AtomicBool::default()),
         );
-        let (record_sender, record_receiver) = record_channels();
+        let (record_sender, record_receiver) = record_channels(false);
         let recorder = TransactionRecorder::new(record_sender, poh_recorder.is_exited.clone());
         let poh_recorder = Arc::new(RwLock::new(poh_recorder));
 
@@ -673,7 +673,7 @@ mod tests {
             &PohConfig::default(),
             Arc::new(AtomicBool::default()),
         );
-        let (record_sender, record_receiver) = record_channels();
+        let (record_sender, record_receiver) = record_channels(false);
         let recorder = TransactionRecorder::new(record_sender, poh_recorder.is_exited.clone());
         let poh_recorder = Arc::new(RwLock::new(poh_recorder));
 
@@ -825,7 +825,7 @@ mod tests {
             &PohConfig::default(),
             Arc::new(AtomicBool::new(false)),
         );
-        let (record_sender, record_receiver) = record_channels();
+        let (record_sender, record_receiver) = record_channels(false);
         let recorder = TransactionRecorder::new(record_sender, poh_recorder.is_exited.clone());
         let poh_recorder = Arc::new(RwLock::new(poh_recorder));
 
@@ -967,7 +967,7 @@ mod tests {
             &PohConfig::default(),
             Arc::new(AtomicBool::default()),
         );
-        let (record_sender, record_receiver) = record_channels();
+        let (record_sender, record_receiver) = record_channels(false);
         let recorder = TransactionRecorder::new(record_sender, poh_recorder.is_exited.clone());
         let poh_recorder = Arc::new(RwLock::new(poh_recorder));
 
@@ -1055,7 +1055,7 @@ mod tests {
             &PohConfig::default(),
             Arc::new(AtomicBool::default()),
         );
-        let (record_sender, record_receiver) = record_channels();
+        let (record_sender, record_receiver) = record_channels(false);
         let recorder = TransactionRecorder::new(record_sender, poh_recorder.is_exited.clone());
         let poh_recorder = Arc::new(RwLock::new(poh_recorder));
 
@@ -1247,7 +1247,7 @@ mod tests {
             &PohConfig::default(),
             Arc::new(AtomicBool::default()),
         );
-        let (record_sender, record_receiver) = record_channels();
+        let (record_sender, record_receiver) = record_channels(false);
         let recorder = TransactionRecorder::new(record_sender, poh_recorder.is_exited.clone());
         let poh_recorder = Arc::new(RwLock::new(poh_recorder));
 
@@ -1499,7 +1499,7 @@ mod tests {
 
         // Poh Recorder has no working bank, so should throw MaxHeightReached error on
         // record
-        let (record_sender, record_receiver) = record_channels();
+        let (record_sender, record_receiver) = record_channels(false);
         let recorder = TransactionRecorder::new(record_sender, poh_recorder.is_exited.clone());
 
         let poh_simulator = simulate_poh(record_receiver, &Arc::new(RwLock::new(poh_recorder)));
@@ -1610,7 +1610,7 @@ mod tests {
             &PohConfig::default(),
             Arc::new(AtomicBool::default()),
         );
-        let (record_sender, record_receiver) = record_channels();
+        let (record_sender, record_receiver) = record_channels(false);
         let recorder = TransactionRecorder::new(record_sender, poh_recorder.is_exited.clone());
         let poh_recorder = Arc::new(RwLock::new(poh_recorder));
 
@@ -1756,7 +1756,7 @@ mod tests {
             &PohConfig::default(),
             Arc::new(AtomicBool::default()),
         );
-        let (record_sender, record_receiver) = record_channels();
+        let (record_sender, record_receiver) = record_channels(false);
         let recorder = TransactionRecorder::new(record_sender, poh_recorder.is_exited.clone());
         let poh_recorder = Arc::new(RwLock::new(poh_recorder));
 

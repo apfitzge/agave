@@ -11,11 +11,15 @@ use {
 };
 
 /// Create a channel pair for communicating `Record`s.
-pub fn record_channels() -> (RecordSender, RecordReceiver) {
+pub fn record_channels(track_transaction_indexes: bool) -> (RecordSender, RecordReceiver) {
     const CAPACITY: u64 = 1024;
     let (sender, receiver) = bounded(CAPACITY as usize);
     let allowed_insertions = Arc::new(AtomicU64::new(CAPACITY));
-    let transaction_indexes = None;
+    let transaction_indexes = if track_transaction_indexes {
+        Some(Arc::new(RwLock::new(0)))
+    } else {
+        None
+    };
     (
         RecordSender {
             allowed_insertions: allowed_insertions.clone(),
@@ -41,7 +45,11 @@ pub struct RecordSender {
 
 impl RecordSender {
     pub fn try_send(&self, record: Record) -> Result<Option<usize>, TrySendError<Record>> {
-        let num_transactions = record.transactions.len();
+        let num_transactions = record
+            .transaction_batches
+            .iter()
+            .map(|batch| batch.len())
+            .sum::<usize>();
         loop {
             // Grab lock on transaction_indexes here to ensure we are sequential sending,
             // ONLY if this exists.
