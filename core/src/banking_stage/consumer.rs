@@ -9,6 +9,7 @@ use {
     solana_clock::MAX_PROCESSING_AGE,
     solana_fee::FeeFeatures,
     solana_fee_structure::FeeBudgetLimits,
+    solana_hash::Hash,
     solana_measure::measure_us,
     solana_poh::{
         poh_recorder::PohRecorderError,
@@ -350,6 +351,22 @@ impl Consumer {
         let (freeze_lock, freeze_lock_us) = measure_us!(bank.freeze_lock());
         execute_and_commit_timings.freeze_lock_us = freeze_lock_us;
 
+        // If already frozen, then we don't even try to record.
+        if *freeze_lock != Hash::default() {
+            retryable_transaction_indexes.extend(processing_results.iter().enumerate().filter_map(
+                |(index, processing_result)| processing_result.was_processed().then_some(index),
+            ));
+
+            return ExecuteAndCommitTransactionsOutput {
+                transaction_counts,
+                retryable_transaction_indexes,
+                commit_transactions_result: Err(PohRecorderError::MaxHeightReached),
+                execute_and_commit_timings,
+                error_counters,
+                min_prioritization_fees,
+                max_prioritization_fees,
+            };
+        }
         let (record_transactions_summary, record_us) = measure_us!(self
             .transaction_recorder
             .record_transactions(bank.slot(), processed_transactions));
