@@ -840,11 +840,11 @@ mod tests {
                     let timeout = Duration::from_millis(10);
                     let record = record_receiver.recv_timeout(timeout);
                     if let Ok(record) = record {
-                        let record_response = poh_recorder
-                            .write()
-                            .unwrap()
-                            .record(record.slot, record.mixins, record.transaction_batches)
-                            .map(|record_summary| record_summary.starting_transaction_index);
+                        let record_response = poh_recorder.write().unwrap().record(
+                            record.slot,
+                            record.mixins,
+                            record.transaction_batches,
+                        );
                         poh_recorder.write().unwrap().tick();
                         if let Err(err) = record_response {
                             panic!("record failed: {:?}", err);

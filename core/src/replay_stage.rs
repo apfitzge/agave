@@ -8661,15 +8661,13 @@ pub(crate) mod tests {
         // this test to use true to avoid skipping the leader slot
         let has_new_vote_been_rooted = true;
 
-        let rpc_subscriptions = Some(rpc_subscriptions);
-
         assert!(!ReplayStage::maybe_start_leader(
             my_pubkey,
             bank_forks,
             &poh_recorder,
             &poh_controller,
             &leader_schedule_cache,
-            rpc_subscriptions.as_deref(),
+            Some(&rpc_subscriptions),
             &None,
             &mut progress,
             &retransmit_slots_sender,
@@ -9317,8 +9315,6 @@ pub(crate) mod tests {
         // this test to use true to avoid skipping the leader slot
         let has_new_vote_been_rooted = true;
 
-        let rpc_subscriptions = Some(rpc_subscriptions);
-
         // We should not attempt to start leader for the dummy_slot
         assert_matches!(
             poh_recorder.read().unwrap().reached_leader_slot(&my_pubkey),
@@ -9330,7 +9326,7 @@ pub(crate) mod tests {
             &poh_recorder,
             &poh_controller,
             &leader_schedule_cache,
-            rpc_subscriptions.as_deref(),
+            Some(&rpc_subscriptions),
             &None,
             &mut progress,
             &retransmit_slots_sender,
@@ -9357,7 +9353,7 @@ pub(crate) mod tests {
             &poh_recorder,
             &poh_controller,
             &leader_schedule_cache,
-            rpc_subscriptions.as_deref(),
+            Some(&rpc_subscriptions),
             &None,
             &mut progress,
             &retransmit_slots_sender,
