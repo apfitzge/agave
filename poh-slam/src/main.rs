@@ -66,7 +66,7 @@ fn main() {
         0,
         Hash::default(),
         bank.clone(),
-        Some((1, 1)),
+        Some((1, 4)),
         64,
         blockstore,
         &leader_schedule_cache,
@@ -125,11 +125,12 @@ fn main() {
                     std::thread::sleep(Duration::from_millis(1));
                 }
 
-                bank = Arc::new(Bank::new_from_parent(
-                    bank,
-                    collector_id,
-                    slot.wrapping_add(1),
-                ));
+                // Poh reset
+                let next_slot = bank.slot().wrapping_add(1);
+                poh_controller
+                    .reset(bank.clone(), Some((next_slot, slot.wrapping_add(4))))
+                    .unwrap();
+                bank = Arc::new(Bank::new_from_parent(bank, collector_id, next_slot));
                 slot = bank.slot();
                 num_recorded = 0;
 
