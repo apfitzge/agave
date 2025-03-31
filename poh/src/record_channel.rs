@@ -115,7 +115,7 @@ impl RecordReceiver {
         // entries, where each entry results in 1 hash.
         // This is very conservative and does not assume we have already
         // included ANY ticks.
-        remaining_hashes.saturating_sub(ticks_per_slot) < self.capacity
+        remaining_hashes.saturating_sub(ticks_per_slot) <= 2 * self.capacity
     }
 
     /// Shut the channel down immediately.
