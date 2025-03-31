@@ -5286,6 +5286,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "poh-slam"
+version = "2.3.0"
+dependencies = [
+ "log",
+ "solana-hash",
+ "solana-ledger",
+ "solana-logger",
+ "solana-message",
+ "solana-poh",
+ "solana-poh-config",
+ "solana-pubkey",
+ "solana-runtime",
+ "solana-transaction",
+]
+
+[[package]]
 name = "polyval"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

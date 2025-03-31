@@ -63,7 +63,7 @@ members = [
     "platform-tools-sdk/cargo-test-sbf",
     "platform-tools-sdk/gen-headers",
     "poh",
-    "poh-bench",
+    "poh-bench", "poh-slam",
     "poseidon",
     "precompiles",
     "program-runtime",
