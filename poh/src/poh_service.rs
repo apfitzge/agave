@@ -346,6 +346,7 @@ impl PohService {
         timing: &mut PohTiming,
         record_receiver: &mut RecordReceiver,
         ticks_per_slot: u64,
+        hashes_per_tick: u64,
         hashes_per_batch: u64,
         poh: &Arc<Mutex<Poh>>,
         target_ns_per_tick: u64,
@@ -368,6 +369,7 @@ impl PohService {
                         Ok(record_summary) => {
                             if record_receiver
                                 .should_shutdown(record_summary.remaining_hashes, ticks_per_slot)
+                                || record_summary.remaining_hashes <= hashes_per_tick
                             {
                                 record_receiver.shutdown();
                             }
@@ -401,10 +403,10 @@ impl PohService {
                     let should_tick = poh_l.hash(hashes_per_batch);
                     let ideal_time = poh_l.target_poh_time(target_ns_per_tick);
                     hash_time.stop();
-                    if record_receiver.should_shutdown(
-                        poh_l.remaining_hashes_in_slot(ticks_per_slot),
-                        ticks_per_slot,
-                    ) {
+                    let remaining_hashes = poh_l.remaining_hashes_in_slot(ticks_per_slot);
+                    if record_receiver.should_shutdown(remaining_hashes, ticks_per_slot)
+                        || remaining_hashes <= hashes_per_tick
+                    {
                         record_receiver.shutdown();
                     }
                     timing.total_hash_time_ns += hash_time.as_ns();
@@ -454,6 +456,7 @@ impl PohService {
         target_ns_per_tick: u64,
     ) {
         let poh = poh_recorder.read().unwrap().poh.clone();
+        let hashes_per_tick = poh.lock().unwrap().hashes_per_tick();
         let mut timing = PohTiming::new();
         let mut next_record = None;
         'outer: loop {
@@ -466,6 +469,7 @@ impl PohService {
                     &mut timing,
                     &mut record_receiver,
                     ticks_per_slot,
+                    hashes_per_tick,
                     hashes_per_batch,
                     &poh,
                     target_ns_per_tick,
