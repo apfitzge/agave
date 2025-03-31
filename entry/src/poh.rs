@@ -148,7 +148,7 @@ impl Poh {
 
     pub fn remaining_hashes_in_slot(&self, ticks_per_slot: u64) -> u64 {
         ticks_per_slot
-            .saturating_sub(self.tick_number)
+            .saturating_sub(self.tick_number % ticks_per_slot + 1)
             .wrapping_mul(self.hashes_per_tick)
             .wrapping_add(self.remaining_hashes)
     }
