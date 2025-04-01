@@ -5,9 +5,9 @@ use {
     solana_message::{Message, VersionedMessage},
     solana_poh::{
         poh_controller::PohController,
-        poh_recorder::{PohRecorder, PohRecorderError},
+        poh_recorder::PohRecorder,
         poh_service::PohService,
-        record_channel::record_channels,
+        record_channel::{record_channels, RecordSenderError},
         transaction_recorder::TransactionRecorder,
     },
     solana_poh_config::PohConfig,
@@ -113,12 +113,12 @@ fn main() {
         .set_bank(BankWithScheduler::new_without_scheduler(bank.clone()))
         .unwrap();
     loop {
-        let result = transaction_recorder.record(slot, Hash::default(), txs.clone());
+        let result = transaction_recorder.record(slot, vec![Hash::default()], vec![txs.clone()]);
         match result {
             Ok(_) => {
                 num_recorded = num_recorded.wrapping_add(1);
             }
-            Err(PohRecorderError::MaxHeightReached) => {
+            Err(RecordSenderError::InactiveSlot) => {
                 info!("{slot}: {num_recorded}");
 
                 // Wait for PohRecorder to be done.
@@ -142,8 +142,8 @@ fn main() {
 
                 info!("Starting {slot}...");
             }
-            Err(err) => {
-                panic!("Unexpected error: {err:?}");
+            Err(_) => {
+                panic!("Unexpected error");
             }
         }
     }

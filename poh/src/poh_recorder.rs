@@ -56,6 +56,12 @@ pub enum PohRecorderError {
 
     #[error("send WorkingBankEntry error")]
     SendError(#[from] SendError<WorkingBankEntry>),
+
+    #[error("channel full")]
+    ChannelFull,
+
+    #[error("channel disconnected")]
+    ChannelDisconnected,
 }
 
 #[derive(Debug)]

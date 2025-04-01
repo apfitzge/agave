@@ -1,7 +1,7 @@
 use {
     crate::{
-        poh_recorder::{PohRecorderError, Record, Result},
-        record_channel::RecordSender,
+        poh_recorder::{PohRecorderError, Record},
+        record_channel::{RecordSender, RecordSenderError},
     },
     solana_clock::Slot,
     solana_entry::entry::hash_transactions,
@@ -33,7 +33,7 @@ pub struct RecordTransactionsSummary {
     // Metrics describing how time was spent recording transactions
     pub record_transactions_timings: RecordTransactionsTimings,
     // Result of trying to record the transactions into the PoH stream
-    pub result: Result<()>,
+    pub result: Result<(), PohRecorderError>,
     // Index in the slot of the first transaction recorded
     pub starting_transaction_index: Option<usize>,
 }
@@ -76,21 +76,27 @@ impl TransactionRecorder {
                 Ok(starting_index) => {
                     starting_transaction_index = starting_index;
                 }
-                Err(PohRecorderError::MaxHeightReached) => {
+                Err(RecordSenderError::InactiveSlot) => {
                     return RecordTransactionsSummary {
                         record_transactions_timings,
                         result: Err(PohRecorderError::MaxHeightReached),
                         starting_transaction_index: None,
                     };
                 }
-                Err(PohRecorderError::SendError(e)) => {
+                Err(RecordSenderError::Full(_)) => {
                     return RecordTransactionsSummary {
                         record_transactions_timings,
-                        result: Err(PohRecorderError::SendError(e)),
+                        result: Err(PohRecorderError::ChannelFull),
                         starting_transaction_index: None,
                     };
                 }
-                Err(e) => panic!("Poh recorder returned unexpected error: {e:?}"),
+                Err(RecordSenderError::Disconnected) => {
+                    return RecordTransactionsSummary {
+                        record_transactions_timings,
+                        result: Err(PohRecorderError::ChannelDisconnected),
+                        starting_transaction_index: None,
+                    };
+                }
             }
         }
 
@@ -107,9 +113,8 @@ impl TransactionRecorder {
         bank_slot: Slot,
         mixins: Vec<Hash>,
         transaction_batches: Vec<Vec<VersionedTransaction>>,
-    ) -> Result<Option<usize>> {
+    ) -> Result<Option<usize>, RecordSenderError> {
         self.record_sender
             .try_send(Record::new(mixins, transaction_batches, bank_slot))
-            .map_err(|_| PohRecorderError::MaxHeightReached)
     }
 }

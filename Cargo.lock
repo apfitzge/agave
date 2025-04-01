@@ -5287,7 +5287,7 @@ dependencies = [
 
 [[package]]
 name = "poh-slam"
-version = "2.3.0"
+version = "3.0.0"
 dependencies = [
  "log",
  "solana-hash",

@@ -1,6 +1,6 @@
 use {
     crate::poh_recorder::Record,
-    crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError},
+    crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TryRecvError},
     solana_clock::Slot,
     std::{
         ops::Deref,
@@ -45,8 +45,14 @@ pub struct RecordSender {
     transaction_indexes: Option<Arc<RwLock<usize>>>,
 }
 
+pub enum RecordSenderError {
+    Full(Record),
+    InactiveSlot,
+    Disconnected,
+}
+
 impl RecordSender {
-    pub fn try_send(&self, record: Record) -> Result<Option<usize>, TrySendError<Record>> {
+    pub fn try_send(&self, record: Record) -> Result<Option<usize>, RecordSenderError> {
         let num_transactions = record
             .transaction_batches
             .iter()
@@ -68,8 +74,11 @@ impl RecordSender {
             let slot = SlotAllowedInsertions::slot(current_slot_allowed_insertions);
             let allowed_insertions =
                 SlotAllowedInsertions::allowed_insertions(current_slot_allowed_insertions);
-            if slot != record.slot || allowed_insertions == 0 {
-                return Err(TrySendError::Full(record));
+            if slot != record.slot {
+                return Err(RecordSenderError::InactiveSlot);
+            }
+            if allowed_insertions == 0 {
+                return Err(RecordSenderError::Full(record));
             }
 
             let slot_allowed_insertions =
@@ -84,7 +93,11 @@ impl RecordSender {
             ) {
                 Ok(_) => {
                     // Send the value over the channel, space has been reserved successfully.
-                    self.sender.try_send(record)?;
+                    if let Err(err) = self.sender.try_send(record) {
+                        // The channel is disconnected, return the error.
+                        assert!(err.is_disconnected());
+                        return Err(RecordSenderError::Disconnected);
+                    }
                     return Ok(transaction_indexes.map(|mut transaction_indexes| {
                         let transaction_starting_index = *transaction_indexes;
                         *transaction_indexes = transaction_starting_index + num_transactions;
@@ -123,7 +136,8 @@ impl RecordReceiver {
         self.is_shutdown = true;
         // The slot value doesn't matter here because we are done with whatever
         // slot we were on.
-        self.slot_allowed_insertions.store(0, Ordering::Release);
+        self.slot_allowed_insertions
+            .store(Slot::MAX, Ordering::Release);
     }
 
     /// Re-enable the channel after a shutdown.

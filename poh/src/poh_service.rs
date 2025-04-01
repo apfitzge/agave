@@ -592,18 +592,15 @@ impl PohService {
         while let Ok(record) = record_receiver.try_recv() {
             // Record the record.
             let mut w_poh_recorder = poh_recorder.write().unwrap();
-            let Ok(record_result) =
-                w_poh_recorder.record(record.slot, record.mixin, record.transactions)
+            let Ok(record_summary) =
+                w_poh_recorder.record(record.slot, record.mixins, record.transaction_batches)
             else {
                 panic!("PohRecorder::record failed");
             };
 
             // Check if we need to shutdown the channel.
-            if record_result.remaining_hashes > 1_000_000_000 {
-                panic!("remaining_hashes too large");
-            }
-            if record_receiver.should_shutdown(record_result.remaining_hashes, ticks_per_slot)
-                || record_result.remaining_hashes <= 2 * hashes_per_tick
+            if record_receiver.should_shutdown(record_summary.remaining_hashes, ticks_per_slot)
+                || record_summary.remaining_hashes <= 2 * hashes_per_tick
             {
                 record_receiver.shutdown();
             }
