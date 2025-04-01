@@ -27,7 +27,7 @@ use {
 
 // Spawn a PoH service thread, and just spam transactions.
 fn main() {
-    solana_logger::setup_with_default("poh_slam=info");
+    solana_logger::setup_with_default("error,poh_slam=info");
 
     let ledger_dir = PathBuf::from("poh-slam-temp/ledger");
     let _ = std::fs::remove_dir_all(&ledger_dir);
@@ -108,6 +108,7 @@ fn main() {
     let collector_id = &Pubkey::new_unique();
     let mut slot = bank.slot();
     let mut num_recorded = 0u64;
+    let mut num_full = 0u64;
     // Set bank in poh on controller.
     poh_controller
         .set_bank(BankWithScheduler::new_without_scheduler(bank.clone()))
@@ -118,8 +119,11 @@ fn main() {
             Ok(_) => {
                 num_recorded = num_recorded.wrapping_add(1);
             }
+            Err(RecordSenderError::Full(_)) => {
+                num_full = num_full.wrapping_add(1);
+            }
             Err(RecordSenderError::InactiveSlot) => {
-                info!("{slot}: {num_recorded}");
+                info!("{slot}: {num_recorded} {num_full}");
 
                 // Wait for PohRecorder to be done.
                 while poh_recorder.read().unwrap().has_bank() {
@@ -134,6 +138,7 @@ fn main() {
                 bank = Arc::new(Bank::new_from_parent(bank, collector_id, next_slot));
                 slot = bank.slot();
                 num_recorded = 0;
+                num_full = 0;
 
                 // Set bank in poh on controller.
                 poh_controller
@@ -142,7 +147,7 @@ fn main() {
 
                 info!("Starting {slot}...");
             }
-            Err(_) => {
+            Err(_err) => {
                 panic!("Unexpected error");
             }
         }
