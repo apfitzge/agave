@@ -137,7 +137,20 @@ impl PohService {
                     if let Some(cores) = core_affinity::get_core_ids() {
                         core_affinity::set_for_current(cores[pinned_cpu_core]);
                     }
-                    Self::tick_producer(
+                    // Self::tick_producer(
+                    //     poh_recorder,
+                    //     &poh_exit,
+                    //     ticks_per_slot,
+                    //     hashes_per_batch,
+                    //     record_receiver,
+                    //     bank_message_receiver,
+                    //     pending_bank_message,
+                    //     Self::target_ns_per_tick(
+                    //         ticks_per_slot,
+                    //         poh_config.target_tick_duration.as_nanos() as u64,
+                    //     ),
+                    // );
+                    Self::reasonable_poh_service_loop(
                         poh_recorder,
                         &poh_exit,
                         ticks_per_slot,
@@ -515,6 +528,139 @@ impl PohService {
         }
     }
 
+    fn reasonable_poh_service_loop(
+        poh_recorder: Arc<RwLock<PohRecorder>>,
+        poh_exit: &AtomicBool,
+        ticks_per_slot: u64,
+        hashes_per_batch: u64,
+        mut record_receiver: RecordReceiver,
+        bank_message_receiver: Receiver<BankMessage>,
+        pending_bank_message: Arc<AtomicBool>,
+        target_ns_per_tick: u64,
+    ) {
+        let poh = poh_recorder.read().unwrap().poh.clone();
+        let hashes_per_tick = poh.lock().unwrap().hashes_per_tick();
+
+        while !poh_exit.load(Ordering::Relaxed) {
+            let bank_message =
+                Self::check_for_bank_message(&bank_message_receiver, &mut record_receiver);
+            Self::record_loop(
+                &poh_recorder,
+                &mut record_receiver,
+                ticks_per_slot,
+                hashes_per_tick,
+            );
+            // If there is a bank message, process that.
+            if let Some(bank_message) = bank_message {
+                Self::handle_bank_message(
+                    &poh_recorder,
+                    bank_message,
+                    &pending_bank_message,
+                    &mut record_receiver,
+                );
+            } else {
+                let should_tick = Self::hash_loop(
+                    &poh,
+                    &mut record_receiver,
+                    ticks_per_slot,
+                    hashes_per_tick,
+                    hashes_per_batch,
+                    target_ns_per_tick,
+                );
+                if should_tick {
+                    // We must tick.
+                    let mut w_poh_recorder = poh_recorder.write().unwrap();
+                    w_poh_recorder.tick();
+                    if let Some(working_bank) = w_poh_recorder.bank() {
+                        if w_poh_recorder.tick_height() == working_bank.max_tick_height() - 1 {
+                            // We are in last tick. Shutdown the channel.
+                            record_receiver.shutdown();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn record_loop(
+        poh_recorder: &RwLock<PohRecorder>,
+        record_receiver: &mut RecordReceiver,
+        ticks_per_slot: u64,
+        hashes_per_tick: u64,
+    ) {
+        // Process all records here. None can be skipped, fail, or result in an error.
+        while let Ok(record) = record_receiver.try_recv() {
+            // Record the record.
+            let mut w_poh_recorder = poh_recorder.write().unwrap();
+            let Ok(record_result) =
+                w_poh_recorder.record(record.slot, record.mixin, record.transactions)
+            else {
+                panic!("PohRecorder::record failed");
+            };
+
+            // Check if we need to shutdown the channel.
+            if record_result.remaining_hashes > 1_000_000_000 {
+                panic!("remaining_hashes too large");
+            }
+            if record_receiver.should_shutdown(record_result.remaining_hashes, ticks_per_slot)
+                || record_result.remaining_hashes <= 2 * hashes_per_tick
+            {
+                record_receiver.shutdown();
+            }
+        }
+    }
+
+    fn hash_loop(
+        poh: &Mutex<Poh>,
+        record_receiver: &mut RecordReceiver,
+        ticks_per_slot: u64,
+        hashes_per_tick: u64,
+        hashes_per_batch: u64,
+        target_ns_per_tick: u64,
+    ) -> bool {
+        // did not receive instructions to record, so hash until we notice we've been asked to record (or we need to tick) and then remember what to record
+        let mut poh_l = poh.lock().unwrap();
+        // do at most 100 iterations to avoid an infinite loop
+        for _ in 0..100 {
+            let should_tick = poh_l.hash(hashes_per_batch);
+            let ideal_time = poh_l.target_poh_time(target_ns_per_tick);
+            let remaining_hashes = poh_l.remaining_hashes_in_slot(ticks_per_slot);
+            if record_receiver.should_shutdown(remaining_hashes, ticks_per_slot)
+                || remaining_hashes <= hashes_per_tick
+            {
+                record_receiver.shutdown();
+            }
+            if should_tick {
+                // nothing else can be done. tick required.
+                return true;
+            }
+
+            // If there is another record, break immediately.
+            if !record_receiver.is_empty() {
+                return false;
+            }
+
+            // check to see if we need to wait to catch up to ideal
+            let wait_start = Instant::now();
+            if ideal_time <= wait_start {
+                // no, keep hashing. We still hold the lock.
+                continue;
+            }
+
+            // busy wait, polling for new records and after dropping poh lock
+            drop(poh_l);
+            while ideal_time > Instant::now() {
+                // If there is another record, break immediately.
+                if !record_receiver.is_empty() {
+                    return false;
+                }
+            }
+            break;
+        }
+
+        false
+    }
+
     /// Check for a bank message and shutdown the channel if there is one.
     fn check_for_bank_message(
         bank_message_receiver: &Receiver<BankMessage>,
@@ -535,26 +681,23 @@ impl PohService {
         pending_bank_message: &AtomicBool,
         record_receiver: &mut RecordReceiver,
     ) {
-        let reset_slot = {
+        {
             let mut recorder = poh_recorder.write().unwrap();
             match bank_message {
                 BankMessage::Reset {
                     reset_bank,
                     next_leader_slot,
                 } => {
-                    let slot = reset_bank.slot();
                     recorder.reset(reset_bank, next_leader_slot);
-                    slot
                 }
                 BankMessage::SetBank { bank } => {
                     let slot = bank.slot();
                     recorder.set_bank(bank);
-                    slot
+                    record_receiver.restart(slot);
                 }
             }
-        };
+        }
         pending_bank_message.store(false, Ordering::Release);
-        record_receiver.restart(reset_slot);
     }
 
     pub fn join(self) -> thread::Result<()> {

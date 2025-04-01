@@ -27,19 +27,28 @@ use {
 
 // Spawn a PoH service thread, and just spam transactions.
 fn main() {
-    solana_logger::setup_with_default("info");
+    solana_logger::setup_with_default("poh_slam=info");
 
     let ledger_dir = PathBuf::from("poh-slam-temp/ledger");
     let _ = std::fs::remove_dir_all(&ledger_dir);
     let blockstore = Arc::new(Blockstore::open(ledger_dir.as_path()).unwrap());
 
     let accounts_dir = PathBuf::from("poh-slam-temp/ledger/accounts");
-    let GenesisConfigInfo { genesis_config, .. } = genesis_utils::create_genesis_config_with_leader(
+    let GenesisConfigInfo {
+        mut genesis_config, ..
+    } = genesis_utils::create_genesis_config_with_leader(
         1_000_000_000_000,
         &Pubkey::new_unique(),
         1_000_000_000,
     );
     let exit: Arc<AtomicBool> = Arc::default();
+
+    let poh_config = PohConfig {
+        target_tick_duration: Duration::from_nanos(6250),
+        target_tick_count: None,
+        hashes_per_tick: Some(62500),
+    };
+    genesis_config.poh_config = poh_config.clone();
 
     let mut bank = Arc::new(Bank::new_with_paths(
         &genesis_config,
@@ -57,11 +66,7 @@ fn main() {
     ));
 
     let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(&bank));
-    let poh_config = PohConfig {
-        target_tick_duration: Duration::from_nanos(6250),
-        target_tick_count: None,
-        hashes_per_tick: Some(62500),
-    };
+
     let (poh_recorder, entry_receiver) = PohRecorder::new(
         0,
         Hash::default(),
@@ -108,14 +113,10 @@ fn main() {
         .set_bank(BankWithScheduler::new_without_scheduler(bank.clone()))
         .unwrap();
     loop {
-        std::thread::sleep(Duration::from_micros(1));
         let result = transaction_recorder.record(slot, Hash::default(), txs.clone());
         match result {
             Ok(_) => {
                 num_recorded = num_recorded.wrapping_add(1);
-                if num_recorded % 1000 == 0 {
-                    info!("{slot}: {num_recorded}");
-                }
             }
             Err(PohRecorderError::MaxHeightReached) => {
                 info!("{slot}: {num_recorded}");
@@ -128,7 +129,7 @@ fn main() {
                 // Poh reset
                 let next_slot = bank.slot().wrapping_add(1);
                 poh_controller
-                    .reset(bank.clone(), Some((next_slot, slot.wrapping_add(4))))
+                    .reset(bank.clone(), Some((next_slot, next_slot)))
                     .unwrap();
                 bank = Arc::new(Bank::new_from_parent(bank, collector_id, next_slot));
                 slot = bank.slot();
