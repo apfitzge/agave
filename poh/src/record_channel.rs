@@ -12,10 +12,22 @@ use {
     },
 };
 
+#[derive(Clone, Debug)]
+struct MaxSent {
+    sent: Arc<AtomicU64>,
+    max_sent_per_slot: u64,
+}
+
 /// Create a channel pair for communicating `Record`s.
 pub fn record_channels(track_transaction_indexes: bool) -> (RecordSender, RecordReceiver) {
     const CAPACITY: u64 = 1024;
+    const MAX_SEND_PER_SLOT: u64 = 64 * 1024;
     let (sender, receiver) = bounded(CAPACITY as usize);
+    let max_sent = MaxSent {
+        sent: Arc::new(AtomicU64::new(0)),
+        max_sent_per_slot: MAX_SEND_PER_SLOT,
+    };
+
     let slot_allowed_insertions = SlotAllowedInsertions::new(0, CAPACITY);
     let transaction_indexes = if track_transaction_indexes {
         Some(Arc::new(RwLock::new(0)))
@@ -26,6 +38,7 @@ pub fn record_channels(track_transaction_indexes: bool) -> (RecordSender, Record
         RecordSender {
             slot_allowed_insertions: slot_allowed_insertions.clone(),
             sender,
+            max_sent: max_sent.clone(),
             transaction_indexes: transaction_indexes.clone(),
         },
         RecordReceiver {
@@ -33,6 +46,7 @@ pub fn record_channels(track_transaction_indexes: bool) -> (RecordSender, Record
             capacity: CAPACITY,
             slot_allowed_insertions,
             receiver,
+            max_sent,
             transaction_indexes,
         },
     )
@@ -42,11 +56,13 @@ pub fn record_channels(track_transaction_indexes: bool) -> (RecordSender, Record
 pub struct RecordSender {
     slot_allowed_insertions: SlotAllowedInsertions,
     sender: Sender<Record>,
+    max_sent: MaxSent,
     transaction_indexes: Option<Arc<RwLock<usize>>>,
 }
 
 pub enum RecordSenderError {
     Full(Record),
+    MaxSent,
     InactiveSlot,
     Disconnected,
 }
@@ -65,6 +81,13 @@ impl RecordSender {
                 .transaction_indexes
                 .as_ref()
                 .map(|transaction_indexes| transaction_indexes.write().unwrap());
+
+            // Check if we've already sent too many records.
+            // This is a hack to avoid slowing down the PoH service thread,
+            // which hashes record-inserts slower than normal hashing loop.
+            if self.max_sent.sent.load(Ordering::Acquire) >= self.max_sent.max_sent_per_slot {
+                return Err(RecordSenderError::MaxSent);
+            }
 
             // Get the current slot and allowed insertions.
             // If the number of allowed insertions is 0, the channel is full - just return immediately.
@@ -98,6 +121,7 @@ impl RecordSender {
                         assert!(err.is_disconnected());
                         return Err(RecordSenderError::Disconnected);
                     }
+                    self.max_sent.sent.fetch_add(1, Ordering::AcqRel);
                     return Ok(transaction_indexes.map(|mut transaction_indexes| {
                         let transaction_starting_index = *transaction_indexes;
                         *transaction_indexes = transaction_starting_index + num_transactions;
@@ -119,6 +143,7 @@ pub struct RecordReceiver {
     capacity: u64,
     slot_allowed_insertions: SlotAllowedInsertions,
     receiver: Receiver<Record>,
+    max_sent: MaxSent,
     transaction_indexes: Option<Arc<RwLock<usize>>>,
 }
 
@@ -152,6 +177,7 @@ impl RecordReceiver {
         if let Some(transaction_indexes) = self.transaction_indexes.as_ref() {
             *transaction_indexes.write().unwrap() = 0;
         }
+        self.max_sent.sent.store(0, Ordering::Release);
     }
 
     /// Drain the channel - this should only be called if the channel is shutdown.
