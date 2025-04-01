@@ -21,7 +21,7 @@ use {
     std::{
         path::PathBuf,
         sync::{atomic::AtomicBool, Arc, RwLock},
-        time::Duration,
+        time::{Duration, Instant},
     },
 };
 
@@ -113,6 +113,7 @@ fn main() {
     poh_controller
         .set_bank(BankWithScheduler::new_without_scheduler(bank.clone()))
         .unwrap();
+    let mut start_time = Instant::now();
     loop {
         let result = transaction_recorder.record(slot, vec![Hash::default()], vec![txs.clone()]);
         match result {
@@ -123,12 +124,14 @@ fn main() {
                 num_full = num_full.wrapping_add(1);
             }
             Err(RecordSenderError::InactiveSlot) => {
-                info!("{slot}: {num_recorded} {num_full}");
-
                 // Wait for PohRecorder to be done.
                 while poh_recorder.read().unwrap().has_bank() {
                     std::thread::sleep(Duration::from_millis(1));
                 }
+                info!(
+                    "{slot} took {}ms: {num_recorded} {num_full}",
+                    start_time.elapsed().as_millis()
+                );
 
                 // Poh reset
                 let next_slot = bank.slot().wrapping_add(1);
@@ -146,6 +149,7 @@ fn main() {
                     .unwrap();
 
                 info!("Starting {slot}...");
+                start_time = Instant::now();
             }
             Err(_err) => {
                 panic!("Unexpected error");
