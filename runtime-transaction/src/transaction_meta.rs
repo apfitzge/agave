@@ -24,6 +24,7 @@ pub trait StaticMeta {
     fn signature_details(&self) -> &TransactionSignatureDetails;
     fn compute_budget_instruction_details(&self) -> &ComputeBudgetInstructionDetails;
     fn instruction_data_len(&self) -> u64;
+    fn allocated_accounts_data_size(&self) -> u64;
 }
 
 /// Statically loaded meta is a supertrait of Dynamically loaded meta, when
@@ -41,4 +42,5 @@ pub struct TransactionMeta {
     pub(crate) signature_details: TransactionSignatureDetails,
     pub(crate) compute_budget_instruction_details: ComputeBudgetInstructionDetails,
     pub(crate) instruction_data_len: u64,
+    pub(crate) allocated_accounts_data_size: u64,
 }

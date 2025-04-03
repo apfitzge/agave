@@ -51,6 +51,9 @@ impl<T> StaticMeta for RuntimeTransaction<T> {
     fn instruction_data_len(&self) -> u64 {
         self.meta.instruction_data_len
     }
+    fn allocated_accounts_data_size(&self) -> u64 {
+        self.meta.allocated_accounts_data_size
+    }
 }
 
 impl<T: SVMMessage> DynamicMeta for RuntimeTransaction<T> {}

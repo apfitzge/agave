@@ -34,6 +34,7 @@ impl RuntimeTransaction<SanitizedVersionedTransaction> {
             precompile_signature_details,
             instruction_data_len,
             compute_budget_instruction_details,
+            allocated_accounts_data_size,
         } = InstructionMeta::try_new(
             sanitized_versioned_tx
                 .get_message()
@@ -61,6 +62,7 @@ impl RuntimeTransaction<SanitizedVersionedTransaction> {
                 signature_details,
                 compute_budget_instruction_details,
                 instruction_data_len,
+                allocated_accounts_data_size,
             },
         })
     }

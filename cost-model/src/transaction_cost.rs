@@ -280,6 +280,10 @@ impl solana_runtime_transaction::transaction_meta::StaticMeta for WritableKeysTr
     fn instruction_data_len(&self) -> u64 {
         unimplemented!("WritableKeysTransaction::instruction_data_len")
     }
+
+    fn allocated_accounts_data_size(&self) -> u64 {
+        unimplemented!("WritableKeysTransaction::allocated_accounts_data_size")
+    }
 }
 
 #[cfg(feature = "dev-context-only-utils")]

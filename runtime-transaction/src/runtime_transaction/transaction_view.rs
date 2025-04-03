@@ -55,6 +55,7 @@ impl<D: TransactionData> RuntimeTransaction<SanitizedTransactionView<D>> {
             precompile_signature_details,
             instruction_data_len,
             compute_budget_instruction_details,
+            allocated_accounts_data_size,
         } = InstructionMeta::try_new(transaction.program_instructions_iter())?;
 
         let signature_details = TransactionSignatureDetails::new(
@@ -72,6 +73,7 @@ impl<D: TransactionData> RuntimeTransaction<SanitizedTransactionView<D>> {
                 signature_details,
                 compute_budget_instruction_details,
                 instruction_data_len,
+                allocated_accounts_data_size,
             },
         })
     }
