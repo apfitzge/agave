@@ -4523,7 +4523,11 @@ impl Blockstore {
             assert!(slot_meta_entry.did_insert_occur);
             let meta: &SlotMeta = &RefCell::borrow(&*slot_meta_entry.new_slot_meta);
             let meta_backup = &slot_meta_entry.old_slot_meta;
-            if !completed_slots_senders.is_empty() && is_newly_completed_slot(meta, meta_backup) {
+            let completed = is_newly_completed_slot(meta, meta_backup);
+            if completed {
+                slot_last_shred(meta.slot);
+            }
+            if !completed_slots_senders.is_empty() && completed {
                 newly_completed_slots.push(*slot);
             }
             // Check if the working copy of the metadata has changed
@@ -4718,6 +4722,7 @@ fn update_slot_meta<'a>(
     // so received = index + 1 for the same shred.
     slot_meta.received = cmp::max(u64::from(index) + 1, slot_meta.received);
     if first_insert {
+        slot_first_shred(slot_meta.slot);
         // predict the timestamp of what would have been the first shred in this slot
         let slot_time_elapsed = u64::from(reference_tick) * 1000 / DEFAULT_TICKS_PER_SECOND;
         slot_meta.first_shred_timestamp = timestamp() - slot_time_elapsed;
@@ -11947,4 +11952,16 @@ pub mod tests {
             Err(TransactionError::InsufficientFundsForFee)
         );
     }
+}
+
+#[no_mangle]
+#[inline(never)]
+fn slot_first_shred(slot: Slot) {
+    log::trace!("slot first shred: {slot}");
+}
+
+#[no_mangle]
+#[inline(never)]
+fn slot_last_shred(slot: Slot) {
+    log::trace!("slot last shred: {slot}");
 }
