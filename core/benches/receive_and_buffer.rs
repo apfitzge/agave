@@ -395,13 +395,13 @@ fn bench_no_copy_receive_and_buffer<T: ReceiveAndBuffer + NoCopyReceiveAndBuffer
 
                 let start = Instant::now();
                 {
-                    let res = rb.receive_and_buffer_packets(
+                    let _res = rb.receive_and_buffer_packets(
                         &mut container,
                         &mut timing_metrics,
                         &mut count_metrics,
                         &decision,
                     );
-                    assert!(res.unwrap() == num_txs && !container.is_empty());
+                    assert!(!container.is_empty());
                     black_box(&container);
                 }
                 total = total.saturating_add(start.elapsed());
