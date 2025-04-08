@@ -1,3 +1,5 @@
+use bytes::Bytes;
+
 /// Trait for accessing transaction data from an abstract byte container.
 pub trait TransactionData {
     /// Returns a reference to the serialized transaction data.
@@ -12,6 +14,13 @@ impl TransactionData for &[u8] {
 }
 
 impl TransactionData for std::sync::Arc<Vec<u8>> {
+    #[inline]
+    fn data(&self) -> &[u8] {
+        self.as_ref()
+    }
+}
+
+impl TransactionData for Bytes {
     #[inline]
     fn data(&self) -> &[u8] {
         self.as_ref()
