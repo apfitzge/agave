@@ -6,6 +6,7 @@ use {
         transaction_state_container::StateContainer,
     },
     crate::banking_stage::{
+        consumer::RetryableIndexKind,
         scheduler_messages::{
             ConsumeWork, FinishedConsumeWork, MaxAge, TransactionBatchId, TransactionId,
         },
@@ -233,11 +234,28 @@ impl<Tx: TransactionWithMeta> SchedulingCommon<Tx> {
                 // Assumption - retryable indexes are in order (sorted by workers).
                 let mut retryable_iter = retryable_indexes.iter().peekable();
                 for (index, (id, transaction)) in izip!(ids, transactions).enumerate() {
-                    if let Some(&&retryable_index) = retryable_iter.peek() {
-                        if retryable_index == index {
-                            container.retry_transaction(slot, id, transaction);
-                            retryable_iter.next();
-                            continue;
+                    if let Some(retryable_index) = retryable_iter.peek() {
+                        match retryable_index {
+                            RetryableIndexKind::AccountInUse(retryable_index)
+                            | RetryableIndexKind::InvalidBank(retryable_index)
+                                if retryable_index == &index =>
+                            {
+                                // Immediately retry on:
+                                //     - account-locking failures (jito).
+                                //     - recording failures (slot ended).
+                                container.retry_transaction(None, id, transaction);
+                                retryable_iter.next();
+                                continue;
+                            }
+                            RetryableIndexKind::BlockLimits(retryable_index)
+                                if retryable_index == &index =>
+                            {
+                                // Do not immediately retry on block-limits failures - want to wait for next slot.
+                                container.retry_transaction(slot, id, transaction);
+                                retryable_iter.next();
+                                continue;
+                            }
+                            _ => {} // not the current index
                         }
                     }
                     container.remove_by_id(id);
@@ -245,7 +263,7 @@ impl<Tx: TransactionWithMeta> SchedulingCommon<Tx> {
 
                 debug_assert!(
                     retryable_iter.peek().is_none(),
-                    "retryable indexes were not in order: {retryable_indexes:?}"
+                    "retryable indexes were not in order"
                 );
 
                 Ok((num_transactions, num_retryable))
