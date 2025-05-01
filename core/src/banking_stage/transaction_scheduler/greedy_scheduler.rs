@@ -26,6 +26,7 @@ pub(crate) struct GreedySchedulerConfig {
     pub target_scheduled_cus: u64,
     pub max_scanned_transactions_per_scheduling_pass: usize,
     pub target_transactions_per_batch: usize,
+    pub ultra_greedy: bool,
 }
 
 impl Default for GreedySchedulerConfig {
@@ -34,6 +35,7 @@ impl Default for GreedySchedulerConfig {
             target_scheduled_cus: MAX_BLOCK_UNITS / 4,
             max_scanned_transactions_per_scheduling_pass: 100_000,
             target_transactions_per_batch: TARGET_NUM_TRANSACTIONS_PER_BATCH,
+            ultra_greedy: true,
         }
     }
 }
@@ -148,10 +150,16 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for GreedyScheduler<Tx> {
                 Err(TransactionSchedulingError::UnschedulableConflicts) => {
                     num_unschedulable_conflicts += 1;
                     self.unschedulables.push(id);
+                    if self.config.ultra_greedy {
+                        break;
+                    }
                 }
                 Err(TransactionSchedulingError::UnschedulableThread) => {
                     num_unschedulable_threads += 1;
                     self.unschedulables.push(id);
+                    if self.config.ultra_greedy {
+                        break;
+                    }
                 }
                 Err(TransactionSchedulingError::Skipped) => {
                     num_skipped_retry += 1;
