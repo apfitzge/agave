@@ -114,6 +114,7 @@ members = [
     "rpc-test",
     "runtime",
     "runtime-transaction",
+    "scheduler_bindings",
     "send-transaction-service",
     "stake-accounts",
     "storage-bigtable",
@@ -197,6 +198,7 @@ agave-banking-stage-ingress-types = { path = "banking-stage-ingress-types", vers
 agave-feature-set = { path = "feature-set", version = "=2.3.0" }
 agave-precompiles = { path = "precompiles", version = "=2.3.0" }
 agave-reserved-account-keys = { path = "reserved-account-keys", version = "=2.3.0" }
+agave-scheduler-bindings = { path = "scheduler_bindings", version = "=2.3.0" }
 agave-transaction-view = { path = "transaction-view", version = "=2.3.0" }
 agave-xdp = { path = "xdp", version = "=2.3.0" }
 aquamarine = "0.6.0"
