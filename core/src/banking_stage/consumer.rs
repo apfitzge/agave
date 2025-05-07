@@ -32,7 +32,7 @@ use {
 /// Consumer will create chunks of transactions from buffer with up to this size.
 pub const TARGET_NUM_TRANSACTIONS_PER_BATCH: usize = 64;
 
-#[cfg_attr(test, derive(Debug,))]
+#[cfg_attr(test, derive(Debug, Clone))]
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 pub enum RetryableIndexKind {
     /// Retryable index due to account lock failures (Jito)

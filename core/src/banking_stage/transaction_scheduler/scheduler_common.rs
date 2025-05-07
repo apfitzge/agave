@@ -512,6 +512,7 @@ mod tests {
         let finished_work = FinishedConsumeWork {
             work,
             retryable_indexes,
+            slot: None,
         };
 
         finished_work_sender.send(finished_work).unwrap();
@@ -529,10 +530,14 @@ mod tests {
         let num_scheduled = common.send_batch(&mut batches, 0, 10).unwrap();
         let work = work_receivers[0].try_recv().unwrap();
         assert_eq!(work.ids.len(), num_scheduled);
-        let retryable_indexes = vec![0, 1];
+        let retryable_indexes = vec![
+            RetryableIndexKind::BlockLimits(0),
+            RetryableIndexKind::BlockLimits(1),
+        ];
         let finished_work = FinishedConsumeWork {
             work,
             retryable_indexes: retryable_indexes.clone(),
+            slot: None,
         };
         finished_work_sender.send(finished_work).unwrap();
         let (num_transactions, num_retryable) =
@@ -559,10 +564,14 @@ mod tests {
         let num_scheduled = common.send_batch(&mut batches, 0, 10).unwrap();
         let work = work_receivers[0].try_recv().unwrap();
         assert_eq!(work.ids.len(), num_scheduled);
-        let retryable_indexes = vec![1, 0];
+        let retryable_indexes = vec![
+            RetryableIndexKind::BlockLimits(1),
+            RetryableIndexKind::BlockLimits(0),
+        ];
         let finished_work = FinishedConsumeWork {
             work,
             retryable_indexes: retryable_indexes.clone(),
+            slot: None,
         };
         finished_work_sender.send(finished_work).unwrap();
 
