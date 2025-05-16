@@ -432,6 +432,12 @@ pub struct RepairService {
     ancestor_hashes_service: AncestorHashesService,
 }
 
+#[no_mangle]
+#[inline(never)]
+extern "C" fn repair_stats(repairs: usize) {
+    log::trace!("repairing {repairs}");
+}
+
 impl RepairService {
     pub fn new(
         blockstore: Arc<Blockstore>,
@@ -658,6 +664,7 @@ impl RepairService {
         if !batch.is_empty() {
             let num_pkts = batch.len();
             let batch = batch.iter().map(|(bytes, addr)| (bytes, addr));
+            repair_stats(batch.len());
             match batch_send(repair_socket, batch) {
                 Ok(()) => (),
                 Err(SendPktsError::IoError(err, num_failed)) => {
