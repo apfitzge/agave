@@ -53,7 +53,12 @@ pub struct TransactionStatus {
     /// Only non-zero if the transaction got to point of processing.
     fee_payer_lamports: u64,
 
-    /// Number of CUs used by the transaction.
+    /// Most up-to-date block compute units used - this is populated
+    /// after batch processing, so it may not be the summation of processed
+    /// transactions up to this point.
+    block_compute_units_update: u64,
+
+    /// Number of CUs used by this transaction.
     /// Only non-zero if the transaction got to point of processing.
     compute_units_used: u64,
 
