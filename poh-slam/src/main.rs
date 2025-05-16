@@ -123,10 +123,10 @@ fn main() {
             Err(RecordSenderError::Full(_)) => {
                 num_full = num_full.wrapping_add(1);
             }
-            Err(RecordSenderError::InactiveSlot) => {
+            Err(RecordSenderError::InactiveSlot | RecordSenderError::MaxSent) => {
                 // Wait for PohRecorder to be done.
                 while poh_recorder.read().unwrap().has_bank() {
-                    std::thread::sleep(Duration::from_millis(1));
+                    std::thread::sleep(Duration::from_millis(5));
                 }
                 info!(
                     "{slot} took {}ms: {num_recorded} {num_full}",
