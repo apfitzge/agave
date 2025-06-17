@@ -14,42 +14,49 @@ use {
     solana_pubkey::Pubkey,
     solana_signer::Signer,
     solana_system_interface::instruction as system_instruction,
-    solana_transaction::versioned::{
-        sanitized::SanitizedVersionedTransaction, VersionedTransaction,
-    },
+    solana_transaction::versioned::VersionedTransaction,
+    txv1::serialize_v1_from_legacy,
 };
 
 const NUM_TRANSACTIONS: usize = 1024;
 
-fn serialize_transactions(transactions: Vec<VersionedTransaction>) -> Vec<Vec<u8>> {
+fn serialize_transactions(transactions: &[VersionedTransaction]) -> Vec<Vec<u8>> {
     transactions
-        .into_iter()
-        .map(|transaction| bincode::serialize(&transaction).unwrap())
+        .iter()
+        .map(|transaction| bincode::serialize(transaction).unwrap())
+        .collect()
+}
+
+fn convert_transactions(transactions: &[VersionedTransaction]) -> Vec<Vec<u8>> {
+    transactions
+        .iter()
+        .map(|tx| serialize_v1_from_legacy(tx))
         .collect()
 }
 
 fn bench_transactions_parsing(
     group: &mut BenchmarkGroup<impl Measurement>,
+    transactions: &[VersionedTransaction],
     serialized_transactions: Vec<Vec<u8>>,
 ) {
-    // Legacy Transaction Parsing
-    group.bench_function("VersionedTransaction", |c| {
-        c.iter(|| {
-            for bytes in serialized_transactions.iter() {
-                let _ = bincode::deserialize::<VersionedTransaction>(black_box(bytes)).unwrap();
-            }
-        });
-    });
+    // // Legacy Transaction Parsing
+    // group.bench_function("VersionedTransaction", |c| {
+    //     c.iter(|| {
+    //         for bytes in serialized_transactions.iter() {
+    //             let _ = bincode::deserialize::<VersionedTransaction>(black_box(bytes)).unwrap();
+    //         }
+    //     });
+    // });
 
-    // Legacy Transaction Parsing and Sanitize checks
-    group.bench_function("SanitizedVersionedTransaction", |c| {
-        c.iter(|| {
-            for bytes in serialized_transactions.iter() {
-                let tx = bincode::deserialize::<VersionedTransaction>(black_box(bytes)).unwrap();
-                let _ = SanitizedVersionedTransaction::try_new(tx).unwrap();
-            }
-        });
-    });
+    // // Legacy Transaction Parsing and Sanitize checks
+    // group.bench_function("SanitizedVersionedTransaction", |c| {
+    //     c.iter(|| {
+    //         for bytes in serialized_transactions.iter() {
+    //             let tx = bincode::deserialize::<VersionedTransaction>(black_box(bytes)).unwrap();
+    //             let _ = SanitizedVersionedTransaction::try_new(tx).unwrap();
+    //         }
+    //     });
+    // });
 
     // New Transaction Parsing
     group.bench_function("TransactionView", |c| {
@@ -60,11 +67,22 @@ fn bench_transactions_parsing(
         });
     });
 
-    // New Transaction Parsing and Sanitize checks
-    group.bench_function("TransactionView (Sanitized)", |c| {
+    // // New Transaction Parsing and Sanitize checks
+    // group.bench_function("TransactionView (Sanitized)", |c| {
+    //     c.iter(|| {
+    //         for bytes in serialized_transactions.iter() {
+    //             let _ = TransactionView::try_new_sanitized(black_box(bytes.as_ref())).unwrap();
+    //         }
+    //     });
+    // });
+
+    // V1 transaction parsing
+    // convert transactions to v1 format first.
+    let serialized_transactions = convert_transactions(transactions);
+    group.bench_function("V1 Transaction Parsing", |c| {
         c.iter(|| {
             for bytes in serialized_transactions.iter() {
-                let _ = TransactionView::try_new_sanitized(black_box(bytes.as_ref())).unwrap();
+                let _ = txv1::TransactionView::try_new(black_box(bytes.as_ref())).unwrap();
             }
         });
     });
@@ -187,38 +205,35 @@ fn packed_atls() -> Vec<VersionedTransaction> {
 }
 
 fn bench_parse_min_sized_transactions(c: &mut Criterion) {
-    let serialized_transactions = serialize_transactions(minimum_sized_transactions());
+    let transactions = minimum_sized_transactions();
+    let serialized_transactions = serialize_transactions(&transactions);
     let mut group = c.benchmark_group("min sized transactions");
     group.throughput(Throughput::Elements(serialized_transactions.len() as u64));
-    bench_transactions_parsing(&mut group, serialized_transactions);
+    bench_transactions_parsing(&mut group, &transactions, serialized_transactions);
 }
 
 fn bench_parse_simple_transfers(c: &mut Criterion) {
-    let serialized_transactions = serialize_transactions(simple_transfers());
+    let transactions = simple_transfers();
+    let serialized_transactions = serialize_transactions(&transactions);
     let mut group = c.benchmark_group("simple transfers");
     group.throughput(Throughput::Elements(serialized_transactions.len() as u64));
-    bench_transactions_parsing(&mut group, serialized_transactions);
+    bench_transactions_parsing(&mut group, &transactions, serialized_transactions);
 }
 
 fn bench_parse_packed_transfers(c: &mut Criterion) {
-    let serialized_transactions = serialize_transactions(packed_transfers());
+    let transactions = packed_transfers();
+    let serialized_transactions = serialize_transactions(&transactions);
     let mut group = c.benchmark_group("packed transfers");
     group.throughput(Throughput::Elements(serialized_transactions.len() as u64));
-    bench_transactions_parsing(&mut group, serialized_transactions);
+    bench_transactions_parsing(&mut group, &transactions, serialized_transactions);
 }
 
 fn bench_parse_packed_noops(c: &mut Criterion) {
-    let serialized_transactions = serialize_transactions(packed_noops());
+    let transactions = packed_noops();
+    let serialized_transactions = serialize_transactions(&transactions);
     let mut group = c.benchmark_group("packed noops");
     group.throughput(Throughput::Elements(serialized_transactions.len() as u64));
-    bench_transactions_parsing(&mut group, serialized_transactions);
-}
-
-fn bench_parse_packed_atls(c: &mut Criterion) {
-    let serialized_transactions = serialize_transactions(packed_atls());
-    let mut group = c.benchmark_group("packed atls");
-    group.throughput(Throughput::Elements(serialized_transactions.len() as u64));
-    bench_transactions_parsing(&mut group, serialized_transactions);
+    bench_transactions_parsing(&mut group, &transactions, serialized_transactions);
 }
 
 criterion_group!(
@@ -227,6 +242,6 @@ criterion_group!(
     bench_parse_simple_transfers,
     bench_parse_packed_transfers,
     bench_parse_packed_noops,
-    bench_parse_packed_atls
+    // bench_parse_packed_atls
 );
 criterion_main!(benches);

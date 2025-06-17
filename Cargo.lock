@@ -398,6 +398,7 @@ dependencies = [
  "solana-svm-transaction",
  "solana-system-interface",
  "solana-transaction",
+ "txv1",
 ]
 
 [[package]]

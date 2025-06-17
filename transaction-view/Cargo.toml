@@ -34,6 +34,7 @@ solana-signature = { workspace = true, features = ["serde"] }
 solana-signer = { workspace = true }
 solana-system-interface = { workspace = true, features = ["bincode"] }
 solana-transaction = { workspace = true, features = ["bincode"] }
+txv1 = { path = "../txv1" }
 
 [[bench]]
 name = "bytes"

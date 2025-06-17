@@ -1,4 +1,4 @@
-use {core::num, solana_transaction::versioned::VersionedTransaction};
+use solana_transaction::versioned::VersionedTransaction;
 
 #[repr(C)]
 pub struct TransactionHeader {
@@ -29,12 +29,14 @@ impl TransactionView<'_> {
     // TODO: error.
     pub fn try_new(bytes: &[u8]) -> Option<TransactionView> {
         if bytes.len() <= core::mem::size_of::<TransactionHeader>() {
-            return None;
+            panic!("1 - {}", bytes.len());
+            // return None;
         }
 
         let transaction_header_ptr = bytes.as_ptr() as *const TransactionHeader;
         if !transaction_header_ptr.is_aligned() {
-            return None;
+            panic!("2");
+            // return None;
         }
         let header = unsafe { &*(transaction_header_ptr) };
 
@@ -45,7 +47,8 @@ impl TransactionView<'_> {
         if bytes.len() != expected_size
             || usize::from(header.payload_length) < core::mem::size_of::<TransactionHeader>()
         {
-            return None;
+            panic!("3");
+            // return None;
         }
 
         // Check that the serialization is reasonably correct:
@@ -63,7 +66,8 @@ impl TransactionView<'_> {
             + expected_instruction_meta_size
             + expected_signature_size;
         if bytes.len() < minimum_size_check {
-            return None;
+            panic!("4");
+            // return None;
         }
 
         let view = TransactionView { bytes };
@@ -74,11 +78,13 @@ impl TransactionView<'_> {
             if usize::from(ix_meta.accounts_offset) + usize::from(ix_meta.num_accounts)
                 > bytes.len()
             {
-                return None;
+                panic!("5");
+                // return None;
             }
             if usize::from(ix_meta.data_offset) + usize::from(ix_meta.num_data_bytes) > bytes.len()
             {
-                return None;
+                panic!("6");
+                // return None;
             }
         }
 
@@ -169,7 +175,7 @@ pub fn serialize_v1_from_legacy(tx: &VersionedTransaction) -> Vec<u8> {
     let payload_length =
         trailing_start + expected_instructions_accounts_size + expected_instructions_data_size;
 
-    let mut bytes: Vec<u8> = Vec::with_capacity(payload_length + tx.signatures.len() * 64);
+    let mut bytes: Vec<u8> = vec![0; payload_length + tx.signatures.len() * 64];
 
     // Write the header.
     {
