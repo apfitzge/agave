@@ -1,4 +1,4 @@
-use core::num;
+use {core::num, solana_transaction::versioned::VersionedTransaction};
 
 #[repr(C)]
 pub struct TransactionHeader {
@@ -138,4 +138,123 @@ impl TransactionView<'_> {
             )
         }
     }
+}
+
+pub fn serialize_v1_from_legacy(tx: &VersionedTransaction) -> Vec<u8> {
+    assert!(matches!(
+        tx.version(),
+        solana_transaction::versioned::TransactionVersion::Legacy(_)
+    ));
+
+    let expected_addresses_size = usize::from(tx.message.static_account_keys().len()) * 32;
+    let expected_resource_size = 0; // not setting this for example...
+    let expected_instruction_meta_size =
+        usize::from(tx.message.instructions().len()) * core::mem::size_of::<InstructionMeta>();
+    let expected_instructions_accounts_size = tx
+        .message
+        .instructions()
+        .iter()
+        .map(|ix| ix.accounts.len())
+        .sum::<usize>();
+    let expected_instructions_data_size = tx
+        .message
+        .instructions()
+        .iter()
+        .map(|ix| ix.data.len())
+        .sum::<usize>();
+    let trailing_start = core::mem::size_of::<TransactionHeader>()
+        + expected_addresses_size
+        + expected_resource_size
+        + expected_instruction_meta_size;
+    let payload_length =
+        trailing_start + expected_instructions_accounts_size + expected_instructions_data_size;
+
+    let mut bytes: Vec<u8> = Vec::with_capacity(payload_length + tx.signatures.len() * 64);
+
+    // Write the header.
+    {
+        let header = bytes.as_mut_ptr() as *mut TransactionHeader;
+        unsafe {
+            core::ptr::write(
+                header,
+                TransactionHeader {
+                    version: 128, // Version 1
+                    num_required_signatures: tx.message.header().num_required_signatures,
+                    num_readonly_signed_accounts: tx.message.header().num_readonly_signed_accounts,
+                    num_readonly_unsigned_accounts: tx
+                        .message
+                        .header()
+                        .num_readonly_unsigned_accounts,
+                    payload_length: payload_length as u16,
+                    num_instructions: tx.message.instructions().len() as u8,
+                    num_addresses: tx.message.static_account_keys().len() as u8,
+                    resource_mask: 0, // not setting this for example...
+                },
+            );
+        }
+    }
+
+    // Write the addresses.
+    let mut offset = core::mem::size_of::<TransactionHeader>();
+    {
+        let mut addresses = unsafe { bytes.as_mut_ptr().add(offset) as *mut [u8; 32] };
+        for address in tx.message.static_account_keys() {
+            unsafe {
+                core::ptr::write(addresses, *address.as_array());
+                addresses = addresses.add(1);
+            }
+        }
+
+        offset += expected_addresses_size;
+    }
+
+    // No resources for now.
+    offset += expected_resource_size;
+
+    // Write the instruction metas.
+    let mut trailing_offset = trailing_start;
+    {
+        let mut instruction_metas =
+            unsafe { bytes.as_mut_ptr().add(offset) as *mut InstructionMeta };
+        for instruction in tx.message.instructions() {
+            // Write the instruction meta.
+            unsafe {
+                core::ptr::write(
+                    instruction_metas,
+                    InstructionMeta {
+                        program_id_index: instruction.program_id_index,
+                        num_accounts: instruction.accounts.len() as u8,
+                        accounts_offset: trailing_offset as u16,
+                        num_data_bytes: instruction.data.len() as u16,
+                        data_offset: (trailing_offset + instruction.accounts.len()) as u16,
+                    },
+                );
+                instruction_metas = instruction_metas.add(1);
+            }
+
+            // Write the accounts in trailing section.
+            let accounts_array = unsafe { bytes.as_mut_ptr().add(trailing_offset) as *mut u8 };
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    instruction.accounts.as_ptr(),
+                    accounts_array,
+                    instruction.accounts.len(),
+                );
+            }
+            trailing_offset += instruction.accounts.len();
+
+            // Write the data in trailing section.
+            let data_array = unsafe { bytes.as_mut_ptr().add(trailing_offset) as *mut u8 };
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    instruction.data.as_ptr(),
+                    data_array,
+                    instruction.data.len(),
+                );
+            }
+            trailing_offset += instruction.data.len();
+        }
+    }
+
+    bytes
 }
