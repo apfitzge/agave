@@ -6,6 +6,7 @@ use {
 
 /// Tracks the number of transactions that are in flight for each thread.
 pub struct InFlightTracker {
+    num_batches_in_flight: Vec<usize>,
     num_in_flight_per_thread: Vec<usize>,
     cus_in_flight_per_thread: Vec<u64>,
     batches: HashMap<TransactionBatchId, BatchEntry>,
@@ -21,11 +22,17 @@ struct BatchEntry {
 impl InFlightTracker {
     pub fn new(num_threads: usize) -> Self {
         Self {
+            num_batches_in_flight: vec![0; num_threads],
             num_in_flight_per_thread: vec![0; num_threads],
             cus_in_flight_per_thread: vec![0; num_threads],
             batches: HashMap::new(),
             batch_id_generator: BatchIdGenerator::default(),
         }
+    }
+
+    /// Returns the number of batches that are in flight for a given thread.
+    pub fn outstanding_batches(&self, thread_id: ThreadId) -> usize {
+        self.num_batches_in_flight[thread_id]
     }
 
     /// Returns the number of transactions that are in flight for each thread.
@@ -48,6 +55,7 @@ impl InFlightTracker {
         thread_id: ThreadId,
     ) -> TransactionBatchId {
         let batch_id = self.batch_id_generator.next();
+        self.num_batches_in_flight[thread_id] += 1;
         self.num_in_flight_per_thread[thread_id] += num_transactions;
         self.cus_in_flight_per_thread[thread_id] += total_cus;
         self.batches.insert(
@@ -77,6 +85,7 @@ impl InFlightTracker {
         else {
             panic!("batch id {batch_id} is not being tracked");
         };
+        self.num_batches_in_flight[thread_id] -= 1;
         self.num_in_flight_per_thread[thread_id] -= num_transactions;
         self.cus_in_flight_per_thread[thread_id] -= total_cus;
 

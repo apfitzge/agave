@@ -27,6 +27,7 @@ use {
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
 pub(crate) struct GreedySchedulerConfig {
     pub target_scheduled_cus: u64,
+    pub target_outstanding_batches: usize,
     pub max_scanned_transactions_per_scheduling_pass: usize,
     pub target_transactions_per_batch: usize,
 }
@@ -35,6 +36,7 @@ impl Default for GreedySchedulerConfig {
     fn default() -> Self {
         Self {
             target_scheduled_cus: MAX_BLOCK_UNITS / 4,
+            target_outstanding_batches: 2,
             max_scanned_transactions_per_scheduling_pass: 100_000,
             target_transactions_per_batch: TARGET_NUM_TRANSACTIONS_PER_BATCH,
         }
@@ -84,6 +86,11 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for GreedyScheduler<Tx> {
         for thread_id in 0..num_threads {
             if self.common.in_flight_tracker.cus_in_flight_per_thread()[thread_id]
                 >= target_cu_per_thread
+            {
+                schedulable_threads.remove(thread_id);
+            }
+            if self.common.in_flight_tracker.outstanding_batches(thread_id)
+                >= self.config.target_outstanding_batches
             {
                 schedulable_threads.remove(thread_id);
             }
@@ -185,6 +192,8 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for GreedyScheduler<Tx> {
                     if self.common.in_flight_tracker.cus_in_flight_per_thread()[thread_id]
                         + batches.total_cus()[thread_id]
                         >= target_cu_per_thread
+                        || self.common.in_flight_tracker.outstanding_batches(thread_id)
+                            >= self.config.target_outstanding_batches
                     {
                         schedulable_threads.remove(thread_id);
                         if schedulable_threads.is_empty() {
