@@ -1,6 +1,7 @@
 use {
     crate::{
         banking_stage::{committer::Committer, vote_storage::VoteStorage, BankingStage},
+        tpu_to_pack,
         validator::{BlockProductionMethod, TransactionStructure},
     },
     agave_banking_stage_ingress_types::BankingPacketReceiver,
@@ -70,12 +71,14 @@ impl BlockProductionManager {
             "spawning non-vote block-production threads with method: {}, transaction structure: {}",
             block_production_method, transaction_structure
         );
+
         self.non_vote_shutdown_signal
             .store(false, Ordering::Relaxed);
+
         BankingStage::spawn_scheduler_and_workers_with_structure(
             self.non_vote_shutdown_signal.clone(),
             &mut self.non_vote_thread_handles,
-            block_production_method,
+            block_production_method.clone(),
             transaction_structure,
             self.context.poh_recorder.clone(),
             Committer::new(
@@ -89,6 +92,16 @@ impl BlockProductionManager {
             self.context.log_messages_bytes_limit,
             self.context.bank_forks.clone(),
         );
+
+        // If using an external pack process, we spawn a transalation thread
+        // to copy packets into shared memory space and pass them to pack from
+        // the TPU input.
+        if block_production_method == BlockProductionMethod::ExternalPack {
+            tpu_to_pack::spawn_tpu_to_pack(
+                self.non_vote_shutdown_signal.clone(),
+                self.context.non_vote_receiver.clone(),
+            );
+        }
 
         Ok(())
     }

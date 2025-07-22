@@ -526,6 +526,9 @@ impl BankingStage {
         let use_greedy_scheduler = match block_production_method {
             BlockProductionMethod::CentralScheduler => false,
             BlockProductionMethod::CentralSchedulerGreedy => true,
+            BlockProductionMethod::ExternalPack => {
+                todo!("external pack scheduler not implemented yet")
+            }
         };
         // Create channels for communication between scheduler and workers
         let num_workers = (num_threads).saturating_sub(NUM_VOTE_PROCESSING_THREADS);

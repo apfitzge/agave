@@ -39,6 +39,7 @@ pub mod stats_reporter_service;
 pub mod system_monitor_service;
 pub mod tpu;
 mod tpu_entry_notifier;
+mod tpu_to_pack;
 pub mod tvu;
 pub mod unfrozen_gossip_verified_vote_hashes;
 pub mod validator;
