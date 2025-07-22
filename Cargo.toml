@@ -183,6 +183,7 @@ agave-geyser-plugin-interface = { path = "geyser-plugin-interface", version = "=
 agave-io-uring = { path = "io-uring", version = "=3.0.0" }
 agave-precompiles = { path = "precompiles", version = "=3.0.0" }
 agave-reserved-account-keys = { path = "reserved-account-keys", version = "=3.0.0" }
+agave-scheduler-bindings = { path = "../../../agave-scheduler-bindings" }
 agave-thread-manager = { path = "thread-manager", version = "=3.0.0" }
 agave-transaction-view = { path = "transaction-view", version = "=3.0.0" }
 agave-verified-packet-receiver = { path = "verified-packet-receiver", version = "=3.0.0" }
@@ -350,6 +351,7 @@ reqwest = { version = "0.12.22", default-features = false }
 reqwest-middleware = "0.4.2"
 rolling-file = "0.2.0"
 rpassword = "7.4"
+rts-alloc = { path = "../../../rts-alloc" }
 rustls = { version = "0.23.29", features = ["std"], default-features = false }
 scopeguard = "1.2.0"
 semver = "1.0.26"
@@ -364,6 +366,7 @@ serde_yaml = "0.9.34"
 serial_test = "2.0.0"
 sha2 = "0.10.9"
 sha3 = "0.10.8"
+shaq = { path = "../../../shaq" }
 shuttle = "0.7.1"
 signal-hook = "0.3.18"
 siphasher = "1.0.1"

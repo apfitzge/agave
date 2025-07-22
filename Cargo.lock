@@ -334,6 +334,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "agave-scheduler-bindings"
+version = "0.1.0"
+
+[[package]]
 name = "agave-store-histogram"
 version = "3.0.0"
 dependencies = [
@@ -5968,6 +5972,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rts-alloc"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "rustc-demangle"
 version = "0.1.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6522,6 +6533,13 @@ checksum = "75872d278a8f37ef87fa0ddbda7802605cb18344497949862c0d4dcb291eba60"
 dependencies = [
  "digest 0.10.7",
  "keccak",
+]
+
+[[package]]
+name = "shaq"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -7885,6 +7903,7 @@ dependencies = [
  "agave-banking-stage-ingress-types",
  "agave-feature-set",
  "agave-reserved-account-keys",
+ "agave-scheduler-bindings",
  "agave-transaction-view",
  "agave-verified-packet-receiver",
  "ahash 0.8.11",
@@ -7919,12 +7938,14 @@ dependencies = [
  "rand_chacha 0.3.1",
  "rayon",
  "rolling-file",
+ "rts-alloc",
  "rustls 0.23.29",
  "serde",
  "serde_bytes",
  "serde_derive",
  "serde_json",
  "serial_test",
+ "shaq",
  "slab",
  "solana-account",
  "solana-accounts-db",
