@@ -39,7 +39,7 @@ use {
         num::Saturating,
         ops::Deref,
         sync::{
-            atomic::{AtomicU64, AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
             Arc, RwLock,
         },
         thread::{self, Builder, JoinHandle},
@@ -428,6 +428,7 @@ impl BankingStage {
 
         // Spawn legacy voting thread
         bank_thread_hdls.push(Self::spawn_vote_worker(
+            Arc::new(AtomicBool::new(false)),
             tpu_vote_receiver,
             gossip_vote_receiver,
             decision_maker.clone(),
@@ -610,6 +611,7 @@ impl BankingStage {
     }
 
     pub(crate) fn spawn_vote_worker(
+        exit_signal: Arc<AtomicBool>,
         tpu_receiver: BankingPacketReceiver,
         gossip_receiver: BankingPacketReceiver,
         decision_maker: DecisionMaker,
@@ -632,6 +634,7 @@ impl BankingStage {
             .name("solBanknStgVote".to_string())
             .spawn(move || {
                 VoteWorker::new(
+                    exit_signal,
                     decision_maker,
                     tpu_receiver,
                     gossip_receiver,
