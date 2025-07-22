@@ -440,6 +440,7 @@ impl BankingStage {
         ));
 
         Self::spawn_scheduler_and_workers_with_structure(
+            Arc::new(AtomicBool::new(false)),
             &mut bank_thread_hdls,
             block_production_method,
             transaction_struct,
@@ -458,6 +459,7 @@ impl BankingStage {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn_scheduler_and_workers_with_structure(
+        exit_signal: Arc<AtomicBool>,
         bank_thread_hdls: &mut Vec<JoinHandle<()>>,
         block_production_method: BlockProductionMethod,
         transaction_struct: TransactionStructure,
@@ -477,6 +479,7 @@ impl BankingStage {
                     bank_forks.clone(),
                 );
                 Self::spawn_scheduler_and_workers(
+                    exit_signal,
                     bank_thread_hdls,
                     receive_and_buffer,
                     block_production_method,
@@ -495,6 +498,7 @@ impl BankingStage {
                     bank_forks: bank_forks.clone(),
                 };
                 Self::spawn_scheduler_and_workers(
+                    exit_signal,
                     bank_thread_hdls,
                     receive_and_buffer,
                     block_production_method,
@@ -512,6 +516,7 @@ impl BankingStage {
 
     #[allow(clippy::too_many_arguments)]
     fn spawn_scheduler_and_workers<R: ReceiveAndBuffer + Send + Sync + 'static>(
+        exit_signal: Arc<AtomicBool>,
         bank_thread_hdls: &mut Vec<JoinHandle<()>>,
         receive_and_buffer: R,
         block_production_method: BlockProductionMethod,
@@ -572,6 +577,7 @@ impl BankingStage {
                         .name("solBnkTxSched".to_string())
                         .spawn(move || {
                             let scheduler_controller = SchedulerController::new(
+                                exit_signal,
                                 decision_maker.clone(),
                                 receive_and_buffer,
                                 bank_forks,
