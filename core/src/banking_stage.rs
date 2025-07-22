@@ -366,7 +366,7 @@ impl BankingStage {
     pub fn new(
         block_production_method: BlockProductionMethod,
         transaction_struct: TransactionStructure,
-        poh_recorder: &Arc<RwLock<PohRecorder>>,
+        poh_recorder: Arc<RwLock<PohRecorder>>,
         transaction_recorder: TransactionRecorder,
         non_vote_receiver: BankingPacketReceiver,
         tpu_vote_receiver: BankingPacketReceiver,
@@ -398,7 +398,7 @@ impl BankingStage {
     pub fn new_num_threads(
         block_production_method: BlockProductionMethod,
         transaction_struct: TransactionStructure,
-        poh_recorder: &Arc<RwLock<PohRecorder>>,
+        poh_recorder: Arc<RwLock<PohRecorder>>,
         transaction_recorder: TransactionRecorder,
         non_vote_receiver: BankingPacketReceiver,
         tpu_vote_receiver: BankingPacketReceiver,
@@ -416,7 +416,6 @@ impl BankingStage {
             VoteStorage::new(&bank)
         };
 
-        let decision_maker = DecisionMaker::new(poh_recorder.clone());
         let committer = Committer::new(
             transaction_status_sender.clone(),
             replay_vote_sender.clone(),
@@ -431,7 +430,7 @@ impl BankingStage {
             Arc::new(AtomicBool::new(false)),
             tpu_vote_receiver,
             gossip_vote_receiver,
-            decision_maker.clone(),
+            poh_recorder.clone(),
             bank_forks.clone(),
             committer.clone(),
             transaction_recorder.clone(),
@@ -444,9 +443,8 @@ impl BankingStage {
             &mut bank_thread_hdls,
             block_production_method,
             transaction_struct,
-            decision_maker,
-            committer,
             poh_recorder,
+            committer,
             transaction_recorder,
             non_vote_receiver,
             num_threads,
@@ -463,9 +461,8 @@ impl BankingStage {
         bank_thread_hdls: &mut Vec<JoinHandle<()>>,
         block_production_method: BlockProductionMethod,
         transaction_struct: TransactionStructure,
-        decision_maker: DecisionMaker,
+        poh_recorder: Arc<RwLock<PohRecorder>>,
         committer: Committer,
-        poh_recorder: &Arc<RwLock<PohRecorder>>,
         transaction_recorder: TransactionRecorder,
         non_vote_receiver: BankingPacketReceiver,
         num_threads: u32,
@@ -483,9 +480,8 @@ impl BankingStage {
                     bank_thread_hdls,
                     receive_and_buffer,
                     block_production_method,
-                    decision_maker,
-                    committer,
                     poh_recorder,
+                    committer,
                     transaction_recorder,
                     num_threads,
                     log_messages_bytes_limit,
@@ -502,9 +498,8 @@ impl BankingStage {
                     bank_thread_hdls,
                     receive_and_buffer,
                     block_production_method,
-                    decision_maker,
-                    committer,
                     poh_recorder,
+                    committer,
                     transaction_recorder,
                     num_threads,
                     log_messages_bytes_limit,
@@ -520,9 +515,8 @@ impl BankingStage {
         bank_thread_hdls: &mut Vec<JoinHandle<()>>,
         receive_and_buffer: R,
         block_production_method: BlockProductionMethod,
-        decision_maker: DecisionMaker,
+        poh_recorder: Arc<RwLock<PohRecorder>>,
         committer: Committer,
-        poh_recorder: &Arc<RwLock<PohRecorder>>,
         transaction_recorder: TransactionRecorder,
         num_threads: u32,
         log_messages_bytes_limit: Option<usize>,
@@ -578,7 +572,7 @@ impl BankingStage {
                         .spawn(move || {
                             let scheduler_controller = SchedulerController::new(
                                 exit_signal,
-                                decision_maker.clone(),
+                                DecisionMaker::new(poh_recorder),
                                 receive_and_buffer,
                                 bank_forks,
                                 $scheduler,
@@ -620,7 +614,7 @@ impl BankingStage {
         exit_signal: Arc<AtomicBool>,
         tpu_receiver: BankingPacketReceiver,
         gossip_receiver: BankingPacketReceiver,
-        decision_maker: DecisionMaker,
+        poh_recorder: Arc<RwLock<PohRecorder>>,
         bank_forks: Arc<RwLock<BankForks>>,
         committer: Committer,
         transaction_recorder: TransactionRecorder,
@@ -641,7 +635,7 @@ impl BankingStage {
             .spawn(move || {
                 VoteWorker::new(
                     exit_signal,
-                    decision_maker,
+                    DecisionMaker::new(poh_recorder),
                     tpu_receiver,
                     gossip_receiver,
                     vote_storage,
@@ -756,7 +750,7 @@ mod tests {
         let banking_stage = BankingStage::new(
             BlockProductionMethod::CentralScheduler,
             transaction_struct,
-            &poh_recorder,
+            poh_recorder,
             transaction_recorder,
             non_vote_receiver,
             tpu_vote_receiver,
@@ -811,7 +805,7 @@ mod tests {
         let banking_stage = BankingStage::new(
             BlockProductionMethod::CentralScheduler,
             transaction_struct,
-            &poh_recorder,
+            poh_recorder,
             transaction_recorder,
             non_vote_receiver,
             tpu_vote_receiver,
@@ -828,7 +822,6 @@ mod tests {
         drop(gossip_vote_sender);
         exit.store(true, Ordering::Relaxed);
         poh_service.join().unwrap();
-        drop(poh_recorder);
 
         trace!("getting entries");
         let entries: Vec<_> = entry_receiver
@@ -875,7 +868,7 @@ mod tests {
         let banking_stage = BankingStage::new(
             block_production_method,
             transaction_struct,
-            &poh_recorder,
+            poh_recorder,
             transaction_recorder,
             non_vote_receiver,
             tpu_vote_receiver,
@@ -928,7 +921,6 @@ mod tests {
 
         exit.store(true, Ordering::Relaxed);
         poh_service.join().unwrap();
-        drop(poh_recorder);
 
         let mut blockhash = start_hash;
         let (bank, _bank_forks) = Bank::new_no_wallclock_throttle_for_tests(&genesis_config);
@@ -1027,7 +1019,7 @@ mod tests {
             let _banking_stage = BankingStage::new(
                 BlockProductionMethod::CentralScheduler,
                 transaction_struct,
-                &poh_recorder,
+                poh_recorder,
                 transaction_recorder,
                 non_vote_receiver,
                 tpu_vote_receiver,
@@ -1213,7 +1205,7 @@ mod tests {
         let banking_stage = BankingStage::new(
             BlockProductionMethod::CentralScheduler,
             transaction_struct,
-            &poh_recorder,
+            poh_recorder,
             transaction_recorder,
             non_vote_receiver,
             tpu_vote_receiver,
