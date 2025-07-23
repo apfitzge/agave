@@ -18,6 +18,7 @@ use {
 /// setup by the pack process.
 pub fn spawn_tpu_to_pack(
     exit_signal: Arc<AtomicBool>,
+    non_vote_thread_exitted_signal: Arc<AtomicBool>,
     receiver: BankingPacketReceiver,
     clean_up: impl Fn() + Send + Sync + 'static,
 ) -> JoinHandle<()> {
@@ -27,7 +28,13 @@ pub fn spawn_tpu_to_pack(
             // Setup allocator and queue.
             // If setup fails, exit immediately.
             if let Some((allocator, producer)) = setup() {
-                tpu_to_pack(exit_signal, receiver, allocator, producer);
+                tpu_to_pack(
+                    exit_signal,
+                    non_vote_thread_exitted_signal,
+                    receiver,
+                    allocator,
+                    producer,
+                );
             }
 
             // call `clean_up` unconditionally.
@@ -59,11 +66,14 @@ fn setup() -> Option<(Allocator, shaq::Producer<TpuToPackMessage>)> {
 
 fn tpu_to_pack(
     exit_signal: Arc<AtomicBool>,
+    non_vote_thread_exitted_signal: Arc<AtomicBool>,
     receiver: BankingPacketReceiver,
     allocator: Allocator,
     mut producer: shaq::Producer<TpuToPackMessage>,
 ) {
-    while exit_signal.load(Ordering::Relaxed) {
+    while !exit_signal.load(Ordering::Relaxed)
+        && !non_vote_thread_exitted_signal.load(Ordering::Relaxed)
+    {
         // Receive packets from the TPU.
         if let Ok(packet_batch) = receiver.try_recv() {
             // Clean all remote frees in allocator so we have as much

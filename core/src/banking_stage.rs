@@ -442,6 +442,7 @@ impl BankingStage {
 
         Self::spawn_scheduler_and_workers_with_structure(
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
             &mut bank_thread_hdls,
             block_production_method,
             transaction_struct,
@@ -460,6 +461,7 @@ impl BankingStage {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn_scheduler_and_workers_with_structure(
         exit_signal: Arc<AtomicBool>,
+        non_vote_thread_exitted_signal: Arc<AtomicBool>,
         bank_thread_hdls: &mut Vec<JoinHandle<()>>,
         block_production_method: BlockProductionMethod,
         transaction_struct: TransactionStructure,
@@ -479,6 +481,7 @@ impl BankingStage {
                 );
                 Self::spawn_scheduler_and_workers(
                     exit_signal,
+                    non_vote_thread_exitted_signal,
                     bank_thread_hdls,
                     receive_and_buffer,
                     block_production_method,
@@ -497,6 +500,7 @@ impl BankingStage {
                 };
                 Self::spawn_scheduler_and_workers(
                     exit_signal,
+                    non_vote_thread_exitted_signal,
                     bank_thread_hdls,
                     receive_and_buffer,
                     block_production_method,
@@ -514,6 +518,7 @@ impl BankingStage {
     #[allow(clippy::too_many_arguments)]
     fn spawn_scheduler_and_workers<R: ReceiveAndBuffer + Send + Sync + 'static>(
         exit_signal: Arc<AtomicBool>,
+        non_vote_thread_exitted_signal: Arc<AtomicBool>,
         bank_thread_hdls: &mut Vec<JoinHandle<()>>,
         receive_and_buffer: R,
         block_production_method: BlockProductionMethod,
@@ -529,7 +534,11 @@ impl BankingStage {
             BlockProductionMethod::CentralScheduler => false,
             BlockProductionMethod::CentralSchedulerGreedy => true,
             BlockProductionMethod::ExternalPack => {
-                Self::connect_to_external_pack(exit_signal, bank_thread_hdls);
+                Self::connect_to_external_pack(
+                    exit_signal,
+                    non_vote_thread_exitted_signal,
+                    bank_thread_hdls,
+                );
                 return;
             }
         };
@@ -618,6 +627,7 @@ impl BankingStage {
 
     fn connect_to_external_pack(
         exit_signal: Arc<AtomicBool>,
+        non_vote_thread_exitted_signal: Arc<AtomicBool>,
         bank_thread_hdls: &mut Vec<JoinHandle<()>>,
     ) {
         bank_thread_hdls.push(
@@ -626,6 +636,7 @@ impl BankingStage {
                 .spawn(move || {
                     let mut scheduler = FifoScheduler::new(exit_signal);
                     scheduler.run();
+                    non_vote_thread_exitted_signal.store(true, Ordering::Relaxed);
                 })
                 .unwrap(),
         );

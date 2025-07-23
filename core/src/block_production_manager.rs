@@ -30,6 +30,8 @@ pub struct BlockProductionManager {
 
     /// Signal to shutdown non-vote thread(s).
     non_vote_shutdown_signal: Arc<AtomicBool>,
+    /// Signal that a thread has exited.
+    non_vote_thread_exitted_signal: Arc<AtomicBool>,
     /// Non-vote thread handle(s).
     non_vote_thread_handles: Vec<JoinHandle<()>>,
 
@@ -44,6 +46,7 @@ impl BlockProductionManager {
     pub fn with_context(context: BlockProductionContext) -> Self {
         let vote_shutdown_signal = Arc::new(AtomicBool::new(false));
         let non_vote_shutdown_signal = Arc::new(AtomicBool::new(false));
+        let non_vote_thread_exitted_signal = Arc::new(AtomicBool::new(false));
 
         let vote_thread_handle = Self::spawn_vote_thread(vote_shutdown_signal.clone(), &context);
 
@@ -51,6 +54,7 @@ impl BlockProductionManager {
             vote_shutdown_signal,
             vote_thread_handle: Some(vote_thread_handle),
             non_vote_shutdown_signal,
+            non_vote_thread_exitted_signal,
             non_vote_thread_handles: vec![],
             context,
         }
@@ -73,34 +77,37 @@ impl BlockProductionManager {
         // the TPU input.
         if block_production_method == BlockProductionMethod::ExternalPack {
             let weak = Arc::downgrade(manager);
-            let mut manager = manager.lock().unwrap();
+            let manager = manager.lock().unwrap();
             let non_vote_shutdown_signal = manager.non_vote_shutdown_signal.clone();
-            let non_vote_receiver = manager.context.non_vote_receiver.clone();
 
-            manager
-                .non_vote_thread_handles
-                .push(tpu_to_pack::spawn_tpu_to_pack(
-                    non_vote_shutdown_signal.clone(),
-                    non_vote_receiver,
-                    move || {
-                        // Exit immediately if shutdown signal is set - otherwise
-                        // this will block indefinitely.
-                        if non_vote_shutdown_signal.load(Ordering::Relaxed) {
-                            return;
-                        }
-                        if let Some(manager) = weak.upgrade() {
-                            info!("external pack crashing. spawning default block production");
-                            manager
-                                .lock()
-                                .unwrap()
-                                .spawn_scheduler_and_workers(
-                                    BlockProductionMethod::default(),
-                                    TransactionStructure::default(),
-                                )
-                                .expect("failed to spawn default block production");
-                        }
-                    },
-                ));
+            // Do NOT add tpu_to_pack to the non vote thread handles.
+            // It is additionally used to respawn the default scheduler.
+            // Need to be VERY confident that tpu to pack will shutdown
+            // correctly when the shutdown signal is set OR if the
+            // internal scheduler finishes.
+            tpu_to_pack::spawn_tpu_to_pack(
+                non_vote_shutdown_signal.clone(),
+                manager.non_vote_thread_exitted_signal.clone(),
+                manager.context.non_vote_receiver.clone(),
+                move || {
+                    // Exit immediately if shutdown signal is set - otherwise
+                    // this will block indefinitely.
+                    if non_vote_shutdown_signal.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    if let Some(manager) = weak.upgrade() {
+                        info!("external pack crashing. spawning default block production");
+                        manager
+                            .lock()
+                            .unwrap()
+                            .spawn_scheduler_and_workers(
+                                BlockProductionMethod::default(),
+                                TransactionStructure::default(),
+                            )
+                            .expect("failed to spawn default block production");
+                    }
+                },
+            );
         }
 
         Ok(())
@@ -122,9 +129,12 @@ impl BlockProductionManager {
 
         self.non_vote_shutdown_signal
             .store(false, Ordering::Relaxed);
+        self.non_vote_thread_exitted_signal
+            .store(false, Ordering::Relaxed);
 
         BankingStage::spawn_scheduler_and_workers_with_structure(
             self.non_vote_shutdown_signal.clone(),
+            self.non_vote_thread_exitted_signal.clone(),
             &mut self.non_vote_thread_handles,
             block_production_method.clone(),
             transaction_structure,
