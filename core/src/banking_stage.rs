@@ -12,6 +12,7 @@ use {
     crate::{
         banking_stage::{
             consume_worker::ConsumeWorker,
+            fifo_scheduler::FifoScheduler,
             packet_deserializer::PacketDeserializer,
             transaction_scheduler::{
                 prio_graph_scheduler::PrioGraphScheduler,
@@ -64,6 +65,7 @@ pub mod qos_service;
 pub mod vote_storage;
 
 mod consume_worker;
+mod fifo_scheduler;
 mod vote_worker;
 conditional_vis_mod!(decision_maker, feature = "dev-context-only-utils", pub);
 mod immutable_deserialized_packet;
@@ -527,7 +529,8 @@ impl BankingStage {
             BlockProductionMethod::CentralScheduler => false,
             BlockProductionMethod::CentralSchedulerGreedy => true,
             BlockProductionMethod::ExternalPack => {
-                todo!("external pack scheduler not implemented yet")
+                Self::connect_to_external_pack(exit_signal, bank_thread_hdls);
+                return;
             }
         };
         // Create channels for communication between scheduler and workers
@@ -611,6 +614,21 @@ impl BankingStage {
             );
             spawn_scheduler!(scheduler);
         }
+    }
+
+    fn connect_to_external_pack(
+        exit_signal: Arc<AtomicBool>,
+        bank_thread_hdls: &mut Vec<JoinHandle<()>>,
+    ) {
+        bank_thread_hdls.push(
+            std::thread::Builder::new()
+                .name("solBnkTxSched".to_string())
+                .spawn(move || {
+                    let mut scheduler = FifoScheduler::new(exit_signal);
+                    scheduler.run();
+                })
+                .unwrap(),
+        );
     }
 
     pub(crate) fn spawn_vote_worker(
