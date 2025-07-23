@@ -97,10 +97,11 @@ impl BlockProductionManager {
         // to copy packets into shared memory space and pass them to pack from
         // the TPU input.
         if block_production_method == BlockProductionMethod::ExternalPack {
-            tpu_to_pack::spawn_tpu_to_pack(
-                self.non_vote_shutdown_signal.clone(),
-                self.context.non_vote_receiver.clone(),
-            );
+            self.non_vote_thread_handles
+                .push(tpu_to_pack::spawn_tpu_to_pack(
+                    self.non_vote_shutdown_signal.clone(),
+                    self.context.non_vote_receiver.clone(),
+                ));
         }
 
         Ok(())
