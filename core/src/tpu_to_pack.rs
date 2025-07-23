@@ -29,11 +29,21 @@ pub fn spawn_tpu_to_pack(
         .name("solTpu2Pack".to_string())
         .spawn(move || {
             // Join allocator and queue regions
-            let allocator = Allocator::join(ALLOCATOR_PATH, ALLOCATOR_WORKER_ID)
-                .expect("failed to join allocator region");
-            let producer = shaq::Producer::<TpuToPackMessage>::join(TPU_TO_PACK_PATH)
-                .expect("failed to join tpu_to_pack queue");
-            tpu_to_pack(exit_signal, receiver, allocator, producer)
+            let allocator = match Allocator::join(ALLOCATOR_PATH, ALLOCATOR_WORKER_ID) {
+                Ok(allocator) => allocator,
+                Err(e) => {
+                    error!("Failed to join allocator: {e:?}");
+                    return;
+                }
+            };
+            let producer = match shaq::Producer::<TpuToPackMessage>::join(TPU_TO_PACK_PATH) {
+                Ok(producer) => producer,
+                Err(e) => {
+                    error!("Failed to join producer queue: {e:?}");
+                    return;
+                }
+            };
+            tpu_to_pack(exit_signal, receiver, allocator, producer);
         })
         .expect("failed to spawn tpu_to_pack thread")
 }
@@ -68,7 +78,6 @@ fn tpu_to_pack(
                     };
 
                     // Allocate enough bytes in the allocator for the packet.
-
                     let Some(allocated_packet) = allocator.allocate(packet_size as u32) else {
                         // TODO: Better handling?
                         break 'batch_loop;
