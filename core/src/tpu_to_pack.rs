@@ -21,33 +21,40 @@ pub fn spawn_tpu_to_pack(
     receiver: BankingPacketReceiver,
     clean_up: impl Fn() + Send + Sync + 'static,
 ) -> JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("solTpu2Pack".to_string())
+        .spawn(move || {
+            // Setup allocator and queue.
+            // If setup fails, exit immediately.
+            if let Some((allocator, producer)) = setup() {
+                tpu_to_pack(exit_signal, receiver, allocator, producer);
+            }
+
+            // call `clean_up` unconditionally.
+            // this handles cases where external pack process fails,
+            // and we want to respawn a default scheduler.
+            clean_up();
+        })
+        .expect("failed to spawn tpu_to_pack thread")
+}
+
+fn setup() -> Option<(Allocator, shaq::Producer<TpuToPackMessage>)> {
     // TODO: Pass these in.
     const ALLOCATOR_PATH: &str = "/mnt/hugepages/rts-alloc";
     const ALLOCATOR_WORKER_ID: u32 = 0;
     const TPU_TO_PACK_PATH: &str = "/mnt/hugepages/tpu_to_pack";
-
-    std::thread::Builder::new()
-        .name("solTpu2Pack".to_string())
-        .spawn(move || {
-            // Join allocator and queue regions
-            let allocator = match Allocator::join(ALLOCATOR_PATH, ALLOCATOR_WORKER_ID) {
-                Ok(allocator) => allocator,
-                Err(e) => {
-                    error!("Failed to join allocator: {e:?}");
-                    return;
-                }
-            };
-            let producer = match shaq::Producer::<TpuToPackMessage>::join(TPU_TO_PACK_PATH) {
-                Ok(producer) => producer,
-                Err(e) => {
-                    error!("Failed to join producer queue: {e:?}");
-                    return;
-                }
-            };
-            tpu_to_pack(exit_signal, receiver, allocator, producer);
-            clean_up();
+    let allocator = Allocator::join(ALLOCATOR_PATH, ALLOCATOR_WORKER_ID)
+        .map_err(|e| {
+            error!("Failed to join allocator: {e:?}");
         })
-        .expect("failed to spawn tpu_to_pack thread")
+        .ok()?;
+    let producer = shaq::Producer::join(TPU_TO_PACK_PATH)
+        .map_err(|e| {
+            error!("Failed to create producer: {e:?}");
+        })
+        .ok()?;
+
+    Some((allocator, producer))
 }
 
 fn tpu_to_pack(
