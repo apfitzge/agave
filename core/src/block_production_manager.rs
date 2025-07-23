@@ -14,7 +14,7 @@ use {
     std::{
         sync::{
             atomic::{AtomicBool, Ordering},
-            Arc, RwLock,
+            Arc, Mutex, RwLock,
         },
         thread::{self, JoinHandle},
     },
@@ -59,6 +59,54 @@ impl BlockProductionManager {
     /// Spawn non-vote threads with specified block production method and
     /// transaction structure.
     pub fn spawn_non_vote_threads(
+        manager: &Arc<Mutex<Self>>,
+        block_production_method: BlockProductionMethod,
+        transaction_structure: TransactionStructure,
+    ) -> thread::Result<()> {
+        manager
+            .lock()
+            .unwrap()
+            .spawn_scheduler_and_workers(block_production_method.clone(), transaction_structure)?;
+
+        // If using an external pack process, we spawn a transalation thread
+        // to copy packets into shared memory space and pass them to pack from
+        // the TPU input.
+        if block_production_method == BlockProductionMethod::ExternalPack {
+            let weak = Arc::downgrade(manager);
+            let mut manager = manager.lock().unwrap();
+            let non_vote_shutdown_signal = manager.non_vote_shutdown_signal.clone();
+            let non_vote_receiver = manager.context.non_vote_receiver.clone();
+
+            manager
+                .non_vote_thread_handles
+                .push(tpu_to_pack::spawn_tpu_to_pack(
+                    non_vote_shutdown_signal.clone(),
+                    non_vote_receiver,
+                    move || {
+                        // Exit immediately if shutdown signal is set - otherwise
+                        // this will block indefinitely.
+                        if non_vote_shutdown_signal.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        if let Some(manager) = weak.upgrade() {
+                            info!("external pack crashing. spawning default block production");
+                            manager
+                                .lock()
+                                .unwrap()
+                                .spawn_scheduler_and_workers(
+                                    BlockProductionMethod::default(),
+                                    TransactionStructure::default(),
+                                )
+                                .expect("failed to spawn default block production");
+                        }
+                    },
+                ));
+        }
+
+        Ok(())
+    }
+
+    fn spawn_scheduler_and_workers(
         &mut self,
         block_production_method: BlockProductionMethod,
         transaction_structure: TransactionStructure,
@@ -92,17 +140,6 @@ impl BlockProductionManager {
             self.context.log_messages_bytes_limit,
             self.context.bank_forks.clone(),
         );
-
-        // If using an external pack process, we spawn a transalation thread
-        // to copy packets into shared memory space and pass them to pack from
-        // the TPU input.
-        if block_production_method == BlockProductionMethod::ExternalPack {
-            self.non_vote_thread_handles
-                .push(tpu_to_pack::spawn_tpu_to_pack(
-                    self.non_vote_shutdown_signal.clone(),
-                    self.context.non_vote_receiver.clone(),
-                ));
-        }
 
         Ok(())
     }

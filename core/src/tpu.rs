@@ -324,7 +324,7 @@ impl Tpu {
             duplicate_confirmed_slot_sender,
         );
 
-        let mut block_production_manager =
+        let block_production_manager =
             BlockProductionManager::with_context(BlockProductionContext {
                 poh_recorder: poh_recorder.clone(),
                 transaction_recorder,
@@ -337,10 +337,13 @@ impl Tpu {
                 bank_forks: bank_forks.clone(),
                 prioritization_fee_cache: prioritization_fee_cache.clone(),
             });
-        block_production_manager
-            .spawn_non_vote_threads(block_production_method, transaction_struct)
-            .expect("failed to spawn non-vote threads");
         let block_production_manager = Arc::new(Mutex::new(block_production_manager));
+        BlockProductionManager::spawn_non_vote_threads(
+            &block_production_manager,
+            block_production_method,
+            transaction_struct,
+        )
+        .expect("failed to spawn non-vote threads");
 
         let SpawnForwardingStageResult {
             join_handle: forwarding_stage,

@@ -11,6 +11,7 @@ use {
     solana_accounts_db::accounts_index::AccountIndex,
     solana_core::{
         admin_rpc_post_init::AdminRpcRequestMetadataPostInit,
+        block_production_manager::BlockProductionManager,
         consensus::{tower_storage::TowerStorage, Tower},
         repair::repair_service,
         validator::{BlockProductionMethod, TransactionStructure, ValidatorStartProgress},
@@ -777,14 +778,15 @@ impl AdminRpc for AdminRpcImpl {
                 return Err(jsonrpc_core::error::Error::internal_error());
             };
 
-            block_production_manager
-                .lock()
-                .unwrap()
-                .spawn_non_vote_threads(block_production_method, transaction_struct)
-                .map_err(|err| {
-                    error!("Failed to spawn new non-vote threads: {err:?}");
-                    jsonrpc_core::error::Error::internal_error()
-                })?;
+            BlockProductionManager::spawn_non_vote_threads(
+                block_production_manager,
+                block_production_method,
+                transaction_struct,
+            )
+            .map_err(|err| {
+                error!("Failed to spawn new non-vote threads: {err:?}");
+                jsonrpc_core::error::Error::internal_error()
+            })?;
 
             Ok(())
         })

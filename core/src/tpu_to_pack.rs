@@ -19,6 +19,7 @@ use {
 pub fn spawn_tpu_to_pack(
     exit_signal: Arc<AtomicBool>,
     receiver: BankingPacketReceiver,
+    clean_up: impl Fn() + Send + Sync + 'static,
 ) -> JoinHandle<()> {
     // TODO: Pass these in.
     const ALLOCATOR_PATH: &str = "/mnt/hugepages/rts-alloc";
@@ -44,6 +45,7 @@ pub fn spawn_tpu_to_pack(
                 }
             };
             tpu_to_pack(exit_signal, receiver, allocator, producer);
+            clean_up();
         })
         .expect("failed to spawn tpu_to_pack thread")
 }
