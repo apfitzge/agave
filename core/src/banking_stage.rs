@@ -636,8 +636,9 @@ impl BankingStage {
             std::thread::Builder::new()
                 .name("solBnkTxSched".to_string())
                 .spawn(move || {
-                    let mut scheduler = FifoScheduler::new(exit_signal, poh_recorder);
-                    scheduler.run();
+                    if let Some(mut scheduler) = FifoScheduler::new(exit_signal, poh_recorder) {
+                        scheduler.run();
+                    }
                     non_vote_thread_exitted_signal.store(true, Ordering::Relaxed);
                 })
                 .unwrap(),
