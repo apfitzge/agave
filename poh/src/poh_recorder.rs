@@ -603,6 +603,32 @@ impl PohRecorder {
                 })
     }
 
+    /// Return the current or next leader slot and the percentage
+    /// of progress in that slot - this will be negative if the slot
+    /// has not begun yet.
+    pub fn leader_progress(&self) -> Option<(Slot, i16)> {
+        if let Some(bank) = self.working_bank.as_ref() {
+            let starting_tick_height = bank.min_tick_height;
+            let current_tick_height = bank.bank.tick_height();
+            let progress = ((100 * current_tick_height.saturating_sub(starting_tick_height))
+                / self.ticks_per_slot) as i16;
+            return Some((bank.bank.slot(), progress));
+        }
+
+        if let Some(leader_first_tick_height) = self.leader_first_tick_height {
+            let current_tick_height = self.tick_height;
+            let progress = ((100 * leader_first_tick_height.saturating_sub(current_tick_height))
+                / self.ticks_per_slot)
+                .min(i16::MAX as u64) as i16;
+            return Some((
+                self.slot_for_tick_height(leader_first_tick_height),
+                progress,
+            ));
+        }
+
+        None
+    }
+
     // Return the slot for a given tick height
     fn slot_for_tick_height(&self, tick_height: u64) -> Slot {
         // We need to subtract by one here because, assuming ticks per slot is 64,
