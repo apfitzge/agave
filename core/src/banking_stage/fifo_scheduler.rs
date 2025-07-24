@@ -1,6 +1,7 @@
 use {
     agave_scheduler_bindings::{
         scheduler_message_types, PackToSchedulerMessage, SchedulerToPackMessage,
+        MAX_TRANSACTIONS_PER_MESSAGE,
     },
     rts_alloc::Allocator,
     shaq::{Consumer, Producer},
@@ -50,8 +51,8 @@ pub struct FifoScheduler {
     exit_signal: Arc<AtomicBool>,
     cached_leader_progress: CachedLeaderProgress,
 
-    _allocator: Allocator,
-    _pack_message_consumer: Consumer<PackToSchedulerMessage>,
+    allocator: Allocator,
+    pack_message_consumer: Consumer<PackToSchedulerMessage>,
     scheduler_message_producer: Producer<SchedulerToPackMessage>,
 }
 
@@ -64,8 +65,8 @@ impl FifoScheduler {
         Some(Self {
             exit_signal,
             cached_leader_progress: CachedLeaderProgress::new(poh_recorder),
-            _allocator: allocator,
-            _pack_message_consumer: consumer,
+            allocator,
+            pack_message_consumer: consumer,
             scheduler_message_producer: producer,
         })
     }
@@ -74,6 +75,7 @@ impl FifoScheduler {
         while !self.exit_signal.load(Ordering::Relaxed) {
             self.scheduler_message_producer.sync();
             let _progress = self.progress();
+            self.receive_pack_messages();
             self.scheduler_message_producer.commit();
         }
     }
@@ -98,6 +100,49 @@ impl FifoScheduler {
         }
 
         progress
+    }
+
+    fn receive_pack_messages(&mut self) {
+        self.pack_message_consumer.sync();
+
+        while let Some(pack_message) = self.pack_message_consumer.try_read() {
+            let message = unsafe { pack_message.as_ref() };
+
+            if message.num_transactions == 0
+                || message.num_transactions > MAX_TRANSACTIONS_PER_MESSAGE as u8
+            {
+                continue;
+            }
+
+            for (transaction_index, sharable_transaction) in message.transactions
+                [..usize::from(message.num_transactions)]
+                .iter()
+                .enumerate()
+            {
+                // Pass back message that transaction was dropped.
+                let ptr = self
+                    .allocator
+                    .ptr_from_offset(sharable_transaction.transaction_offset);
+
+                // SAFETY: The pointer is valid as it was allocated by the allocator.
+                unsafe {
+                    self.allocator.free(ptr);
+                }
+
+                if let Some(mut scheduler_message) = self.scheduler_message_producer.reserve() {
+                    // SAFETY: reserved safely
+                    let scheduler_message = unsafe { scheduler_message.as_mut() };
+                    scheduler_message.tag = scheduler_message_types::DROPPED_TRANSACTION;
+                    // SAFETY: writing the message
+                    let dropped_transaction =
+                        unsafe { &mut scheduler_message.inner.dropped_transaction };
+                    dropped_transaction.message_id = message.message_id;
+                    dropped_transaction.transaction_index = transaction_index as u8;
+                }
+            }
+        }
+
+        self.pack_message_consumer.finalize();
     }
 }
 
