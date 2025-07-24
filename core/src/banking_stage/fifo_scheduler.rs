@@ -72,30 +72,32 @@ impl FifoScheduler {
 
     pub fn run(&mut self) {
         while !self.exit_signal.load(Ordering::Relaxed) {
-            std::thread::sleep(Duration::from_millis(5));
-
             self.scheduler_message_producer.sync();
-
-            let (progress, updated) = self.cached_leader_progress.get();
-            if updated {
-                if let Some((slot, progress)) = progress {
-                    log::info!("current progress: slot {}, progress {}", slot, progress);
-                    if let Some(mut scheduler_message) = self.scheduler_message_producer.reserve() {
-                        // SAFETY: reserved safely
-                        let scheduler_message = unsafe { scheduler_message.as_mut() };
-                        scheduler_message.tag = scheduler_message_types::SLOT_STATUS;
-                        // SAFETY: writing the message
-                        let slot_status = unsafe { &mut scheduler_message.inner.slot_status };
-                        slot_status.slot = slot;
-                        slot_status.progress = progress;
-                    }
-                } else {
-                    log::info!("no progress available");
-                }
-            }
-
+            let _progress = self.progress();
             self.scheduler_message_producer.commit();
         }
+    }
+
+    fn progress(&mut self) -> Option<(Slot, i16)> {
+        let (progress, updated) = self.cached_leader_progress.get();
+        if updated {
+            if let Some((slot, progress)) = progress {
+                log::info!("current progress: slot {}, progress {}", slot, progress);
+                if let Some(mut scheduler_message) = self.scheduler_message_producer.reserve() {
+                    // SAFETY: reserved safely
+                    let scheduler_message = unsafe { scheduler_message.as_mut() };
+                    scheduler_message.tag = scheduler_message_types::SLOT_STATUS;
+                    // SAFETY: writing the message
+                    let slot_status = unsafe { &mut scheduler_message.inner.slot_status };
+                    slot_status.slot = slot;
+                    slot_status.progress = progress;
+                }
+            } else {
+                log::info!("no progress available");
+            }
+        }
+
+        progress
     }
 }
 
