@@ -536,6 +536,7 @@ impl BankingStage {
             BlockProductionMethod::ExternalPack => {
                 Self::connect_to_external_pack(
                     exit_signal,
+                    poh_recorder,
                     non_vote_thread_exitted_signal,
                     bank_thread_hdls,
                 );
@@ -627,6 +628,7 @@ impl BankingStage {
 
     fn connect_to_external_pack(
         exit_signal: Arc<AtomicBool>,
+        poh_recorder: Arc<RwLock<PohRecorder>>,
         non_vote_thread_exitted_signal: Arc<AtomicBool>,
         bank_thread_hdls: &mut Vec<JoinHandle<()>>,
     ) {
@@ -634,7 +636,7 @@ impl BankingStage {
             std::thread::Builder::new()
                 .name("solBnkTxSched".to_string())
                 .spawn(move || {
-                    let mut scheduler = FifoScheduler::new(exit_signal);
+                    let mut scheduler = FifoScheduler::new(exit_signal, poh_recorder);
                     scheduler.run();
                     non_vote_thread_exitted_signal.store(true, Ordering::Relaxed);
                 })
