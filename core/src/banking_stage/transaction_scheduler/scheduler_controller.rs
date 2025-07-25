@@ -85,6 +85,7 @@ where
 
     pub fn run(mut self) -> Result<(), SchedulerError> {
         let mut last_slot = None;
+        let mut skip_processing = false; // skip processing until scheduler is "fresh" at the start of each slot
         loop {
             // BufferedPacketsDecision is shared with legacy BankingStage, which will forward
             // packets. Initially, not renaming these decision variants but the actions taken
@@ -114,8 +115,27 @@ where
             if last_slot != new_leader_slot {
                 self.container.flush_held_transactions();
                 last_slot = new_leader_slot;
+
+                if new_leader_slot.is_some() {
+                    skip_processing = true;
+                }
             }
-            self.process_transactions(&decision)?;
+
+            if skip_processing
+                && self
+                    .scheduler
+                    .scheduling_common_mut()
+                    .in_flight_tracker
+                    .num_in_flight_per_thread()
+                    .iter()
+                    .all(|&in_flight| in_flight == 0)
+            {
+                skip_processing = false;
+            }
+
+            if !skip_processing {
+                self.process_transactions(&decision)?;
+            }
             if self.receive_and_buffer_packets(&decision).is_err() {
                 break;
             }
