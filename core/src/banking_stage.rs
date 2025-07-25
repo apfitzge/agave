@@ -12,6 +12,7 @@ use {
     crate::{
         banking_stage::{
             consume_worker::ConsumeWorker,
+            consumer_worker_for_external::ConsumerWorkerForExternal,
             fifo_scheduler::FifoScheduler,
             packet_deserializer::PacketDeserializer,
             transaction_scheduler::{
@@ -65,6 +66,7 @@ pub mod qos_service;
 pub mod vote_storage;
 
 mod consume_worker;
+mod consumer_worker_for_external;
 mod fifo_scheduler;
 mod vote_worker;
 conditional_vis_mod!(decision_maker, feature = "dev-context-only-utils", pub);
@@ -539,6 +541,7 @@ impl BankingStage {
                     poh_recorder,
                     non_vote_thread_exitted_signal,
                     bank_thread_hdls,
+                    (num_threads).saturating_sub(NUM_VOTE_PROCESSING_THREADS),
                 );
                 return;
             }
@@ -631,18 +634,43 @@ impl BankingStage {
         poh_recorder: Arc<RwLock<PohRecorder>>,
         non_vote_thread_exitted_signal: Arc<AtomicBool>,
         bank_thread_hdls: &mut Vec<JoinHandle<()>>,
+        num_workers: u32,
     ) {
         bank_thread_hdls.push(
             std::thread::Builder::new()
                 .name("solBnkTxSched".to_string())
-                .spawn(move || {
-                    if let Some(mut scheduler) = FifoScheduler::new(exit_signal, poh_recorder) {
-                        scheduler.run();
+                .spawn({
+                    let exit_signal = exit_signal.clone();
+                    let non_vote_thread_exitted_signal = non_vote_thread_exitted_signal.clone();
+                    move || {
+                        if let Some(mut scheduler) = FifoScheduler::new(exit_signal, poh_recorder) {
+                            scheduler.run();
+                        }
+                        non_vote_thread_exitted_signal.store(true, Ordering::Relaxed);
                     }
-                    non_vote_thread_exitted_signal.store(true, Ordering::Relaxed);
                 })
                 .unwrap(),
         );
+
+        for worker_index in 0..num_workers {
+            bank_thread_hdls.push(
+                std::thread::Builder::new()
+                    .name("solBnkEWrker".to_string())
+                    .spawn({
+                        let exit_signal = exit_signal.clone();
+                        let non_vote_thread_exitted_signal = non_vote_thread_exitted_signal.clone();
+                        move || {
+                            if let Some(mut worker) =
+                                ConsumerWorkerForExternal::new(worker_index, exit_signal)
+                            {
+                                worker.run();
+                            }
+                            non_vote_thread_exitted_signal.store(true, Ordering::Relaxed);
+                        }
+                    })
+                    .unwrap(),
+            );
+        }
     }
 
     pub(crate) fn spawn_vote_worker(
