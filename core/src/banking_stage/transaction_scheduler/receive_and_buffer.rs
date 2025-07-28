@@ -11,7 +11,7 @@ use {
         },
     },
     crate::banking_stage::{
-        consumer::Consumer, decision_maker::BufferedPacketsDecision,
+        decision_maker::BufferedPacketsDecision,
         immutable_deserialized_packet::ImmutableDeserializedPacket,
         packet_deserializer::PacketDeserializer, packet_filter::MAX_ALLOWED_PRECOMPILE_SIGNATURES,
         scheduler_messages::MaxAge, TransactionStateContainer,
@@ -232,9 +232,6 @@ impl SanitizedTransactionReceiveAndBuffer {
                 .zip(fee_budget_limits_vec.drain(..))
                 .zip(check_results)
                 .filter(|(_, check_result)| check_result.is_ok())
-                .filter(|(((tx, _), _), _)| {
-                    Consumer::check_fee_payer_unlocked(&working_bank, tx, &mut error_counts).is_ok()
-                })
             {
                 post_transaction_check_count += 1;
 
@@ -424,19 +421,6 @@ impl TransactionViewReceiveAndBuffer {
                     .zip(transaction_priority_ids.iter())
                 {
                     if result.is_err() {
-                        num_dropped_on_status_age_checks += 1;
-                        container.remove_by_id(priority_id.id);
-                        continue;
-                    }
-                    let transaction = container
-                        .get_transaction(priority_id.id)
-                        .expect("transaction must exist");
-                    if let Err(err) = Consumer::check_fee_payer_unlocked(
-                        working_bank,
-                        transaction,
-                        &mut error_counters,
-                    ) {
-                        *result = Err(err);
                         num_dropped_on_status_age_checks += 1;
                         container.remove_by_id(priority_id.id);
                         continue;
