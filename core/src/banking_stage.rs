@@ -66,6 +66,7 @@ pub mod qos_service;
 pub mod vote_storage;
 
 mod consume_worker;
+#[allow(dead_code)]
 mod consumer_worker_for_external;
 mod fifo_scheduler;
 mod vote_worker;
@@ -542,6 +543,9 @@ impl BankingStage {
                     non_vote_thread_exitted_signal,
                     bank_thread_hdls,
                     (num_threads).saturating_sub(NUM_VOTE_PROCESSING_THREADS),
+                    committer,
+                    transaction_recorder,
+                    log_messages_bytes_limit,
                 );
                 return;
             }
@@ -635,13 +639,17 @@ impl BankingStage {
         non_vote_thread_exitted_signal: Arc<AtomicBool>,
         bank_thread_hdls: &mut Vec<JoinHandle<()>>,
         num_workers: u32,
+        committer: Committer,
+        transaction_recorder: TransactionRecorder,
+        log_messages_bytes_limit: Option<usize>,
     ) {
         bank_thread_hdls.push(
             std::thread::Builder::new()
-                .name("solBnkTxSched".to_string())
+                .name("solProgTrker".to_string())
                 .spawn({
                     let exit_signal = exit_signal.clone();
                     let non_vote_thread_exitted_signal = non_vote_thread_exitted_signal.clone();
+                    let poh_recorder = poh_recorder.clone();
                     move || {
                         if let Some(mut scheduler) = FifoScheduler::new(exit_signal, poh_recorder) {
                             scheduler.run();
@@ -659,10 +667,22 @@ impl BankingStage {
                     .spawn({
                         let exit_signal = exit_signal.clone();
                         let non_vote_thread_exitted_signal = non_vote_thread_exitted_signal.clone();
+                        let leader_bank_notifier =
+                            poh_recorder.read().unwrap().new_leader_bank_notifier();
+                        let committer = committer.clone();
+                        let transaction_recorder = transaction_recorder.clone();
                         move || {
-                            if let Some(mut worker) =
-                                ConsumerWorkerForExternal::new(worker_index, exit_signal)
-                            {
+                            if let Some(mut worker) = ConsumerWorkerForExternal::new(
+                                worker_index,
+                                exit_signal,
+                                leader_bank_notifier,
+                                consumer::Consumer::new(
+                                    committer,
+                                    transaction_recorder,
+                                    QosService::new(worker_index),
+                                    log_messages_bytes_limit,
+                                ),
+                            ) {
                                 worker.run();
                             }
                             non_vote_thread_exitted_signal.store(true, Ordering::Relaxed);

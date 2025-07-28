@@ -1,32 +1,150 @@
 use {
-    agave_scheduler_bindings::{PackToSchedulerMessage, SchedulerToPackMessage},
+    crate::banking_stage::consumer::Consumer,
+    agave_scheduler_bindings::{
+        PackToWorkerMessage, WorkerToPackMessage, MAX_TRANSACTIONS_PER_MESSAGE,
+    },
+    agave_transaction_view::{
+        resolved_transaction_view::ResolvedTransactionView, transaction_data::TransactionData,
+        transaction_version::TransactionVersion, transaction_view::SanitizedTransactionView,
+    },
     rts_alloc::Allocator,
-    std::sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
+    solana_poh::leader_bank_notifier::LeaderBankNotifier,
+    solana_runtime::bank::Bank,
+    solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
+    solana_transaction::sanitized::MessageHash,
+    std::{
+        ptr::NonNull,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        time::Duration,
     },
 };
 
+struct TxPtr {
+    ptr: NonNull<u8>,
+    len: usize,
+}
+
+impl TransactionData for TxPtr {
+    #[inline]
+    fn data(&self) -> &[u8] {
+        unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+type RuntimeTransactionView = RuntimeTransaction<ResolvedTransactionView<TxPtr>>;
+
 pub struct ConsumerWorkerForExternal {
     exit: Arc<AtomicBool>,
-    _allocator: Allocator,
-    _consumer: shaq::Consumer<PackToSchedulerMessage>,
-    _producer: shaq::Producer<SchedulerToPackMessage>,
+    allocator: Allocator,
+    pack_message_consumer: shaq::Consumer<PackToWorkerMessage>,
+    producer: shaq::Producer<WorkerToPackMessage>,
+
+    leader_bank_notifier: Arc<LeaderBankNotifier>,
+    consumer: Consumer,
+
+    current_tx_indexes: Vec<u8>,
+    current_txs: Vec<RuntimeTransactionView>,
+    dropped_tx_indexes: Vec<usize>,
 }
 
 impl ConsumerWorkerForExternal {
-    pub fn new(worker_index: u32, exit: Arc<AtomicBool>) -> Option<Self> {
-        let (allocator, consumer, producer) = setup(worker_index)?;
+    pub fn new(
+        worker_index: u32,
+        exit: Arc<AtomicBool>,
+        leader_bank_notifier: Arc<LeaderBankNotifier>,
+        consumer: Consumer,
+    ) -> Option<Self> {
+        let (allocator, pack_message_consumer, producer) = setup(worker_index)?;
         Some(Self {
             exit,
-            _allocator: allocator,
-            _consumer: consumer,
-            _producer: producer,
+            allocator,
+            pack_message_consumer,
+            producer,
+            leader_bank_notifier,
+            consumer,
+            current_tx_indexes: Vec::with_capacity(MAX_TRANSACTIONS_PER_MESSAGE),
+            current_txs: Vec::with_capacity(MAX_TRANSACTIONS_PER_MESSAGE),
+            dropped_tx_indexes: Vec::with_capacity(MAX_TRANSACTIONS_PER_MESSAGE),
         })
     }
 
     pub fn run(&mut self) {
-        while !self.exit.load(Ordering::Relaxed) {}
+        while !self.exit.load(Ordering::Relaxed) {
+            self.pack_message_consumer.sync();
+            self.process_loop();
+            self.pack_message_consumer.finalize();
+        }
+    }
+
+    fn process_loop(&mut self) {
+        if self.pack_message_consumer.is_empty() {
+            return;
+        }
+
+        // Get the bank to process transactions against.
+        let Some(_bank) = self
+            .leader_bank_notifier
+            .get_or_wait_for_in_progress(Duration::from_millis(1))
+            .upgrade()
+        else {
+            return;
+        };
+
+        // check for exit signal between each message
+        while !self.exit.load(Ordering::Relaxed) {
+            self.current_tx_indexes.clear();
+            self.current_txs.clear();
+            self.dropped_tx_indexes.clear();
+
+            let Some(message) = self.pack_message_consumer.try_read() else {
+                break;
+            };
+
+            let _message = unsafe { message.as_ref() };
+
+            // // TODO: need to check message validity.
+            // for (index, tx) in message.transactions[..usize::from(message.num_transactions)]
+            //     .iter()
+            //     .enumerate()
+            // {
+            //     let tx_ptr = TxPtr {
+            //         ptr: self.allocator.ptr_from_offset(tx.transaction_offset),
+            //         len: tx.transaction_size as usize,
+            //     };
+
+            //     let Some(resolved) = tx_ptr_to_resolved_transaction_view(tx_ptr, &bank) else {
+            //         self.dropped_tx_indexes.push(index);
+            //         continue;
+            //     };
+            //     self.current_tx_indexes.push(index as u8);
+            //     self.current_txs.push(resolved);
+            // }
+
+            // if !self.current_txs.is_empty() {
+            //     let _results = self
+            //         .consumer
+            //         .process_and_record_transactions(&bank, &self.current_txs);
+            // } else {
+            //     // All transactions were dropped, so we just return them all
+            //     // as invalid.
+            //     for index in &self.dropped_tx_indexes {
+            //         let Some(mut msg) = self.producer.reserve() else {
+            //             break; // we should kill here - pack is too far behind.
+            //         };
+            //         let msg = unsafe { msg.as_mut() };
+            //         msg.tag = worker_message_types::DROPPED_TRANSACTION;
+            //         let dropped_transaction = unsafe { &mut msg.inner.dropped_transaction };
+            //         dropped_transaction.transaction =
+            //             dropped_transaction.reason = dropped_transaction_reasons::INVALID_FORMAT;
+            //         // TODO: track actual reason.
+            //     }
+            // };
+
+            todo!("drop packets?");
+        }
     }
 }
 
@@ -34,8 +152,8 @@ fn setup(
     worker_index: u32,
 ) -> Option<(
     Allocator,
-    shaq::Consumer<PackToSchedulerMessage>,
-    shaq::Producer<SchedulerToPackMessage>,
+    shaq::Consumer<PackToWorkerMessage>,
+    shaq::Producer<WorkerToPackMessage>,
 )> {
     const ALLOCATOR_PATH: &str = "/mnt/hugepages/rts-alloc";
     const ALLOCATOR_WORKER_STARTING_ID: u32 = 4;
@@ -65,4 +183,30 @@ fn setup(
         .ok()?;
 
     Some((allocator, consumer, producer))
+}
+
+fn tx_ptr_to_resolved_transaction_view(
+    tx_ptr: TxPtr,
+    bank: &Bank,
+) -> Option<RuntimeTransactionView> {
+    let view = SanitizedTransactionView::try_new_sanitized(tx_ptr).ok()?;
+    let view = RuntimeTransaction::<SanitizedTransactionView<_>>::try_from(
+        view,
+        MessageHash::Compute,
+        None,
+    )
+    .ok()?;
+
+    // Load addresses for transaction.
+    let load_addresses_result = match view.version() {
+        TransactionVersion::Legacy => Ok((None, u64::MAX)),
+        TransactionVersion::V0 => bank
+            .load_addresses_from_ref(view.address_table_lookup_iter())
+            .map(|(loaded_addresses, deactivation_slot)| {
+                (Some(loaded_addresses), deactivation_slot)
+            }),
+    };
+    let (loaded_addresses, _deactivation_slot) = load_addresses_result.ok()?;
+
+    RuntimeTransactionView::try_from(view, loaded_addresses, bank.get_reserved_account_keys()).ok()
 }
