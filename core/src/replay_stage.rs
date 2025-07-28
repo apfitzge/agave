@@ -4318,6 +4318,24 @@ impl ReplayStage {
     }
 }
 
+#[no_mangle]
+#[inline(never)]
+extern "C" fn slot_start(slot: Slot) {
+    log::trace!("slot start {slot}");
+}
+
+#[no_mangle]
+#[inline(never)]
+extern "C" fn slot_complete(slot: Slot, num_shreds: u64, num_entries: usize, num_txs: usize) {
+    log::trace!("slot complete {slot} {num_shreds} {num_entries} {num_txs}");
+}
+
+#[no_mangle]
+#[inline(never)]
+extern "C" fn slot_dead(slot: Slot) {
+    log::trace!("slot dead {slot}");
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use {
@@ -9582,22 +9600,4 @@ pub(crate) mod tests {
             &mut PurgeRepairSlotCounter::default(),
         );
     }
-}
-
-#[no_mangle]
-#[inline(never)]
-extern "C" fn slot_start(slot: Slot) {
-    log::trace!("slot start {slot}");
-}
-
-#[no_mangle]
-#[inline(never)]
-extern "C" fn slot_complete(slot: Slot, num_shreds: u64, num_entries: usize, num_txs: usize) {
-    log::trace!("slot complete {slot} {num_shreds} {num_entries} {num_txs}");
-}
-
-#[no_mangle]
-#[inline(never)]
-extern "C" fn slot_dead(slot: Slot) {
-    log::trace!("slot dead {slot}");
 }

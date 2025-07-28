@@ -5320,6 +5320,18 @@ fn adjust_ulimit_nofile(enforce_ulimit_nofile: bool) -> Result<()> {
     Ok(())
 }
 
+#[no_mangle]
+#[inline(never)]
+fn slot_first_shred(slot: Slot) {
+    log::trace!("slot first shred: {slot}");
+}
+
+#[no_mangle]
+#[inline(never)]
+fn slot_last_shred(slot: Slot) {
+    log::trace!("slot last shred: {slot}");
+}
+
 #[cfg(test)]
 pub mod tests {
     use {
@@ -11952,16 +11964,4 @@ pub mod tests {
             Err(TransactionError::InsufficientFundsForFee)
         );
     }
-}
-
-#[no_mangle]
-#[inline(never)]
-fn slot_first_shred(slot: Slot) {
-    log::trace!("slot first shred: {slot}");
-}
-
-#[no_mangle]
-#[inline(never)]
-fn slot_last_shred(slot: Slot) {
-    log::trace!("slot last shred: {slot}");
 }
