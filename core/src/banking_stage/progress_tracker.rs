@@ -1,6 +1,5 @@
 use {
     agave_scheduler_bindings::ProgressMessage,
-    rts_alloc::Allocator,
     shaq::Producer,
     solana_clock::Slot,
     solana_poh::poh_recorder::PohRecorder,
@@ -13,17 +12,8 @@ use {
     },
 };
 
-fn setup() -> Option<(Allocator, Producer<ProgressMessage>)> {
-    const ALLOCATOR_PATH: &str = "/mnt/hugepages/rts-alloc";
-    const ALLOCATOR_WORKER_ID: u32 = 2;
-
+fn setup() -> Option<Producer<ProgressMessage>> {
     const PROGRESS_TRACKER_TO_PACK_PATH: &str = "/mnt/hugepages/progress_tracker_to_pack";
-
-    let allocator = Allocator::join(ALLOCATOR_PATH, ALLOCATOR_WORKER_ID)
-        .map_err(|e| {
-            error!("Failed to join allocator: {e:?}");
-        })
-        .ok()?;
 
     let producer = Producer::join(PROGRESS_TRACKER_TO_PACK_PATH)
         .map_err(|e| {
@@ -31,14 +21,13 @@ fn setup() -> Option<(Allocator, Producer<ProgressMessage>)> {
         })
         .ok()?;
 
-    Some((allocator, producer))
+    Some(producer)
 }
 
 pub struct ProgressTracker {
     exit_signal: Arc<AtomicBool>,
     cached_leader_progress: CachedLeaderProgress,
 
-    _allocator: Allocator,
     producer: Producer<ProgressMessage>,
 }
 
@@ -47,11 +36,10 @@ impl ProgressTracker {
         exit_signal: Arc<AtomicBool>,
         poh_recorder: Arc<RwLock<PohRecorder>>,
     ) -> Option<Self> {
-        let (allocator, producer) = setup()?;
+        let producer = setup()?;
         Some(Self {
             exit_signal,
             cached_leader_progress: CachedLeaderProgress::new(poh_recorder),
-            _allocator: allocator,
             producer,
         })
     }
