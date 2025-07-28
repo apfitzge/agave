@@ -36,7 +36,7 @@ impl TransactionData for TxPtr {
 
 type RuntimeTransactionView = RuntimeTransaction<ResolvedTransactionView<TxPtr>>;
 
-pub struct ConsumerWorkerForExternal {
+pub struct ConsumeWorkerForExternal {
     exit: Arc<AtomicBool>,
     allocator: Allocator,
     pack_message_consumer: shaq::Consumer<PackToWorkerMessage>,
@@ -50,7 +50,7 @@ pub struct ConsumerWorkerForExternal {
     dropped_tx_indexes: Vec<usize>,
 }
 
-impl ConsumerWorkerForExternal {
+impl ConsumeWorkerForExternal {
     pub fn new(
         worker_index: u32,
         exit: Arc<AtomicBool>,

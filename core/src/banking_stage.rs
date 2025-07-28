@@ -12,7 +12,7 @@ use {
     crate::{
         banking_stage::{
             consume_worker::ConsumeWorker,
-            consumer_worker_for_external::ConsumerWorkerForExternal,
+            consume_worker_for_external::ConsumeWorkerForExternal,
             packet_deserializer::PacketDeserializer,
             progress_tracker::ProgressTracker,
             transaction_scheduler::{
@@ -67,7 +67,7 @@ pub mod vote_storage;
 
 mod consume_worker;
 #[allow(dead_code)]
-mod consumer_worker_for_external;
+mod consume_worker_for_external;
 mod progress_tracker;
 mod vote_worker;
 conditional_vis_mod!(decision_maker, feature = "dev-context-only-utils", pub);
@@ -673,7 +673,7 @@ impl BankingStage {
                         let committer = committer.clone();
                         let transaction_recorder = transaction_recorder.clone();
                         move || {
-                            if let Some(mut worker) = ConsumerWorkerForExternal::new(
+                            if let Some(mut worker) = ConsumeWorkerForExternal::new(
                                 worker_index,
                                 exit_signal,
                                 leader_bank_notifier,
