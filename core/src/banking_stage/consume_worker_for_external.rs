@@ -92,6 +92,8 @@ impl ConsumeWorkerForExternal {
             return;
         };
 
+        self.producer.sync();
+
         // check for exit signal between each message
         while !self.exit.load(Ordering::Relaxed) {
             self.current_tx_indexes.clear();
@@ -138,6 +140,8 @@ impl ConsumeWorkerForExternal {
                 dropped_transaction.reason = dropped_transaction_reasons::INVALID_FORMAT;
             }
         }
+
+        self.producer.commit();
     }
 }
 
@@ -149,7 +153,7 @@ fn setup(
     shaq::Producer<WorkerToPackMessage>,
 )> {
     const ALLOCATOR_PATH: &str = "/mnt/hugepages/rts-alloc";
-    const ALLOCATOR_WORKER_STARTING_ID: u32 = 4;
+    const ALLOCATOR_WORKER_STARTING_ID: u32 = 2;
     let allocator_id = worker_index + ALLOCATOR_WORKER_STARTING_ID;
 
     const PACK_TO_WORKER_DIR: &str = "/mnt/hugepages/pack_to_worker";
