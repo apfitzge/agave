@@ -13,8 +13,8 @@ use {
         banking_stage::{
             consume_worker::ConsumeWorker,
             consumer_worker_for_external::ConsumerWorkerForExternal,
-            fifo_scheduler::FifoScheduler,
             packet_deserializer::PacketDeserializer,
+            progress_tracker::ProgressTracker,
             transaction_scheduler::{
                 prio_graph_scheduler::PrioGraphScheduler,
                 scheduler_controller::SchedulerController, scheduler_error::SchedulerError,
@@ -68,7 +68,7 @@ pub mod vote_storage;
 mod consume_worker;
 #[allow(dead_code)]
 mod consumer_worker_for_external;
-mod fifo_scheduler;
+mod progress_tracker;
 mod vote_worker;
 conditional_vis_mod!(decision_maker, feature = "dev-context-only-utils", pub);
 mod immutable_deserialized_packet;
@@ -651,7 +651,8 @@ impl BankingStage {
                     let non_vote_thread_exitted_signal = non_vote_thread_exitted_signal.clone();
                     let poh_recorder = poh_recorder.clone();
                     move || {
-                        if let Some(mut scheduler) = FifoScheduler::new(exit_signal, poh_recorder) {
+                        if let Some(mut scheduler) = ProgressTracker::new(exit_signal, poh_recorder)
+                        {
                             scheduler.run();
                         }
                         non_vote_thread_exitted_signal.store(true, Ordering::Relaxed);

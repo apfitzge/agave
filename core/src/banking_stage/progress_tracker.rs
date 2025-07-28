@@ -34,7 +34,7 @@ fn setup() -> Option<(Allocator, Producer<ProgressMessage>)> {
     Some((allocator, producer))
 }
 
-pub struct FifoScheduler {
+pub struct ProgressTracker {
     exit_signal: Arc<AtomicBool>,
     cached_leader_progress: CachedLeaderProgress,
 
@@ -42,7 +42,7 @@ pub struct FifoScheduler {
     producer: Producer<ProgressMessage>,
 }
 
-impl FifoScheduler {
+impl ProgressTracker {
     pub fn new(
         exit_signal: Arc<AtomicBool>,
         poh_recorder: Arc<RwLock<PohRecorder>>,
