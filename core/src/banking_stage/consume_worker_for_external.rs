@@ -1,7 +1,8 @@
 use {
     crate::banking_stage::consumer::Consumer,
     agave_scheduler_bindings::{
-        PackToWorkerMessage, WorkerToPackMessage, MAX_TRANSACTIONS_PER_MESSAGE,
+        dropped_transaction_reasons, worker_message_types, PackToWorkerMessage,
+        WorkerToPackMessage, MAX_TRANSACTIONS_PER_MESSAGE,
     },
     agave_transaction_view::{
         resolved_transaction_view::ResolvedTransactionView, transaction_data::TransactionData,
@@ -45,9 +46,8 @@ pub struct ConsumeWorkerForExternal {
     leader_bank_notifier: Arc<LeaderBankNotifier>,
     consumer: Consumer,
 
-    current_tx_indexes: Vec<u8>,
+    current_tx_indexes: Vec<usize>,
     current_txs: Vec<RuntimeTransactionView>,
-    dropped_tx_indexes: Vec<usize>,
 }
 
 impl ConsumeWorkerForExternal {
@@ -67,7 +67,6 @@ impl ConsumeWorkerForExternal {
             consumer,
             current_tx_indexes: Vec::with_capacity(MAX_TRANSACTIONS_PER_MESSAGE),
             current_txs: Vec::with_capacity(MAX_TRANSACTIONS_PER_MESSAGE),
-            dropped_tx_indexes: Vec::with_capacity(MAX_TRANSACTIONS_PER_MESSAGE),
         })
     }
 
@@ -85,7 +84,7 @@ impl ConsumeWorkerForExternal {
         }
 
         // Get the bank to process transactions against.
-        let Some(_bank) = self
+        let Some(bank) = self
             .leader_bank_notifier
             .get_or_wait_for_in_progress(Duration::from_millis(1))
             .upgrade()
@@ -97,53 +96,47 @@ impl ConsumeWorkerForExternal {
         while !self.exit.load(Ordering::Relaxed) {
             self.current_tx_indexes.clear();
             self.current_txs.clear();
-            self.dropped_tx_indexes.clear();
 
             let Some(message) = self.pack_message_consumer.try_read() else {
                 break;
             };
 
-            let _message = unsafe { message.as_ref() };
+            let message = unsafe { message.as_ref() };
 
-            // // TODO: need to check message validity.
-            // for (index, tx) in message.transactions[..usize::from(message.num_transactions)]
-            //     .iter()
-            //     .enumerate()
-            // {
-            //     let tx_ptr = TxPtr {
-            //         ptr: self.allocator.ptr_from_offset(tx.transaction_offset),
-            //         len: tx.transaction_size as usize,
-            //     };
+            // Resolve all transactions in the message.
+            for (index, tx) in message.transactions[..usize::from(message.num_transactions)]
+                .iter()
+                .enumerate()
+            {
+                let tx_ptr = TxPtr {
+                    ptr: self.allocator.ptr_from_offset(tx.transaction_offset),
+                    len: tx.transaction_size as usize,
+                };
 
-            //     let Some(resolved) = tx_ptr_to_resolved_transaction_view(tx_ptr, &bank) else {
-            //         self.dropped_tx_indexes.push(index);
-            //         continue;
-            //     };
-            //     self.current_tx_indexes.push(index as u8);
-            //     self.current_txs.push(resolved);
-            // }
+                if let Some(resolved) = tx_ptr_to_resolved_transaction_view(tx_ptr, &bank) {
+                    self.current_tx_indexes.push(index);
+                    self.current_txs.push(resolved);
+                }
+            }
 
-            // if !self.current_txs.is_empty() {
-            //     let _results = self
-            //         .consumer
-            //         .process_and_record_transactions(&bank, &self.current_txs);
-            // } else {
-            //     // All transactions were dropped, so we just return them all
-            //     // as invalid.
-            //     for index in &self.dropped_tx_indexes {
-            //         let Some(mut msg) = self.producer.reserve() else {
-            //             break; // we should kill here - pack is too far behind.
-            //         };
-            //         let msg = unsafe { msg.as_mut() };
-            //         msg.tag = worker_message_types::DROPPED_TRANSACTION;
-            //         let dropped_transaction = unsafe { &mut msg.inner.dropped_transaction };
-            //         dropped_transaction.transaction =
-            //             dropped_transaction.reason = dropped_transaction_reasons::INVALID_FORMAT;
-            //         // TODO: track actual reason.
-            //     }
-            // };
+            // TODO: Handle all or nothing.
+            // TODO: STREAMLINED PROCESSING
 
-            todo!("drop packets?");
+            // Respond with transaction statuses.
+            // for now just drop em all.
+            for tx in message.transactions[..usize::from(message.num_transactions)].iter() {
+                let Some(mut msg) = self.producer.reserve() else {
+                    // TODO fix with an exit of thread.
+                    panic!("external pack too far behind, should kill");
+                };
+
+                let msg = unsafe { msg.as_mut() };
+                msg.tag = worker_message_types::DROPPED_TRANSACTION;
+                let dropped_transaction = unsafe { &mut msg.inner.dropped_transaction };
+                dropped_transaction.transaction.transaction_offset = tx.transaction_offset;
+                dropped_transaction.transaction.transaction_size = tx.transaction_size;
+                dropped_transaction.reason = dropped_transaction_reasons::INVALID_FORMAT;
+            }
         }
     }
 }
