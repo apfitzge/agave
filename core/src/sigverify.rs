@@ -16,6 +16,7 @@ use {
     agave_feature_set::FeatureSet,
     agave_transaction_view::transaction_view::{SanitizedTransactionView, TransactionView},
     crossbeam_channel::Sender,
+    rayon::iter::{IntoParallelRefMutIterator, ParallelIterator},
     solana_compute_budget_instruction::compute_budget_instruction_details::ComputeBudgetInstructionDetails,
     solana_fee::{calculate_fee, FeeFeatures},
     solana_perf::{cuda_runtime::PinnedVec, packet::PacketBatch, recycler::Recycler, sigverify},
@@ -23,9 +24,7 @@ use {
     solana_runtime_transaction::signature_details::{
         get_precompile_signature_details, PrecompileSignatureDetails,
     },
-    solana_svm::{
-        account_loader::validate_fee_payer, transaction_error_metrics::TransactionErrorMetrics,
-    },
+    solana_svm::account_loader::validate_fee_payer_no_counters,
     solana_svm_transaction::svm_message::SVMMessage,
     solana_transaction_error::TransactionError,
     std::{
@@ -125,67 +124,61 @@ impl SigVerifier for TransactionSigVerifier {
         );
 
         if let Some(bank) = self.get_working_bank() {
-            let mut error_counters = TransactionErrorMetrics::default();
             let fee_features = FeeFeatures::from(bank.feature_set.as_ref());
-            for batch in &mut batches {
-                for mut packet in batch.iter_mut() {
-                    let meta = packet.meta();
-                    if let Some(pkt_data) = packet.data(..meta.size) {
-                        let Ok(view) = TransactionView::try_new_sanitized(pkt_data) else {
+            batches.par_iter_mut().flatten().for_each(|mut packet| {
+                let meta = packet.meta();
+                if let Some(pkt_data) = packet.data(..meta.size) {
+                    let Ok(view) = TransactionView::try_new_sanitized(pkt_data) else {
+                        packet.meta_mut().set_discard(true);
+                        return;
+                    };
+
+                    let fee = {
+                        let Ok(details) = get_fee_details(&view, bank.feature_set.as_ref()) else {
                             packet.meta_mut().set_discard(true);
-                            continue;
+                            return;
                         };
 
-                        let fee = {
-                            let Ok(details) = get_fee_details(&view, bank.feature_set.as_ref())
-                            else {
-                                packet.meta_mut().set_discard(true);
-                                continue;
-                            };
-
-                            let hack_wrapper = HackFeeWrapper {
-                                view: &view,
-                                details,
-                            };
-
-                            calculate_fee(
-                                &hack_wrapper,
-                                false, // testing on mnb - no need to have test-only shit
-                                5_000, // testing on mnb - only ever 5klam
-                                hack_wrapper.details.priority_fee,
-                                fee_features,
-                            )
+                        let hack_wrapper = HackFeeWrapper {
+                            view: &view,
+                            details,
                         };
 
-                        let fee_payer = &view.static_account_keys()[0];
-
-                        let Ok((mut fee_payer_account, _slot)) = bank
-                            .rc
-                            .accounts
-                            .accounts_db
-                            .load_with_fixed_root(&bank.ancestors, fee_payer)
-                            .ok_or(TransactionError::AccountNotFound)
-                        else {
-                            packet.meta_mut().set_discard(true);
-                            continue;
-                        };
-
-                        if validate_fee_payer(
-                            fee_payer,
-                            &mut fee_payer_account,
-                            0,
-                            &mut error_counters,
-                            bank.rent_collector(),
-                            fee,
+                        calculate_fee(
+                            &hack_wrapper,
+                            false, // testing on mnb - no need to have test-only shit
+                            5_000, // testing on mnb - only ever 5klam
+                            hack_wrapper.details.priority_fee,
+                            fee_features,
                         )
-                        .is_err()
-                        {
-                            packet.meta_mut().set_discard(true);
-                            continue;
-                        }
+                    };
+
+                    let fee_payer = &view.static_account_keys()[0];
+
+                    let Ok((mut fee_payer_account, _slot)) = bank
+                        .rc
+                        .accounts
+                        .accounts_db
+                        .load_with_fixed_root(&bank.ancestors, fee_payer)
+                        .ok_or(TransactionError::AccountNotFound)
+                    else {
+                        packet.meta_mut().set_discard(true);
+                        return;
+                    };
+
+                    if validate_fee_payer_no_counters(
+                        fee_payer,
+                        &mut fee_payer_account,
+                        0,
+                        bank.rent_collector(),
+                        fee,
+                    )
+                    .is_err()
+                    {
+                        packet.meta_mut().set_discard(true);
                     }
                 }
-            }
+            })
         }
 
         batches

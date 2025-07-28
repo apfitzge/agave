@@ -415,6 +415,50 @@ pub fn validate_fee_payer(
     )
 }
 
+pub fn validate_fee_payer_no_counters(
+    payer_address: &Pubkey,
+    payer_account: &mut AccountSharedData,
+    payer_index: IndexOfAccount,
+    rent_collector: &dyn SVMRentCollector,
+    fee: u64,
+) -> Result<()> {
+    if payer_account.lamports() == 0 {
+        return Err(TransactionError::AccountNotFound);
+    }
+    let system_account_kind =
+        get_system_account_kind(payer_account).ok_or(TransactionError::InvalidAccountForFee)?;
+    let min_balance = match system_account_kind {
+        SystemAccountKind::System => 0,
+        SystemAccountKind::Nonce => {
+            // Should we ever allow a fees charge to zero a nonce account's
+            // balance. The state MUST be set to uninitialized in that case
+            rent_collector
+                .get_rent()
+                .minimum_balance(NonceState::size())
+        }
+    };
+
+    payer_account
+        .lamports()
+        .checked_sub(min_balance)
+        .and_then(|v| v.checked_sub(fee))
+        .ok_or(TransactionError::InsufficientFundsForFee)?;
+
+    let payer_pre_rent_state = rent_collector.get_account_rent_state(payer_account);
+    payer_account
+        .checked_sub_lamports(fee)
+        .map_err(|_| TransactionError::InsufficientFundsForFee)?;
+
+    let payer_post_rent_state = rent_collector.get_account_rent_state(payer_account);
+    rent_collector.check_rent_state_with_account(
+        &payer_pre_rent_state,
+        &payer_post_rent_state,
+        payer_address,
+        payer_account,
+        payer_index,
+    )
+}
+
 pub(crate) fn load_transaction<CB: TransactionProcessingCallback>(
     account_loader: &mut AccountLoader<CB>,
     message: &impl SVMMessage,
