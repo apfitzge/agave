@@ -1,8 +1,8 @@
 use {
-    crate::banking_stage::consumer::Consumer,
+    crate::banking_stage::{committer::CommitTransactionDetails, consumer::Consumer},
     agave_scheduler_bindings::{
         dropped_transaction_reasons, worker_message_types, PackToWorkerMessage,
-        WorkerToPackMessage, MAX_TRANSACTIONS_PER_MESSAGE,
+        SharableTransaction, WorkerToPackMessage, MAX_TRANSACTIONS_PER_MESSAGE,
     },
     agave_transaction_view::{
         resolved_transaction_view::ResolvedTransactionView, transaction_data::TransactionData,
@@ -13,6 +13,7 @@ use {
     solana_runtime::bank::Bank,
     solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
     solana_transaction::sanitized::MessageHash,
+    solana_transaction_error::TransactionError,
     std::{
         ptr::NonNull,
         sync::{
@@ -122,26 +123,143 @@ impl ConsumeWorkerForExternal {
             }
 
             // TODO: Handle all or nothing.
-            // TODO: STREAMLINED PROCESSING
+            let output = self
+                .consumer
+                .process_and_record_transactions(&bank, self.current_txs.as_slice());
+
+            if let Ok(results) = output
+                .execute_and_commit_transactions_output
+                .commit_transactions_result
+            {
+                let mut next_attempted_transaction_index =
+                    self.current_tx_indexes.iter().copied().peekable();
+                let mut attempted_transaction_index = 0;
+                for message_transaction_index in 0..message.num_transactions {
+                    let tx = &message.transactions[usize::from(message_transaction_index)];
+                    if Some(&usize::from(message_transaction_index))
+                        == next_attempted_transaction_index.peek()
+                    {
+                        // transaction attempted processing
+                        let result = &results[attempted_transaction_index];
+
+                        match result {
+                            CommitTransactionDetails::Committed {
+                                compute_units,
+                                loaded_accounts_data_size: _,
+                                result: _,
+                            } => {
+                                if let Some(mut msg) = self.producer.reserve() {
+                                    let msg = unsafe { msg.as_mut() };
+                                    msg.tag = worker_message_types::INCLUDED_TRANSACTION;
+                                    let included_transaction =
+                                        unsafe { &mut msg.inner.included_transaction };
+                                    included_transaction.transaction.transaction_offset =
+                                        tx.transaction_offset;
+                                    included_transaction.transaction.transaction_size =
+                                        tx.transaction_size;
+                                    included_transaction.compute_units = *compute_units;
+
+                                    // todo - this should be fed back as part of the commit results.
+                                    included_transaction.fee_payer_balance = bank.get_balance(
+                                        &self.current_txs[attempted_transaction_index]
+                                            .static_account_keys()[0],
+                                    );
+
+                                    // todo: we should communicate status as well.
+                                }
+                            }
+                            CommitTransactionDetails::NotCommitted(err) => {
+                                Self::drop_with_reason(
+                                    &mut self.producer,
+                                    tx,
+                                    Self::transaction_error_to_reason(err),
+                                );
+                            }
+                        }
+
+                        next_attempted_transaction_index.next();
+                        attempted_transaction_index += 1;
+                    } else {
+                        Self::drop_with_reason(
+                            &mut self.producer,
+                            tx,
+                            dropped_transaction_reasons::INVALID_FORMAT,
+                        );
+                    }
+                }
+            } else {
+                let mut next_attempted_transaction_index =
+                    self.current_tx_indexes.iter().copied().peekable();
+                for message_transaction_index in 0..message.num_transactions {
+                    let tx = &message.transactions[usize::from(message_transaction_index)];
+                    if Some(&usize::from(message_transaction_index))
+                        == next_attempted_transaction_index.peek()
+                    {
+                        Self::drop_with_reason(
+                            &mut self.producer,
+                            tx,
+                            dropped_transaction_reasons::OTHER, // poh record failure
+                        );
+                        next_attempted_transaction_index.next();
+                    } else {
+                        Self::drop_with_reason(
+                            &mut self.producer,
+                            tx,
+                            dropped_transaction_reasons::INVALID_FORMAT,
+                        );
+                    }
+                }
+            }
 
             // Respond with transaction statuses.
             // for now just drop em all.
             for tx in message.transactions[..usize::from(message.num_transactions)].iter() {
-                let Some(mut msg) = self.producer.reserve() else {
-                    // TODO fix with an exit of thread.
-                    panic!("external pack too far behind, should kill");
-                };
-
-                let msg = unsafe { msg.as_mut() };
-                msg.tag = worker_message_types::DROPPED_TRANSACTION;
-                let dropped_transaction = unsafe { &mut msg.inner.dropped_transaction };
-                dropped_transaction.transaction.transaction_offset = tx.transaction_offset;
-                dropped_transaction.transaction.transaction_size = tx.transaction_size;
-                dropped_transaction.reason = dropped_transaction_reasons::INVALID_FORMAT;
+                Self::drop_with_reason(
+                    &mut self.producer,
+                    tx,
+                    dropped_transaction_reasons::INVALID_FORMAT,
+                );
             }
         }
 
         self.producer.commit();
+    }
+
+    // TODO: how to handle reserve failures?
+    fn drop_with_reason(
+        producer: &mut shaq::Producer<WorkerToPackMessage>,
+        tx: &SharableTransaction,
+        reason: u8,
+    ) {
+        if let Some(mut msg) = producer.reserve() {
+            let msg = unsafe { msg.as_mut() };
+            msg.tag = worker_message_types::DROPPED_TRANSACTION;
+            let dropped_transaction = unsafe { &mut msg.inner.dropped_transaction };
+            dropped_transaction.transaction.transaction_offset = tx.transaction_offset;
+            dropped_transaction.transaction.transaction_size = tx.transaction_size;
+            dropped_transaction.reason = reason;
+        }
+    }
+
+    fn transaction_error_to_reason(err: &TransactionError) -> u8 {
+        match err {
+            TransactionError::AlreadyProcessed => dropped_transaction_reasons::ALREADY_PROCESSED,
+            TransactionError::BlockhashNotFound => dropped_transaction_reasons::TOO_OLD,
+            TransactionError::AccountNotFound
+            | TransactionError::InvalidAccountForFee
+            | TransactionError::InsufficientFundsForFee
+            | TransactionError::InsufficientFundsForRent { .. } => {
+                dropped_transaction_reasons::FEE_PAYER_FAILURE
+            }
+            TransactionError::WouldExceedMaxBlockCostLimit
+            | TransactionError::WouldExceedAccountDataBlockLimit => {
+                dropped_transaction_reasons::GLOBAL_BLOCK_LIMITS
+            }
+            TransactionError::WouldExceedMaxAccountCostLimit => {
+                dropped_transaction_reasons::ACCOUNT_BLOCK_LIMITS
+            }
+            _ => dropped_transaction_reasons::OTHER,
+        }
     }
 }
 
