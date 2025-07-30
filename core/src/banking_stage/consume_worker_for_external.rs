@@ -210,16 +210,6 @@ impl ConsumeWorkerForExternal {
                     }
                 }
             }
-
-            // Respond with transaction statuses.
-            // for now just drop em all.
-            for tx in message.transactions[..usize::from(message.num_transactions)].iter() {
-                Self::drop_with_reason(
-                    &mut self.producer,
-                    tx,
-                    dropped_transaction_reasons::INVALID_FORMAT,
-                );
-            }
         }
 
         self.producer.commit();
