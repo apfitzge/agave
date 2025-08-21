@@ -268,7 +268,7 @@ fn test_scheduler_producing_blocks() {
         .unwrap()
         .insert_with_scheduling_mode(SchedulingMode::BlockProduction, tpu_bank);
     poh_controller
-        .set_bank(tpu_bank.clone_with_scheduler())
+        .set_bank_sync(tpu_bank.clone_with_scheduler())
         .unwrap();
     tpu_bank.unpause_new_block_production_scheduler();
     let tpu_bank = bank_forks.read().unwrap().working_bank_with_scheduler();

@@ -33,12 +33,16 @@ impl PohController {
     }
 
     /// Signal to PoH to use a new bank.
-    pub fn set_bank(&self, bank: BankWithScheduler) -> Result<(), SendError<BankMessage>> {
+    pub fn set_bank_sync(&self, bank: BankWithScheduler) -> Result<(), SendError<BankMessage>> {
         self.send_and_wait_on_pending_message(BankMessage::SetBank { bank })
     }
 
+    pub fn set_bank(&self, bank: BankWithScheduler) -> Result<(), SendError<BankMessage>> {
+        self.send_message(BankMessage::SetBank { bank })
+    }
+
     /// Signal to reset PoH to specified bank.
-    pub fn reset(
+    pub fn reset_sync(
         &self,
         reset_bank: Arc<Bank>,
         next_leader_slot: Option<(Slot, Slot)>,
@@ -49,15 +53,31 @@ impl PohController {
         })
     }
 
+    pub fn reset(
+        &self,
+        reset_bank: Arc<Bank>,
+        next_leader_slot: Option<(Slot, Slot)>,
+    ) -> Result<(), SendError<BankMessage>> {
+        self.send_message(BankMessage::Reset {
+            reset_bank,
+            next_leader_slot,
+        })
+    }
+
     fn send_and_wait_on_pending_message(
         &self,
         message: BankMessage,
     ) -> Result<(), SendError<BankMessage>> {
-        self.pending_message.store(true, Ordering::Release);
-        self.sender.send(message)?;
+        self.send_message(message)?;
         while self.pending_message.load(Ordering::Acquire) {
             core::hint::spin_loop();
         }
+        Ok(())
+    }
+
+    fn send_message(&self, message: BankMessage) -> Result<(), SendError<BankMessage>> {
+        self.pending_message.store(true, Ordering::Release);
+        self.sender.send(message)?;
         Ok(())
     }
 }

@@ -111,7 +111,7 @@ fn main() {
     let mut num_full = 0u64;
     // Set bank in poh on controller.
     poh_controller
-        .set_bank(BankWithScheduler::new_without_scheduler(bank.clone()))
+        .set_bank_sync(BankWithScheduler::new_without_scheduler(bank.clone()))
         .unwrap();
     let mut start_time = Instant::now();
     loop {
@@ -136,7 +136,7 @@ fn main() {
                 // Poh reset
                 let next_slot = bank.slot().wrapping_add(1);
                 poh_controller
-                    .reset(bank.clone(), Some((next_slot, next_slot)))
+                    .reset_sync(bank.clone(), Some((next_slot, next_slot)))
                     .unwrap();
                 bank = Arc::new(Bank::new_from_parent(bank, collector_id, next_slot));
                 slot = bank.slot();
@@ -145,7 +145,7 @@ fn main() {
 
                 // Set bank in poh on controller.
                 poh_controller
-                    .set_bank(BankWithScheduler::new_without_scheduler(bank.clone()))
+                    .set_bank_sync(BankWithScheduler::new_without_scheduler(bank.clone()))
                     .unwrap();
 
                 info!("Starting {slot}...");

@@ -4059,7 +4059,7 @@ mod tests {
         let old_scheduler_id = scheduler.id();
         let bank = BankWithScheduler::new(bank, Some(scheduler));
         poh_controller
-            .set_bank(bank.clone_with_scheduler())
+            .set_bank_sync(bank.clone_with_scheduler())
             .unwrap();
         bank.schedule_transaction_executions([(tx, ORIGINAL_TRANSACTION_INDEX)].into_iter())
             .unwrap();
@@ -4094,7 +4094,7 @@ mod tests {
         assert_eq!(scheduler.id(), old_scheduler_id);
         let bank = BankWithScheduler::new(bank, Some(scheduler));
         poh_controller
-            .set_bank(bank.clone_with_scheduler())
+            .set_bank_sync(bank.clone_with_scheduler())
             .unwrap();
         bank.unpause_new_block_production_scheduler();
 

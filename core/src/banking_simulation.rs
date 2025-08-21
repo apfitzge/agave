@@ -455,7 +455,7 @@ impl SimulatorLoop {
                 );
                 debug!("{next_leader_slot:?}");
                 self.poh_controller
-                    .reset(bank.clone_without_scheduler(), next_leader_slot)
+                    .reset_sync(bank.clone_without_scheduler(), next_leader_slot)
                     .expect("poh service exists");
                 info!("Bank::new_from_parent()!");
 

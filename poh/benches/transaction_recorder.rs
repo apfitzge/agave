@@ -88,7 +88,7 @@ fn bench_record_transactions(c: &mut Criterion) {
         poh_controller.pending_message(),
     );
     poh_controller
-        .set_bank(BankWithScheduler::new_without_scheduler(bank.clone()))
+        .set_bank_sync(BankWithScheduler::new_without_scheduler(bank.clone()))
         .unwrap();
 
     let mut group = c.benchmark_group("record_transactions");
@@ -108,7 +108,7 @@ fn bench_record_transactions(c: &mut Criterion) {
                     bank.slot().wrapping_add(1),
                 ));
                 poh_controller
-                    .set_bank(BankWithScheduler::new_without_scheduler(bank.clone()))
+                    .set_bank_sync(BankWithScheduler::new_without_scheduler(bank.clone()))
                     .unwrap();
 
                 let start = Instant::now();

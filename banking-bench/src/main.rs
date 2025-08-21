@@ -533,7 +533,7 @@ fn main() {
 
             let mut poh_time = Measure::start("poh_time");
             poh_controller
-                .reset(bank.clone(), Some((bank.slot(), bank.slot() + 1)))
+                .reset_sync(bank.clone(), Some((bank.slot(), bank.slot() + 1)))
                 .unwrap();
             poh_time.stop();
 

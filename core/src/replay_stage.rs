@@ -2854,7 +2854,7 @@ impl ReplayStage {
         );
 
         poh_controller
-            .reset(bank, next_leader_slot)
+            .reset_sync(bank, next_leader_slot)
             .expect("poh service exists");
 
         let next_leader_msg = if let Some(next_leader_slot) = next_leader_slot {
