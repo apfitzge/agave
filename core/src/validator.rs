@@ -927,8 +927,7 @@ impl Validator {
             )
         };
         let (record_sender, record_receiver) = record_channels(transaction_status_sender.is_some());
-        let transaction_recorder =
-            TransactionRecorder::new(record_sender, poh_recorder.is_exited.clone());
+        let transaction_recorder = TransactionRecorder::new(record_sender);
         let (poh_controller, bank_message_receiver) = PohController::new();
         let poh_recorder = Arc::new(RwLock::new(poh_recorder));
 

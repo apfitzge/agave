@@ -580,7 +580,7 @@ mod tests {
             Arc::new(AtomicBool::default()),
         );
         let (record_sender, record_receiver) = record_channels(false);
-        let recorder = TransactionRecorder::new(record_sender, poh_recorder.is_exited.clone());
+        let recorder = TransactionRecorder::new(record_sender);
         let poh_recorder = Arc::new(RwLock::new(poh_recorder));
 
         poh_recorder
@@ -691,7 +691,7 @@ mod tests {
             Arc::new(AtomicBool::default()),
         );
         let (record_sender, record_receiver) = record_channels(false);
-        let recorder = TransactionRecorder::new(record_sender, poh_recorder.is_exited.clone());
+        let recorder = TransactionRecorder::new(record_sender);
         let poh_recorder = Arc::new(RwLock::new(poh_recorder));
 
         let poh_simulator = simulate_poh(bank.ticks_per_slot(), record_receiver, &poh_recorder);
@@ -843,7 +843,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
         );
         let (record_sender, record_receiver) = record_channels(false);
-        let recorder = TransactionRecorder::new(record_sender, poh_recorder.is_exited.clone());
+        let recorder = TransactionRecorder::new(record_sender);
         let poh_recorder = Arc::new(RwLock::new(poh_recorder));
 
         fn poh_tick_before_returning_record_response(
@@ -985,7 +985,7 @@ mod tests {
             Arc::new(AtomicBool::default()),
         );
         let (record_sender, record_receiver) = record_channels(false);
-        let recorder = TransactionRecorder::new(record_sender, poh_recorder.is_exited.clone());
+        let recorder = TransactionRecorder::new(record_sender);
         let poh_recorder = Arc::new(RwLock::new(poh_recorder));
 
         let poh_simulator = simulate_poh(bank.ticks_per_slot(), record_receiver, &poh_recorder);
@@ -1073,7 +1073,7 @@ mod tests {
             Arc::new(AtomicBool::default()),
         );
         let (record_sender, record_receiver) = record_channels(false);
-        let recorder = TransactionRecorder::new(record_sender, poh_recorder.is_exited.clone());
+        let recorder = TransactionRecorder::new(record_sender);
         let poh_recorder = Arc::new(RwLock::new(poh_recorder));
 
         let poh_simulator = simulate_poh(bank.ticks_per_slot(), record_receiver, &poh_recorder);
@@ -1265,7 +1265,7 @@ mod tests {
             Arc::new(AtomicBool::default()),
         );
         let (record_sender, record_receiver) = record_channels(false);
-        let recorder = TransactionRecorder::new(record_sender, poh_recorder.is_exited.clone());
+        let recorder = TransactionRecorder::new(record_sender);
         let poh_recorder = Arc::new(RwLock::new(poh_recorder));
 
         poh_recorder
@@ -1516,8 +1516,9 @@ mod tests {
 
         // Poh Recorder has no working bank, so should throw MaxHeightReached error on
         // record
+        let exit = poh_recorder.is_exited.clone();
         let (record_sender, record_receiver) = record_channels(false);
-        let recorder = TransactionRecorder::new(record_sender, poh_recorder.is_exited.clone());
+        let recorder = TransactionRecorder::new(record_sender);
 
         let poh_simulator = simulate_poh(
             bank.ticks_per_slot(),
@@ -1573,7 +1574,7 @@ mod tests {
             expected
         );
 
-        recorder.is_exited.store(true, Ordering::Relaxed);
+        exit.store(true, Ordering::Relaxed);
         let _ = poh_simulator.join();
     }
 
@@ -1632,7 +1633,7 @@ mod tests {
             Arc::new(AtomicBool::default()),
         );
         let (record_sender, record_receiver) = record_channels(false);
-        let recorder = TransactionRecorder::new(record_sender, poh_recorder.is_exited.clone());
+        let recorder = TransactionRecorder::new(record_sender);
         let poh_recorder = Arc::new(RwLock::new(poh_recorder));
 
         let poh_simulator = simulate_poh(bank.ticks_per_slot(), record_receiver, &poh_recorder);
@@ -1778,7 +1779,7 @@ mod tests {
             Arc::new(AtomicBool::default()),
         );
         let (record_sender, record_receiver) = record_channels(false);
-        let recorder = TransactionRecorder::new(record_sender, poh_recorder.is_exited.clone());
+        let recorder = TransactionRecorder::new(record_sender);
         let poh_recorder = Arc::new(RwLock::new(poh_recorder));
 
         let poh_simulator = simulate_poh(bank.ticks_per_slot(), record_receiver, &poh_recorder);

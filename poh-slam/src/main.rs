@@ -84,7 +84,7 @@ fn main() {
         std::thread::Builder::new().spawn(move || for _ in entry_receiver.iter() {});
 
     let (record_sender, record_receiver) = record_channels(false);
-    let transaction_recorder = TransactionRecorder::new(record_sender, exit.clone());
+    let transaction_recorder = TransactionRecorder::new(record_sender);
     let (poh_controller, bank_message_receiver) = PohController::new();
     let _poh_service = PohService::new(
         poh_recorder.clone(),

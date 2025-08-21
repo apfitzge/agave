@@ -942,7 +942,7 @@ fn do_create_test_recorder(
     poh_recorder.set_bank(BankWithScheduler::new_without_scheduler(bank));
 
     let (record_sender, record_receiver) = record_channels(track_transaction_indexes);
-    let transaction_recorder = TransactionRecorder::new(record_sender, exit.clone());
+    let transaction_recorder = TransactionRecorder::new(record_sender);
     let (poh_controller, bank_message_receiver) = PohController::new();
 
     let poh_recorder = Arc::new(RwLock::new(poh_recorder));

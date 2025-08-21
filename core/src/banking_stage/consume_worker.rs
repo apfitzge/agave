@@ -864,7 +864,7 @@ mod tests {
             Arc::new(AtomicBool::default()),
         );
         let (record_sender, record_receiver) = record_channels(false);
-        let recorder = TransactionRecorder::new(record_sender, poh_recorder.is_exited.clone());
+        let recorder = TransactionRecorder::new(record_sender);
         let poh_recorder = Arc::new(RwLock::new(poh_recorder));
         let poh_simulator = simulate_poh(bank.ticks_per_slot(), record_receiver, &poh_recorder);
 
