@@ -29,7 +29,7 @@ pub fn record_channels(track_transaction_indexes: bool) -> (RecordSender, Record
     };
 
     // Begin in a shutdown state.
-    let slot_allowed_insertions = SlotAllowedInsertions::new(u64::MAX, CAPACITY);
+    let slot_allowed_insertions = SlotAllowedInsertions::new();
     let transaction_indexes = if track_transaction_indexes {
         Some(Arc::new(RwLock::new(0)))
     } else {
@@ -160,10 +160,8 @@ impl RecordReceiver {
     /// Shut the channel down immediately.
     pub fn shutdown(&mut self) {
         self.is_shutdown = true;
-        // The slot value doesn't matter here because we are done with whatever
-        // slot we were on.
         self.slot_allowed_insertions
-            .store(Slot::MAX, Ordering::Release);
+            .store(u64::MAX, Ordering::Release);
     }
 
     /// Re-enable the channel after a shutdown.
@@ -229,9 +227,8 @@ impl SlotAllowedInsertions {
     const MAX_SLOT: Slot = (1 << 48) - 1;
     const MAX_ALLOWED_INSERTIONS: u64 = (1 << 16) - 1;
 
-    fn new(slot: Slot, allowed_insertions: u64) -> Self {
-        let value = Self::encoded_value(slot, allowed_insertions);
-        Self(Arc::new(AtomicU64::new(value)))
+    fn new() -> Self {
+        Self(Arc::new(AtomicU64::new(u64::MAX)))
     }
 
     fn encoded_value(slot: Slot, allowed_insertions: u64) -> u64 {
