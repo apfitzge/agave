@@ -28,7 +28,8 @@ pub fn record_channels(track_transaction_indexes: bool) -> (RecordSender, Record
         max_sent_per_slot: MAX_SEND_PER_SLOT,
     };
 
-    let slot_allowed_insertions = SlotAllowedInsertions::new(0, CAPACITY);
+    // Begin in a shutdown state.
+    let slot_allowed_insertions = SlotAllowedInsertions::new(u64::MAX, CAPACITY);
     let transaction_indexes = if track_transaction_indexes {
         Some(Arc::new(RwLock::new(0)))
     } else {
@@ -42,7 +43,7 @@ pub fn record_channels(track_transaction_indexes: bool) -> (RecordSender, Record
             transaction_indexes: transaction_indexes.clone(),
         },
         RecordReceiver {
-            is_shutdown: false,
+            is_shutdown: true,
             capacity: CAPACITY,
             slot_allowed_insertions,
             receiver,
