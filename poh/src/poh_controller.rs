@@ -32,6 +32,10 @@ impl PohController {
         self.pending_message.clone()
     }
 
+    pub fn has_pending_message(&self) -> bool {
+        self.pending_message.load(Ordering::Acquire)
+    }
+
     /// Signal to PoH to use a new bank.
     pub fn set_bank_sync(&self, bank: BankWithScheduler) -> Result<(), SendError<BankMessage>> {
         self.send_and_wait_on_pending_message(BankMessage::SetBank { bank })
