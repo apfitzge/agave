@@ -939,8 +939,6 @@ fn do_create_test_recorder(
     }
     let ticks_per_slot = bank.ticks_per_slot();
 
-    poh_recorder.set_bank(BankWithScheduler::new_without_scheduler(bank));
-
     let (record_sender, record_receiver) = record_channels(track_transaction_indexes);
     let transaction_recorder = TransactionRecorder::new(record_sender);
     let (poh_controller, bank_message_receiver) = PohController::new();
@@ -957,6 +955,10 @@ fn do_create_test_recorder(
         bank_message_receiver,
         poh_controller.pending_message(),
     );
+
+    poh_controller
+        .set_bank_sync(BankWithScheduler::new_without_scheduler(bank))
+        .unwrap();
 
     (
         exit,
