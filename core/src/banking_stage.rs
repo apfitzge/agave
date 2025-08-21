@@ -1148,7 +1148,7 @@ mod tests {
         config_info
     }
 
-    pub(crate) fn simulate_poh(
+    fn simulate_poh(
         ticks_per_slot: u64,
         mut record_receiver: RecordReceiver,
         poh_recorder: &Arc<RwLock<PohRecorder>>,
