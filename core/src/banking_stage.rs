@@ -63,6 +63,8 @@ pub mod qos_service;
 pub mod vote_storage;
 
 mod consume_worker;
+#[allow(dead_code)]
+mod progress_tracker;
 mod vote_worker;
 mod worker_for_external;
 conditional_vis_mod!(decision_maker, feature = "dev-context-only-utils", pub);

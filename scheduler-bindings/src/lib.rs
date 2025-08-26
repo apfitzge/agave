@@ -29,7 +29,7 @@ pub type TpuToPackMessage = SharableTransaction;
 /// Agave passes leader status to the external pack process.
 #[repr(C)]
 pub struct ProgressMessage {
-    /// The slot the status is for.
+    /// The slot the status is for - u64::MAX if no next leader slot known.
     pub slot: u64,
     /// The current progress of the slot in percentage.
     /// Negative values indicate approximate time until the first leader slot
