@@ -75,6 +75,9 @@ impl WorkerForExternal {
 
             // SAFETY: `message_ptr` is a valid pointer to a `PackToWorkerMessage`.
             let message = unsafe { message_ptr.as_ref() };
+            if !self.check_message_validity(message) {
+                continue;
+            };
 
             // Depending on flags we may execute or proess the transaction differently.
             if message.flags & pack_message_flags::RESOLVE == 0 {
@@ -87,6 +90,38 @@ impl WorkerForExternal {
         self.producer.commit();
     }
 
+    /// Checks the message is valid.
+    /// If invalid, sends an invalid response back to pack.
+    fn check_message_validity(&mut self, message: &PackToWorkerMessage) -> bool {
+        // Check that the message is valid before continuing.
+        if message.num_transactions == 0
+            || usize::from(message.num_transactions)
+                > agave_scheduler_bindings::MAX_TRANSACTIONS_PER_PACK_MESSAGE
+        {
+            let Some(response) = self.producer.reserve() else {
+                // TODO: gracefully handle this error - shutdown the worker.
+                panic!("WorkerForExternal: unable to reserve response message");
+            };
+
+            // SAFETY: `response` is a valid pointer to a `WorkerToPackMessage`.
+            unsafe {
+                response.write(WorkerToPackMessage {
+                    tag: agave_scheduler_bindings::worker_message_types::INVALID_MESSAGE,
+                    inner:
+                        agave_scheduler_bindings::worker_message_types::WorkerToPackMessageInner {
+                            invalid: core::mem::ManuallyDrop::new(
+                                agave_scheduler_bindings::worker_message_types::InvalidMessage,
+                            ),
+                        },
+                });
+            }
+
+            return false;
+        }
+
+        true
+    }
+
     fn execute_message(&mut self, message: &PackToWorkerMessage) {
         debug_assert_eq!(message.flags & pack_message_flags::RESOLVE, 0);
 
@@ -95,7 +130,5 @@ impl WorkerForExternal {
 
     fn resolve_message(&mut self, message: &PackToWorkerMessage) {
         debug_assert_ne!(message.flags & pack_message_flags::RESOLVE, 0);
-
-        todo!()
     }
 }
