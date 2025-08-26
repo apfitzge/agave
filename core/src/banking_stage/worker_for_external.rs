@@ -60,6 +60,25 @@ pub struct WorkerForExternal {
 
 #[allow(dead_code)]
 impl WorkerForExternal {
+    pub fn new(
+        worker_index: u32,
+        exit: Arc<AtomicBool>,
+        sharable_banks: SharableBanks,
+        shared_working_bank: SharedWorkingBank,
+        consumer: Consumer,
+    ) -> Option<Self> {
+        let (allocator, pack_message_consumer, producer) = setup(worker_index)?;
+        Some(Self {
+            exit,
+            allocator,
+            pack_message_consumer,
+            producer,
+            sharable_banks,
+            shared_working_bank,
+            consumer,
+        })
+    }
+
     pub fn run(&mut self) {
         // Pre-allocate scratch space for processing messages.
         let mut current_tx_indexes = Vec::with_capacity(MAX_TRANSACTIONS_PER_PACK_MESSAGE);
@@ -386,4 +405,43 @@ impl WorkerForExternal {
             .reserve()
             .unwrap_or_else(|| panic!("WorkerForExternal: unable to reserve response message"))
     }
+}
+
+fn setup(
+    worker_index: u32,
+) -> Option<(
+    Allocator,
+    shaq::Consumer<PackToWorkerMessage>,
+    shaq::Producer<WorkerToPackMessage>,
+)> {
+    const ALLOCATOR_PATH: &str = "/mnt/hugepages/rts-alloc";
+    const ALLOCATOR_WORKER_STARTING_ID: u32 = 2;
+    let allocator_id = worker_index + ALLOCATOR_WORKER_STARTING_ID;
+
+    const PACK_TO_WORKER_DIR: &str = "/mnt/hugepages/pack_to_worker";
+    const WORKER_TO_PACK_DIR: &str = "/mnt/hugepages/worker_to_pack";
+
+    let pack_to_worker_path = format!("{PACK_TO_WORKER_DIR}/{worker_index}");
+    let worker_to_pack_path = format!("{WORKER_TO_PACK_DIR}/{worker_index}");
+
+    let allocator = Allocator::join(ALLOCATOR_PATH, allocator_id)
+        .map_err(|e| {
+            error!("Failed to join allocator: {e:?}");
+        })
+        .ok()?;
+
+    // SAFETY: Agave's queue is unique here for the worker.
+    // - If the external pack or another process joins as consumer this is unsafe.
+    let consumer = unsafe { shaq::Consumer::join(pack_to_worker_path) }
+        .map_err(|e| {
+            error!("Failed to create consumer: {e:?}");
+        })
+        .ok()?;
+    let producer = shaq::Producer::join(worker_to_pack_path)
+        .map_err(|e| {
+            error!("Failed to create producer: {e:?}");
+        })
+        .ok()?;
+
+    Some((allocator, consumer, producer))
 }
