@@ -95,6 +95,7 @@ members = [
     "rpc-test",
     "runtime",
     "runtime-transaction",
+    "scheduler-bindings",
     "send-transaction-service",
     "stake-accounts",
     "storage-bigtable",
