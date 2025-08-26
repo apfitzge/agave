@@ -141,6 +141,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "agave-scheduler-bindings"
+version = "3.1.0"
+
+[[package]]
 name = "agave-syscalls"
 version = "3.1.0"
 dependencies = [
@@ -6346,6 +6350,7 @@ version = "3.1.0"
 dependencies = [
  "agave-banking-stage-ingress-types",
  "agave-feature-set",
+ "agave-scheduler-bindings",
  "agave-transaction-view",
  "agave-verified-packet-receiver",
  "agave-votor",
