@@ -64,6 +64,7 @@ pub mod vote_storage;
 
 mod consume_worker;
 mod vote_worker;
+mod worker_for_external;
 conditional_vis_mod!(decision_maker, feature = "dev-context-only-utils", pub);
 mod immutable_deserialized_packet;
 mod latest_validator_vote_packet;
