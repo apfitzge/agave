@@ -342,7 +342,7 @@ impl BundleStage {
             bundle_stage_metrics.increment_cost_model_buffered_packets_count(
                 bundle_storage.cost_model_buffered_packets_len() as u64,
             );
-            bundle_stage_metrics.maybe_report(1_000);
+            bundle_stage_metrics.maybe_report(20);
         }
     }
 
