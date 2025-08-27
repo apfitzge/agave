@@ -1,10 +1,13 @@
 use {
     super::scheduler::SchedulingSummary,
     itertools::MinMaxResult,
-    solana_poh::poh_recorder::BankStart,
     solana_clock::Slot,
+    solana_poh::poh_recorder::BankStart,
     solana_time_utils::AtomicInterval,
-    std::{num::Saturating, time::{Duration, Instant}},
+    std::{
+        num::Saturating,
+        time::{Duration, Instant},
+    },
 };
 
 #[derive(Default)]
@@ -86,7 +89,7 @@ pub struct SchedulerCountMetricsInner {
 
 impl IntervalSchedulerCountMetrics {
     fn maybe_report_and_reset(&mut self, should_report: bool) {
-        const REPORT_INTERVAL_MS: u64 = 1000;
+        const REPORT_INTERVAL_MS: u64 = 20;
         if self.interval.should_update(REPORT_INTERVAL_MS) {
             if should_report {
                 self.metrics.report("banking_stage_scheduler_counts", None);
@@ -124,9 +127,8 @@ impl SchedulerCountMetricsInner {
             num_dropped_on_receive: Saturating(num_dropped_on_receive),
             num_dropped_on_sanitization: Saturating(num_dropped_on_sanitization),
             num_dropped_on_validate_locks: Saturating(num_dropped_on_validate_locks),
-            num_dropped_on_receive_transaction_checks: Saturating(
-                num_dropped_on_receive_transaction_checks,
-            ),
+            num_dropped_on_receive_transaction_checks:
+                Saturating(num_dropped_on_receive_transaction_checks),
             num_dropped_on_clear: Saturating(num_dropped_on_clear),
             num_dropped_on_age_and_status: Saturating(num_dropped_on_age_and_status),
             num_dropped_on_capacity: Saturating(num_dropped_on_capacity),
@@ -180,21 +182,14 @@ impl SchedulerCountMetricsInner {
     }
 
     fn has_data(&self) -> bool {
-        self.num_received != Saturating(0)
-            || self.num_buffered != Saturating(0)
+        self.num_buffered != Saturating(0)
             || self.num_scheduled != Saturating(0)
             || self.num_unschedulable_conflicts != Saturating(0)
             || self.num_unschedulable_threads != Saturating(0)
             || self.num_schedule_filtered_out != Saturating(0)
             || self.num_finished != Saturating(0)
             || self.num_retryable != Saturating(0)
-            || self.num_dropped_on_receive != Saturating(0)
-            || self.num_dropped_on_sanitization != Saturating(0)
-            || self.num_dropped_on_validate_locks != Saturating(0)
-            || self.num_dropped_on_receive_transaction_checks != Saturating(0)
-            || self.num_dropped_on_clear != Saturating(0)
             || self.num_dropped_on_age_and_status != Saturating(0)
-            || self.num_dropped_on_capacity != Saturating(0)
     }
 
     fn reset(&mut self) {
@@ -303,7 +298,7 @@ pub struct SchedulerTimingMetricsInner {
 
 impl IntervalSchedulerTimingMetrics {
     fn maybe_report_and_reset(&mut self, should_report: bool) {
-        const REPORT_INTERVAL_MS: u64 = 1000;
+        const REPORT_INTERVAL_MS: u64 = 20;
         if self.interval.should_update(REPORT_INTERVAL_MS) {
             if should_report {
                 self.metrics.report("banking_stage_scheduler_timing", None);
