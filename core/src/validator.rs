@@ -203,6 +203,7 @@ pub enum BlockProductionMethod {
     CentralScheduler,
     #[default]
     CentralSchedulerGreedy,
+    External,
 }
 
 impl BlockProductionMethod {

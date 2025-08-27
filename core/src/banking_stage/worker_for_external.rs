@@ -46,7 +46,6 @@ impl TransactionData for TxPtr {
 
 type RuntimeTransactionView = RuntimeTransaction<ResolvedTransactionView<TxPtr>>;
 
-#[allow(dead_code)]
 pub struct WorkerForExternal {
     exit: Arc<AtomicBool>,
     allocator: Allocator,
@@ -58,7 +57,6 @@ pub struct WorkerForExternal {
     consumer: Consumer,
 }
 
-#[allow(dead_code)]
 impl WorkerForExternal {
     pub fn new(
         worker_index: u32,

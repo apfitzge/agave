@@ -13,10 +13,12 @@ use {
         banking_stage::{
             consume_worker::ConsumeWorker,
             packet_deserializer::PacketDeserializer,
+            progress_tracker::ProgressTracker,
             transaction_scheduler::{
                 prio_graph_scheduler::PrioGraphScheduler,
                 scheduler_controller::SchedulerController, scheduler_error::SchedulerError,
             },
+            worker_for_external::WorkerForExternal,
         },
         validator::{BlockProductionMethod, TransactionStructure},
     },
@@ -63,9 +65,7 @@ pub mod qos_service;
 pub mod vote_storage;
 
 mod consume_worker;
-#[allow(dead_code)]
 mod progress_tracker;
-#[allow(dead_code)]
 mod tpu_to_pack;
 mod vote_worker;
 mod worker_for_external;
@@ -446,16 +446,22 @@ impl BankingStage {
             );
             context.non_vote_exit_signal.store(false, Ordering::Relaxed);
 
-            Self::new_central_scheduler(
-                &mut self.non_vote_thread_hdls,
-                transaction_struct,
-                matches!(
-                    block_production_method,
-                    BlockProductionMethod::CentralSchedulerGreedy
+            match block_production_method {
+                BlockProductionMethod::External => {
+                    Self::connect_to_external_pack(
+                        &mut self.non_vote_thread_hdls,
+                        num_workers,
+                        context,
+                    );
+                }
+                method => Self::new_central_scheduler(
+                    &mut self.non_vote_thread_hdls,
+                    transaction_struct,
+                    matches!(method, BlockProductionMethod::CentralSchedulerGreedy),
+                    num_workers,
+                    context,
                 ),
-                num_workers,
-                context,
-            )
+            }
         }
 
         Ok(())
@@ -595,6 +601,78 @@ impl BankingStage {
             );
             spawn_scheduler!(scheduler);
         }
+    }
+
+    fn connect_to_external_pack(
+        non_vote_thread_hdls: &mut Vec<JoinHandle<()>>,
+        num_workers: NonZeroUsize,
+        context: &BankingStageNonVoteContext,
+    ) {
+        assert!(non_vote_thread_hdls.is_empty());
+        assert!(num_workers <= BankingStage::max_num_workers());
+        let num_workers = num_workers.get();
+
+        non_vote_thread_hdls.push(
+            std::thread::Builder::new()
+                .name("solProgTrker".to_string())
+                .spawn({
+                    let exit = context.non_vote_exit_signal.clone();
+                    let (shared_working_bank, shared_tick_height, shared_leader_first_tick_height) = {let poh_recorder = context.poh_recorder.read().unwrap();
+                        (poh_recorder.shared_working_bank(), poh_recorder.shared_tick_height(), poh_recorder.shared_leader_first_tick_height())};
+                    move || {
+                        let Some(mut progress_tracker) = ProgressTracker::new(
+                            exit,
+                            shared_working_bank,
+                            shared_tick_height,
+                            shared_leader_first_tick_height,
+                        ) else {
+                            error!("failed to create progress tracker");
+                            return; // TODO recovery.
+                        };
+
+                        progress_tracker.run();
+                    }
+                })
+                .unwrap(),
+        );
+
+        for worker_index in 0..num_workers {
+            non_vote_thread_hdls.push(
+                std::thread::Builder::new()
+                    .name(format!("solBnkEWrker{worker_index:02}"))
+                    .spawn({
+                        let exit = context.non_vote_exit_signal.clone();
+                        let committer = context.committer.clone();
+                        let transaction_recorder = context.transaction_recorder.clone();
+                        let consumer = Consumer::new(
+                            committer,
+                            transaction_recorder,
+                            QosService::new(worker_index as u32),
+                            context.log_messages_bytes_limit,
+                        );
+                        let sharable_banks = context.bank_forks.read().unwrap().sharable_banks();
+                        let shared_working_bank =
+                            context.poh_recorder.read().unwrap().shared_working_bank();
+                        move || {
+                            if let Some(mut worker) = WorkerForExternal::new(
+                                worker_index as u32,
+                                exit,
+                                sharable_banks,
+                                shared_working_bank,
+                                consumer,
+                            ) {
+                                worker.run();
+                            }
+                        }
+                    })
+                    .unwrap(),
+            );
+        }
+
+        non_vote_thread_hdls.push(tpu_to_pack::spawn_tpu_to_pack(
+            context.non_vote_exit_signal.clone(),
+            context.non_vote_receiver.clone(),
+        ));
     }
 
     fn spawn_vote_worker(
