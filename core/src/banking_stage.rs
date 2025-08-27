@@ -65,6 +65,8 @@ pub mod vote_storage;
 mod consume_worker;
 #[allow(dead_code)]
 mod progress_tracker;
+#[allow(dead_code)]
+mod tpu_to_pack;
 mod vote_worker;
 mod worker_for_external;
 conditional_vis_mod!(decision_maker, feature = "dev-context-only-utils", pub);
@@ -443,6 +445,7 @@ impl BankingStage {
                 block_production_method, transaction_struct, num_workers
             );
             context.non_vote_exit_signal.store(false, Ordering::Relaxed);
+
             Self::new_central_scheduler(
                 &mut self.non_vote_thread_hdls,
                 transaction_struct,
