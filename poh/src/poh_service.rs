@@ -402,6 +402,7 @@ impl PohService {
         poh_recorder: &RwLock<PohRecorder>,
         mut service_message: PohServiceMessageGuard,
     ) {
+        std::thread::sleep(Duration::from_millis(1000));
         {
             let mut recorder = poh_recorder.write().unwrap();
             match service_message.take() {
