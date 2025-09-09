@@ -357,10 +357,16 @@ struct CostPacer {
 impl CostPacer {
     fn scheduling_budget(&self, current_time: &Instant) -> u64 {
         // Limit for pacing. After this time, schedule as fast as possible.
+        const WAITING_PERIOD: Duration = Duration::from_millis(250);
         const BLOCK_FILL_TIME: Duration = Duration::from_millis(300);
         const ALLOCATION_PER_MILLI: u64 = MAX_BLOCK_UNITS / BLOCK_FILL_TIME.as_millis() as u64;
 
         let time_since = current_time.saturating_duration_since(self.detection_time);
+
+        if time_since <= WAITING_PERIOD {
+            return 0;
+        }
+
         if time_since >= BLOCK_FILL_TIME {
             return MAX_BLOCK_UNITS - self.shared_block_cost.load(Ordering::Acquire);
         }
