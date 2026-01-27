@@ -6,8 +6,7 @@ use qualifier_attr::qualifiers;
 use {
     self::{
         committer::Committer, consumer::Consumer, decision_maker::DecisionMaker,
-        qos_service::QosService, vote_packet_receiver::VotePacketReceiver,
-        vote_storage::VoteStorage,
+        qos_service::QosService,
     },
     crate::{
         banking_stage::{
@@ -57,7 +56,6 @@ use {
         prio_graph_scheduler::PrioGraphSchedulerConfig,
         receive_and_buffer::TransactionViewReceiveAndBuffer,
     },
-    vote_worker::VoteWorker,
 };
 
 // Below modules are pub to allow use by banking_stage bench
@@ -560,7 +558,6 @@ impl BankingStage {
 
         // Spawn vote worker.
         let mut threads = Vec::with_capacity(num_workers + 2);
-        threads.push(self.spawn_vote_worker());
 
         // Create channels for communication between scheduler and workers
         let (work_senders, work_receivers): (Vec<Sender<_>>, Vec<Receiver<_>>) =
@@ -681,39 +678,6 @@ impl BankingStage {
             .toggle_unified_scheduler_block_production_mode(enable)
     }
 
-    fn spawn_vote_worker(&self) -> JoinHandle<()> {
-        let vote_storage = VoteStorage::new(&self.bank_forks.read().unwrap().working_bank());
-        let tpu_receiver = VotePacketReceiver::new(self.tpu_vote_receiver.clone());
-        let gossip_receiver = VotePacketReceiver::new(self.gossip_vote_receiver.clone());
-        let consumer = Consumer::new(
-            self.committer.clone(),
-            self.transaction_recorder.clone(),
-            QosService::new(0),
-            self.log_messages_bytes_limit,
-        );
-        let decision_maker = DecisionMaker::from(self.poh_recorder.read().unwrap().deref());
-
-        let worker_exit_signal = self.worker_exit_signal.clone();
-        let shutdown_signal = self.banking_shutdown_signal.clone();
-        let bank_forks = self.bank_forks.clone();
-        Builder::new()
-            .name("solBanknStgVote".to_string())
-            .spawn(move || {
-                VoteWorker::new(
-                    worker_exit_signal,
-                    shutdown_signal,
-                    decision_maker,
-                    tpu_receiver,
-                    gossip_receiver,
-                    vote_storage,
-                    bank_forks,
-                    consumer,
-                )
-                .run()
-            })
-            .unwrap()
-    }
-
     pub fn default_num_workers() -> NonZeroUsize {
         DEFAULT_NUM_WORKERS
     }
@@ -769,8 +733,6 @@ mod external {
                     tpu_vote_receiver: Some(self.tpu_vote_receiver.clone()),
                 }
             } else {
-                threads.push(self.spawn_vote_worker());
-
                 BankingPacketReceivers {
                     non_vote_receiver: self.non_vote_receiver.clone(),
                     gossip_vote_receiver: None,
