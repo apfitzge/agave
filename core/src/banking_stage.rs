@@ -24,10 +24,8 @@ use {
     agave_banking_stage_ingress_types::BankingPacketReceiver,
     crossbeam_channel::{unbounded, Receiver, Sender},
     futures::{stream::FuturesUnordered, StreamExt},
-    histogram::Histogram,
     solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfoQuery},
     solana_ledger::blockstore_processor::TransactionStatusSender,
-    solana_perf::packet::PACKETS_PER_BATCH,
     solana_poh::{
         poh_controller::PohController, poh_recorder::PohRecorder,
         transaction_recorder::TransactionRecorder,
@@ -37,17 +35,15 @@ use {
         bank::Bank, bank_forks::BankForks, prioritization_fee_cache::PrioritizationFeeCache,
         vote_sender_types::ReplayVoteSender,
     },
-    solana_time_utils::AtomicInterval,
     solana_unified_scheduler_logic::SchedulingMode,
     std::{
         num::{NonZeroU64, NonZeroUsize, Saturating},
         ops::Deref,
         sync::{
-            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+            atomic::{AtomicBool, Ordering},
             Arc, RwLock,
         },
         thread::{self, Builder, JoinHandle},
-        time::Duration,
     },
     tokio::sync::mpsc,
     tokio_util::sync::CancellationToken,
@@ -61,22 +57,17 @@ use {
 // Below modules are pub to allow use by banking_stage bench
 pub mod committer;
 pub mod consumer;
-pub mod leader_slot_metrics;
 pub mod qos_service;
-pub mod vote_storage;
 
 mod consume_worker;
-mod vote_worker;
 
 #[cfg(feature = "dev-context-only-utils")]
 pub mod decision_maker;
 #[cfg(not(feature = "dev-context-only-utils"))]
 mod decision_maker;
 
-mod latest_validator_vote_packet;
 mod leader_slot_timing_metrics;
 mod read_write_account_set;
-mod vote_packet_receiver;
 
 #[cfg(feature = "dev-context-only-utils")]
 pub mod scheduler_messages;
@@ -103,229 +94,6 @@ const DEFAULT_NUM_WORKERS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
 const TOTAL_BUFFERED_PACKETS: usize = 100_000;
-const SLOT_BOUNDARY_CHECK_PERIOD: Duration = Duration::from_millis(10);
-
-#[derive(Debug, Default)]
-pub struct BankingStageStats {
-    last_report: AtomicInterval,
-    tpu_counts: VoteSourceCounts,
-    gossip_counts: VoteSourceCounts,
-    pub(crate) dropped_duplicated_packets_count: AtomicUsize,
-    dropped_forward_packets_count: AtomicUsize,
-    current_buffered_packets_count: AtomicUsize,
-    rebuffered_packets_count: AtomicUsize,
-    consumed_buffered_packets_count: AtomicUsize,
-    batch_packet_indexes_len: Histogram,
-
-    // Timing
-    consume_buffered_packets_elapsed: AtomicU64,
-    receive_and_buffer_packets_elapsed: AtomicU64,
-    filter_pending_packets_elapsed: AtomicU64,
-    pub(crate) packet_conversion_elapsed: AtomicU64,
-    transaction_processing_elapsed: AtomicU64,
-}
-
-#[derive(Debug, Default)]
-struct VoteSourceCounts {
-    receive_and_buffer_packets_count: AtomicUsize,
-    dropped_packets_count: AtomicUsize,
-    newly_buffered_packets_count: AtomicUsize,
-    newly_buffered_forwarded_packets_count: AtomicUsize,
-}
-
-impl VoteSourceCounts {
-    fn is_empty(&self) -> bool {
-        0 == self
-            .receive_and_buffer_packets_count
-            .load(Ordering::Relaxed)
-            + self.dropped_packets_count.load(Ordering::Relaxed)
-            + self.newly_buffered_packets_count.load(Ordering::Relaxed)
-            + self
-                .newly_buffered_forwarded_packets_count
-                .load(Ordering::Relaxed)
-    }
-}
-
-impl BankingStageStats {
-    pub fn new() -> Self {
-        BankingStageStats {
-            batch_packet_indexes_len: Histogram::configure()
-                .max_value(PACKETS_PER_BATCH as u64)
-                .build()
-                .unwrap(),
-            ..BankingStageStats::default()
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.gossip_counts.is_empty()
-            && self.tpu_counts.is_empty()
-            && 0 == self
-                .dropped_duplicated_packets_count
-                .load(Ordering::Relaxed) as u64
-                + self.dropped_forward_packets_count.load(Ordering::Relaxed) as u64
-                + self.current_buffered_packets_count.load(Ordering::Relaxed) as u64
-                + self.rebuffered_packets_count.load(Ordering::Relaxed) as u64
-                + self.consumed_buffered_packets_count.load(Ordering::Relaxed) as u64
-                + self
-                    .consume_buffered_packets_elapsed
-                    .load(Ordering::Relaxed)
-                + self
-                    .receive_and_buffer_packets_elapsed
-                    .load(Ordering::Relaxed)
-                + self.filter_pending_packets_elapsed.load(Ordering::Relaxed)
-                + self.packet_conversion_elapsed.load(Ordering::Relaxed)
-                + self.transaction_processing_elapsed.load(Ordering::Relaxed)
-                + self.batch_packet_indexes_len.entries()
-    }
-
-    fn report(&mut self, report_interval_ms: u64) {
-        // skip reporting metrics if stats is empty
-        if self.is_empty() {
-            return;
-        }
-        if self.last_report.should_update(report_interval_ms) {
-            datapoint_info!(
-                "banking_stage-vote_loop_stats",
-                (
-                    "tpu_receive_and_buffer_packets_count",
-                    self.tpu_counts
-                        .receive_and_buffer_packets_count
-                        .swap(0, Ordering::Relaxed),
-                    i64
-                ),
-                (
-                    "tpu_dropped_packets_count",
-                    self.tpu_counts
-                        .dropped_packets_count
-                        .swap(0, Ordering::Relaxed),
-                    i64
-                ),
-                (
-                    "tpu_newly_buffered_packets_count",
-                    self.tpu_counts
-                        .newly_buffered_packets_count
-                        .swap(0, Ordering::Relaxed),
-                    i64
-                ),
-                (
-                    "tpu_newly_buffered_forwarded_packets_count",
-                    self.tpu_counts
-                        .newly_buffered_forwarded_packets_count
-                        .swap(0, Ordering::Relaxed),
-                    i64
-                ),
-                (
-                    "gossip_receive_and_buffer_packets_count",
-                    self.gossip_counts
-                        .receive_and_buffer_packets_count
-                        .swap(0, Ordering::Relaxed),
-                    i64
-                ),
-                (
-                    "gossip_dropped_packets_count",
-                    self.gossip_counts
-                        .dropped_packets_count
-                        .swap(0, Ordering::Relaxed),
-                    i64
-                ),
-                (
-                    "gossip_newly_buffered_packets_count",
-                    self.gossip_counts
-                        .newly_buffered_packets_count
-                        .swap(0, Ordering::Relaxed),
-                    i64
-                ),
-                (
-                    "gossip_newly_buffered_forwarded_packets_count",
-                    self.gossip_counts
-                        .newly_buffered_forwarded_packets_count
-                        .swap(0, Ordering::Relaxed),
-                    i64
-                ),
-                (
-                    "dropped_duplicated_packets_count",
-                    self.dropped_duplicated_packets_count
-                        .swap(0, Ordering::Relaxed),
-                    i64
-                ),
-                (
-                    "dropped_forward_packets_count",
-                    self.dropped_forward_packets_count
-                        .swap(0, Ordering::Relaxed),
-                    i64
-                ),
-                (
-                    "current_buffered_packets_count",
-                    self.current_buffered_packets_count
-                        .swap(0, Ordering::Relaxed),
-                    i64
-                ),
-                (
-                    "rebuffered_packets_count",
-                    self.rebuffered_packets_count.swap(0, Ordering::Relaxed),
-                    i64
-                ),
-                (
-                    "consumed_buffered_packets_count",
-                    self.consumed_buffered_packets_count
-                        .swap(0, Ordering::Relaxed),
-                    i64
-                ),
-                (
-                    "consume_buffered_packets_elapsed",
-                    self.consume_buffered_packets_elapsed
-                        .swap(0, Ordering::Relaxed),
-                    i64
-                ),
-                (
-                    "receive_and_buffer_packets_elapsed",
-                    self.receive_and_buffer_packets_elapsed
-                        .swap(0, Ordering::Relaxed),
-                    i64
-                ),
-                (
-                    "filter_pending_packets_elapsed",
-                    self.filter_pending_packets_elapsed
-                        .swap(0, Ordering::Relaxed),
-                    i64
-                ),
-                (
-                    "packet_conversion_elapsed",
-                    self.packet_conversion_elapsed.swap(0, Ordering::Relaxed),
-                    i64
-                ),
-                (
-                    "transaction_processing_elapsed",
-                    self.transaction_processing_elapsed
-                        .swap(0, Ordering::Relaxed),
-                    i64
-                ),
-                (
-                    "packet_batch_indices_len_min",
-                    self.batch_packet_indexes_len.minimum().unwrap_or(0),
-                    i64
-                ),
-                (
-                    "packet_batch_indices_len_max",
-                    self.batch_packet_indexes_len.maximum().unwrap_or(0),
-                    i64
-                ),
-                (
-                    "packet_batch_indices_len_mean",
-                    self.batch_packet_indexes_len.mean().unwrap_or(0),
-                    i64
-                ),
-                (
-                    "packet_batch_indices_len_90pct",
-                    self.batch_packet_indexes_len.percentile(90.0).unwrap_or(0),
-                    i64
-                )
-            );
-            self.batch_packet_indexes_len.clear();
-        }
-    }
-}
 
 #[derive(Debug, Default)]
 pub struct BatchedTransactionDetails {
@@ -927,7 +695,11 @@ mod tests {
         solana_transaction::{sanitized::SanitizedTransaction, Transaction},
         solana_vote::vote_transaction::new_tower_sync_transaction,
         solana_vote_program::vote_state::TowerSync,
-        std::{sync::atomic::Ordering, thread::sleep, time::Instant},
+        std::{
+            sync::atomic::Ordering,
+            thread::sleep,
+            time::{Duration, Instant},
+        },
     };
 
     pub(crate) fn sanitize_transactions(
