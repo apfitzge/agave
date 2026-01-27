@@ -108,17 +108,23 @@ impl ForwardAddressGetter {
         max_count: u64,
         protocol: Protocol,
     ) -> Vec<SocketAddr> {
-        next_leaders(&self.cluster_info, &self.poh_recorder, max_count, |node| {
-            node.tpu_forwards(protocol)
-        })
+        next_leaders(
+            self.cluster_info.as_ref(),
+            &self.poh_recorder,
+            max_count,
+            |node| node.tpu_forwards(protocol),
+        )
     }
 
     /// Returns the TPU vote forwarding address of the next leader, if
     /// available.
     fn get_vote_forwarding_addresses(&self, max_count: u64) -> Vec<SocketAddr> {
-        next_leaders(&self.cluster_info, &self.poh_recorder, max_count, |node| {
-            node.tpu_vote(Protocol::UDP)
-        })
+        next_leaders(
+            self.cluster_info.as_ref(),
+            &self.poh_recorder,
+            max_count,
+            |node| node.tpu_vote(Protocol::UDP),
+        )
     }
 }
 

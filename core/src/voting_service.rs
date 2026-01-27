@@ -2,12 +2,12 @@ use {
     crate::{
         consensus::tower_storage::{SavedTowerVersions, TowerStorage},
         mock_alpenglow_consensus::MockAlpenglowConsensus,
-        next_leader::upcoming_leader_tpu_vote_sockets,
+        next_leader::next_leaders,
     },
     bincode::serialize,
     crossbeam_channel::Receiver,
     solana_client::connection_cache::ConnectionCache,
-    solana_clock::{Slot, FORWARD_TRANSACTIONS_TO_LEADER_AT_SLOT_OFFSET},
+    solana_clock::Slot,
     solana_connection_cache::client_connection::ClientConnection,
     solana_gossip::{cluster_info::ClusterInfo, epoch_specs::EpochSpecs},
     solana_measure::measure::Measure,
@@ -156,16 +156,9 @@ impl VotingService {
         // Attempt to send our vote transaction to the leaders for the next few
         // slots. From the current slot to the forwarding slot offset
         // (inclusive).
-        const UPCOMING_LEADER_FANOUT_SLOTS: u64 =
-            FORWARD_TRANSACTIONS_TO_LEADER_AT_SLOT_OFFSET.saturating_add(1);
-        #[cfg(test)]
-        static_assertions::const_assert_eq!(UPCOMING_LEADER_FANOUT_SLOTS, 3);
-        let upcoming_leader_sockets = upcoming_leader_tpu_vote_sockets(
-            cluster_info,
-            poh_recorder,
-            UPCOMING_LEADER_FANOUT_SLOTS,
-            connection_cache.protocol(),
-        );
+        let upcoming_leader_sockets = next_leaders(cluster_info, poh_recorder, 2, |contact_info| {
+            contact_info.tpu(solana_gossip::contact_info::Protocol::QUIC)
+        });
 
         if !upcoming_leader_sockets.is_empty() {
             for tpu_vote_socket in upcoming_leader_sockets {

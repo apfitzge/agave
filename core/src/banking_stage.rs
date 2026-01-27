@@ -353,19 +353,19 @@ pub struct BatchedTransactionErrorDetails {
     pub batched_dropped_txs_per_account_data_total_limit_count: Saturating<u64>,
 }
 
-pub trait LikeClusterInfo: Send + Sync + 'static + Clone {
+pub trait LikeClusterInfo {
     fn id(&self) -> Pubkey;
 
     fn lookup_contact_info<R>(&self, id: &Pubkey, query: impl ContactInfoQuery<R>) -> Option<R>;
 }
 
-impl LikeClusterInfo for Arc<ClusterInfo> {
+impl LikeClusterInfo for ClusterInfo {
     fn id(&self) -> Pubkey {
-        self.deref().id()
+        self.id()
     }
 
     fn lookup_contact_info<R>(&self, id: &Pubkey, query: impl ContactInfoQuery<R>) -> Option<R> {
-        self.deref().lookup_contact_info(id, query)
+        self.lookup_contact_info(id, query)
     }
 }
 
