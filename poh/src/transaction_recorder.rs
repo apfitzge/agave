@@ -58,11 +58,17 @@ impl TransactionRecorder {
         let mut starting_transaction_index = None;
 
         if !transactions.is_empty() {
-            let (hash, hash_us) = measure_us!(hash_transactions(&transactions));
-            record_transactions_timings.hash_us = Saturating(hash_us);
+            let mut hashes = Vec::with_capacity(transactions.len());
+            let mut separated_transactions = Vec::with_capacity(transactions.len());
+            for transaction in transactions {
+                let txs = vec![transaction];
+                let hash = hash_transactions(&txs);
+                hashes.push(hash);
+                separated_transactions.push(txs);
+            }
 
             let (res, poh_record_us) =
-                measure_us!(self.record(bank_id, vec![hash], vec![transactions]));
+                measure_us!(self.record(bank_id, hashes, separated_transactions));
             record_transactions_timings.poh_record_us = Saturating(poh_record_us);
 
             match res {
