@@ -3048,7 +3048,7 @@ impl Bank {
 
     /// Attempt to take locks on the accounts in a transaction batch
     pub fn try_lock_accounts(&self, txs: &[impl TransactionWithMeta]) -> Vec<Result<()>> {
-        self.try_lock_accounts_with_results(txs, txs.iter().map(|_| Ok(())))
+        self.try_lock_accounts_with_results(txs, txs.iter().map(|_| Ok(())), false)
     }
 
     /// Attempt to take locks on the accounts in a transaction batch, and their cost
@@ -3057,11 +3057,13 @@ impl Bank {
         &self,
         txs: &[impl TransactionWithMeta],
         tx_results: impl Iterator<Item = Result<()>>,
+        relax_intrabatch_account_locks_override: bool,
     ) -> Vec<Result<()>> {
         let tx_account_lock_limit = self.get_transaction_account_lock_limit();
-        let relax_intrabatch_account_locks = self
-            .feature_set
-            .is_active(&feature_set::relax_intrabatch_account_locks::id());
+        let relax_intrabatch_account_locks = relax_intrabatch_account_locks_override
+            || self
+                .feature_set
+                .is_active(&feature_set::relax_intrabatch_account_locks::id());
 
         // with simd83 enabled, we must fail transactions that duplicate a prior message hash
         // previously, conflicting account locks would fail such transactions as a side effect
@@ -3094,7 +3096,7 @@ impl Bank {
         &'a self,
         txs: &'b [Tx],
     ) -> TransactionBatch<'a, 'b, Tx> {
-        self.prepare_sanitized_batch_with_results(txs, txs.iter().map(|_| Ok(())))
+        self.prepare_sanitized_batch_with_results(txs, txs.iter().map(|_| Ok(())), false)
     }
 
     /// Prepare a locked transaction batch from a list of sanitized transactions, and their cost
@@ -3103,10 +3105,15 @@ impl Bank {
         &'a self,
         transactions: &'b [Tx],
         transaction_results: impl Iterator<Item = Result<()>>,
+        relax_intrabatch_account_locks_override: bool,
     ) -> TransactionBatch<'a, 'b, Tx> {
         // this lock_results could be: Ok, AccountInUse, WouldExceedBlockMaxLimit or WouldExceedAccountMaxLimit
         TransactionBatch::new(
-            self.try_lock_accounts_with_results(transactions, transaction_results),
+            self.try_lock_accounts_with_results(
+                transactions,
+                transaction_results,
+                relax_intrabatch_account_locks_override,
+            ),
             self,
             OwnedOrBorrowed::Borrowed(transactions),
         )
