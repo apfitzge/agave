@@ -11,6 +11,7 @@ use {
     },
     agave_votor::{common::block_timeout, event::LeaderWindowInfo},
     crossbeam_channel::Receiver,
+    log::error,
     solana_clock::Slot,
     solana_gossip::cluster_info::ClusterInfo,
     solana_hash::Hash,
@@ -261,7 +262,14 @@ fn start_loop(config: BlockCreationLoopConfig) {
 /// Resets poh recorder
 fn reset_poh_recorder(bank: &Arc<Bank>, ctx: &LeaderContext) {
     trace!("{}: resetting poh to {}", ctx.my_pubkey, bank.slot());
-    assert!(ctx.record_receiver.is_shutdown() && ctx.record_receiver.is_safe_to_restart());
+    let is_shutdown = ctx.record_receiver.is_shutdown();
+    let is_safe = ctx.record_receiver.is_safe_to_restart();
+    error!(
+        "#ASH: reset_poh_recorder: bank_slot={}, is_shutdown={is_shutdown}, \
+         is_safe_to_restart={is_safe}",
+        bank.slot(),
+    );
+    assert!(is_shutdown && is_safe);
     let next_leader_slot = ctx.leader_schedule_cache.next_leader_slot(
         &ctx.my_pubkey,
         bank.slot(),
@@ -289,9 +297,22 @@ fn produce_window(
     let mut window_production_start = Measure::start("window_production");
     let mut slot = start_slot;
 
+    error!(
+        "#ASH: produce_window: starting window production start_slot={start_slot}, \
+         end_slot={end_slot}, parent_slot={parent_slot}, is_shutdown={}, is_safe_to_restart={}",
+        ctx.record_receiver.is_shutdown(),
+        ctx.record_receiver.is_safe_to_restart()
+    );
+
     while !ctx.exit.load(Ordering::Relaxed) && slot <= end_slot {
         // Insert the bank. In case `replay_stage` is slow and `parent_slot` is not
         // yet frozen, we wait up until the timeout.
+        error!(
+            "#ASH: produce_window: starting slot={slot}, parent_slot={parent_slot}, \
+             is_shutdown={}, is_safe_to_restart={}",
+            ctx.record_receiver.is_shutdown(),
+            ctx.record_receiver.is_safe_to_restart()
+        );
         start_leader_wait_for_parent_replay(slot, parent_slot, skip_timer, ctx)?;
 
         let leader_index = leader_slot_index(slot);
@@ -302,6 +323,7 @@ fn produce_window(
         );
 
         let mut bank_completion_measure = Measure::start("bank_completion");
+        error!("#ASH: produce_window: about to call record_and_complete_block for slot={slot}",);
         if let Err(e) = record_and_complete_block(
             ctx.poh_recorder.as_ref(),
             &mut ctx.record_receiver,
@@ -310,6 +332,12 @@ fn produce_window(
         ) {
             panic!("PohRecorder record failed: {e:?}");
         }
+        error!(
+            "#ASH: produce_window: record_and_complete_block returned for slot={slot}, \
+             is_shutdown={}, is_safe_to_restart={}",
+            ctx.record_receiver.is_shutdown(),
+            ctx.record_receiver.is_safe_to_restart()
+        );
         assert!(!ctx.poh_recorder.read().unwrap().has_bank());
         bank_completion_measure.stop();
         ctx.slot_metrics.report();
@@ -365,17 +393,41 @@ fn record_and_complete_block(
     }
 
     // Shutdown and clear any inflight records
+    let bank_slot_before_shutdown = poh_recorder.read().unwrap().bank().map(|b| b.slot());
+    error!(
+        "#ASH: record_and_complete_block: about to shutdown, \
+         bank_slot={bank_slot_before_shutdown:?}",
+    );
     record_receiver.shutdown();
+    let mut drain_iteration = 0u64;
     while !record_receiver.is_safe_to_restart() {
-        let Ok(record) = record_receiver.recv_timeout(Duration::ZERO) else {
+        drain_iteration += 1;
+        let recv_result = record_receiver.recv_timeout(Duration::ZERO);
+        let Ok(record) = recv_result else {
+            error!(
+                "#ASH: record_and_complete_block: drain iteration={drain_iteration}, recv_timeout \
+                 returned Err, is_safe_to_restart={}",
+                record_receiver.is_safe_to_restart()
+            );
             continue;
         };
+        error!(
+            "#ASH: record_and_complete_block: drain iteration={drain_iteration}, received record \
+             bank_id={}, num_batches={}",
+            record.bank_id,
+            record.transaction_batches.len()
+        );
         poh_recorder.write().unwrap().record(
             record.bank_id,
             record.mixins,
             record.transaction_batches,
         )?;
     }
+    error!(
+        "#ASH: record_and_complete_block: shutdown complete after {drain_iteration} drain \
+         iterations, is_safe_to_restart={}",
+        record_receiver.is_safe_to_restart()
+    );
 
     // Alpentick and clear bank
     let mut w_poh_recorder = poh_recorder.write().unwrap();
@@ -595,6 +647,12 @@ fn create_and_insert_leader_bank(slot: Slot, parent_bank: Arc<Bank>, ctx: &mut L
     let tpu_bank = ctx.bank_forks.write().unwrap().insert(tpu_bank);
     let bank_id = tpu_bank.bank_id();
     ctx.poh_recorder.write().unwrap().set_bank(tpu_bank);
+    error!(
+        "#ASH: create_and_insert_leader_bank: about to call restart for slot={slot}, \
+         bank_id={bank_id}, parent_slot={parent_slot}, is_shutdown={}, is_safe_to_restart={}",
+        ctx.record_receiver.is_shutdown(),
+        ctx.record_receiver.is_safe_to_restart()
+    );
     ctx.record_receiver.restart(bank_id);
     ctx.slot_metrics.reset(slot);
 

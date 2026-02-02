@@ -11,6 +11,7 @@ use std::sync::{
 use {
     crate::poh_recorder::Record,
     crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TryRecvError},
+    log::error,
     solana_clock::BankId,
     std::time::Duration,
 };
@@ -193,6 +194,18 @@ impl RecordReceiver {
 
     /// Shutdown the channel immediately.
     pub fn shutdown(&mut self) {
+        let current_state = self.bank_id_allowed_insertions.0.load(Ordering::Acquire);
+        let current_bank_id = BankIdAllowedInsertions::bank_id(current_state);
+        let active_senders = self.active_senders.load(Ordering::Acquire);
+        let receiver_len = self.receiver.len();
+        error!(
+            "#ASH: RecordReceiver::shutdown called: current_bank_id={}, active_senders={}, \
+             receiver_len={}, is_empty={}",
+            current_bank_id,
+            active_senders,
+            receiver_len,
+            self.receiver.is_empty()
+        );
         self.bank_id_allowed_insertions.shutdown();
     }
 
@@ -205,7 +218,37 @@ impl RecordReceiver {
     /// Re-enable the channel after a shutdown.
     pub fn restart(&mut self, bank_id: BankId) {
         assert!(bank_id <= BankIdAllowedInsertions::MAX_BANK_ID);
-        assert!(self.receiver.is_empty()); // Should be empty before restarting.
+        let is_empty = self.receiver.is_empty();
+        let active_senders = self.active_senders.load(Ordering::Acquire);
+        let current_state = self.bank_id_allowed_insertions.0.load(Ordering::Acquire);
+        let current_bank_id = BankIdAllowedInsertions::bank_id(current_state);
+        let allowed_insertions = BankIdAllowedInsertions::allowed_insertions(current_state);
+        let is_shutdown = current_bank_id == BankIdAllowedInsertions::DISABLED_BANK_ID;
+        error!(
+            "#ASH: RecordReceiver::restart called: new_bank_id={}, is_empty={}, \
+             active_senders={}, current_bank_id={}, allowed_insertions={}, is_shutdown={}, \
+             capacity={}",
+            bank_id,
+            is_empty,
+            active_senders,
+            current_bank_id,
+            allowed_insertions,
+            is_shutdown,
+            self.capacity
+        );
+        if !is_empty {
+            error!(
+                "#ASH: RecordReceiver::restart ASSERTION WILL FAIL - channel not empty! Dumping \
+                 channel contents:"
+            );
+            // Log what's in the channel without consuming
+            error!(
+                "#ASH: RecordReceiver::restart - receiver.len()={}, is_safe_to_restart={}",
+                self.receiver.len(),
+                active_senders == 0 && is_empty
+            );
+        }
+        assert!(is_empty); // Should be empty before restarting.
 
         // Reset transaction indexes if tracking them - BEFORE allowing new insertions.
         let transaction_indexes_lock =
@@ -242,7 +285,14 @@ impl RecordReceiver {
         // 3) receiver checks active_senders == 0 && is_empty == true,
         //    thinks the channel is empty with no active senders, but there is
         //    actually a record in the channel now!
-        self.active_senders.load(Ordering::Acquire) == 0 && self.receiver.is_empty()
+        let active_senders = self.active_senders.load(Ordering::Acquire);
+        let is_empty = self.receiver.is_empty();
+        let result = active_senders == 0 && is_empty;
+        error!(
+            "#ASH: RecordReceiver::is_safe_to_restart: active_senders={active_senders}, \
+             is_empty={is_empty}, result={result}",
+        );
+        result
     }
 
     /// Try to receive a record from the channel.
@@ -254,7 +304,15 @@ impl RecordReceiver {
         loop {
             match self.receiver.try_recv() {
                 Ok(record) => {
-                    self.on_received_record(record.transaction_batches.len() as u64);
+                    let num_batches = record.transaction_batches.len();
+                    error!(
+                        "#ASH: RecordReceiver::try_recv received record: bank_id={}, \
+                         num_batches={}, receiver_len_after={}",
+                        record.bank_id,
+                        num_batches,
+                        self.receiver.len()
+                    );
+                    self.on_received_record(num_batches as u64);
                     return Ok(record);
                 }
                 Err(TryRecvError::Empty) => {
@@ -277,7 +335,15 @@ impl RecordReceiver {
     /// Receive a record from the channel, waiting up to `duration`.
     pub fn recv_timeout(&self, duration: Duration) -> Result<Record, RecvTimeoutError> {
         let record = self.receiver.recv_timeout(duration)?;
-        self.on_received_record(record.transaction_batches.len() as u64);
+        let num_batches = record.transaction_batches.len();
+        error!(
+            "#ASH: RecordReceiver::recv_timeout received record: bank_id={}, num_batches={}, \
+             receiver_len_after={}",
+            record.bank_id,
+            num_batches,
+            self.receiver.len()
+        );
+        self.on_received_record(num_batches as u64);
         Ok(record)
     }
 
