@@ -111,8 +111,9 @@ impl RecordSender {
             // batches, the channel is full - just return immediately.
             // If the `record`'s bank_id is different from the current bank_id,
             // return immediately.
+            // Use SeqCst to ensure we see the shutdown store if it happened.
             let current_bank_id_allowed_insertions =
-                self.bank_id_allowed_insertions.0.load(Ordering::Acquire);
+                self.bank_id_allowed_insertions.0.load(Ordering::SeqCst);
             let (bank_id, allowed_insertions) = (
                 BankIdAllowedInsertions::bank_id(current_bank_id_allowed_insertions),
                 BankIdAllowedInsertions::allowed_insertions(current_bank_id_allowed_insertions),
@@ -128,13 +129,13 @@ impl RecordSender {
                 return Err(RecordSenderError::Full);
             }
 
+            // Increment active_senders before CAS so the receiver can see this send is in-flight.
+            self.active_senders.fetch_add(1, Ordering::SeqCst);
+
             let new_bank_id_allowed_insertions = BankIdAllowedInsertions::encoded_value(
                 bank_id,
                 allowed_insertions.wrapping_sub(record.transaction_batches.len() as u64),
             );
-
-            // Increment this before CAS so the receiver can see this send is in-flight.
-            self.active_senders.fetch_add(1, Ordering::AcqRel);
 
             if self
                 .bank_id_allowed_insertions
@@ -142,19 +143,19 @@ impl RecordSender {
                 .compare_exchange(
                     current_bank_id_allowed_insertions,
                     new_bank_id_allowed_insertions,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
                 )
                 .is_err()
             {
                 // Failed to reserve space, decrement active senders and try again.
-                self.active_senders.fetch_sub(1, Ordering::AcqRel);
+                self.active_senders.fetch_sub(1, Ordering::SeqCst);
                 continue;
             }
 
             match self.sender.try_send(record) {
                 Ok(_) => {
-                    self.active_senders.fetch_sub(1, Ordering::AcqRel);
+                    self.active_senders.fetch_sub(1, Ordering::SeqCst);
                     return Ok(transaction_indexes.map(|mut transaction_indexes| {
                         let transaction_starting_index = *transaction_indexes;
                         *transaction_indexes += num_transactions;
@@ -163,7 +164,7 @@ impl RecordSender {
                 }
                 Err(err) => {
                     assert!(err.is_disconnected());
-                    self.active_senders.fetch_sub(1, Ordering::AcqRel);
+                    self.active_senders.fetch_sub(1, Ordering::SeqCst);
                     return Err(RecordSenderError::Disconnected);
                 }
             }
@@ -278,19 +279,43 @@ impl RecordReceiver {
 
     /// Channel is empty and there are no active threads attempting to send.
     pub fn is_safe_to_restart(&self) -> bool {
-        // The order here is important. active_senders must be checked first.
-        // If checked after is_empty, we could have a race:
+        // We need to check active_senders TWICE with is_empty in between.
+        // This prevents a TOCTOU race where:
+        // 1) receiver loads active_senders = 0
+        // 2) sender increments active_senders = 1 and loads state (could be valid!)
+        // 3) receiver checks is_empty = true
+        // 4) receiver returns true, but sender might complete a send!
+        //
+        // By checking active_senders again after is_empty, we ensure no sender
+        // started between the two checks.
+        //
+        // Additionally, checking active_senders first (before is_empty) prevents:
         // 1) sender has not sent yet, active_senders = 1. is_empty = true.
         // 2) sender sends, decrements active_senders = 0.
         // 3) receiver checks active_senders == 0 && is_empty == true,
         //    thinks the channel is empty with no active senders, but there is
         //    actually a record in the channel now!
-        let active_senders = self.active_senders.load(Ordering::Acquire);
+        // Use SeqCst to ensure we see the most recent active_senders from any sender
+        let active_senders_before = self.active_senders.load(Ordering::SeqCst);
+        if active_senders_before != 0 {
+            error!(
+                "#ASH: RecordReceiver::is_safe_to_restart: \
+                 active_senders_before={active_senders_before}, result=false",
+            );
+            return false;
+        }
         let is_empty = self.receiver.is_empty();
-        let result = active_senders == 0 && is_empty;
+        if !is_empty {
+            error!("#ASH: RecordReceiver::is_safe_to_restart: is_empty=false, result=false");
+            return false;
+        }
+        // Double-check: ensure no sender started between the two checks
+        let active_senders_after = self.active_senders.load(Ordering::SeqCst);
+        let result = active_senders_after == 0;
         error!(
-            "#ASH: RecordReceiver::is_safe_to_restart: active_senders={active_senders}, \
-             is_empty={is_empty}, result={result}",
+            "#ASH: RecordReceiver::is_safe_to_restart: \
+             active_senders_before={active_senders_before}, is_empty={is_empty}, \
+             active_senders_after={active_senders_after}, result={result}",
         );
         result
     }
@@ -393,7 +418,7 @@ impl BankIdAllowedInsertions {
 
     /// Shutdown the channel immediately.
     fn shutdown(&self) {
-        self.0.store(Self::SHUTDOWN, Ordering::Release);
+        self.0.store(Self::SHUTDOWN, Ordering::SeqCst);
     }
 
     const fn encoded_value(bank_id: BankId, allowed_insertions: u64) -> u64 {
@@ -504,11 +529,263 @@ mod tests {
 
         assert!(*sender.transaction_indexes.as_ref().unwrap().lock().unwrap() == 4);
     }
+
+    /// Stress test to try to reproduce the shutdown/drain race condition.
+    /// The bug: is_safe_to_restart() returns true, but a sender completes a send afterward.
+    #[test]
+    fn test_shutdown_drain_race_stress() {
+        use std::{
+            sync::{atomic::AtomicBool, Arc, Barrier},
+            thread,
+        };
+
+        const NUM_ITERATIONS: usize = 10_000;
+        const NUM_SENDERS: usize = 4;
+
+        for iteration in 0..NUM_ITERATIONS {
+            let (sender, mut receiver) = record_channels(false);
+            receiver.restart(0);
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let barrier = Arc::new(Barrier::new(NUM_SENDERS + 1));
+
+            // Spawn sender threads that continuously try to send
+            let handles: Vec<_> = (0..NUM_SENDERS)
+                .map(|_| {
+                    let sender = sender.clone();
+                    let stop = stop.clone();
+                    let barrier = barrier.clone();
+                    thread::spawn(move || {
+                        barrier.wait();
+                        while !stop.load(Ordering::Relaxed) {
+                            let _ = sender.try_send(test_record(0, 1));
+                            // Small yield to increase interleaving
+                            thread::yield_now();
+                        }
+                    })
+                })
+                .collect();
+
+            // Wait for all senders to start
+            barrier.wait();
+
+            // Let senders run for a bit
+            thread::yield_now();
+
+            // Now do the shutdown + drain sequence
+            receiver.shutdown();
+
+            // Drain loop (same as record_and_complete_block)
+            while !receiver.is_safe_to_restart() {
+                let _ = receiver.try_recv();
+            }
+
+            // CRITICAL: After is_safe_to_restart() returned true, channel must be empty
+            // and must STAY empty (no in-flight sends can complete)
+            let empty_immediately = receiver.receiver.is_empty();
+            let active_senders = sender.active_senders.load(Ordering::Acquire);
+
+            // Give any "in-flight" operations a chance to complete
+            thread::yield_now();
+
+            let empty_after_yield = receiver.receiver.is_empty();
+
+            // Stop senders
+            stop.store(true, Ordering::Relaxed);
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            // Final check
+            let empty_final = receiver.receiver.is_empty();
+
+            if !empty_immediately || !empty_after_yield || !empty_final {
+                panic!(
+                    "Race condition detected at iteration \
+                     {iteration}!\nempty_immediately={empty_immediately}, \
+                     active_senders={active_senders}, empty_after_yield={empty_after_yield}, \
+                     empty_final={empty_final}\nA sender completed a send after \
+                     is_safe_to_restart() returned true."
+                );
+            }
+        }
+    }
+
+    /// Test that specifically checks the invariant: once shutdown is called and
+    /// is_safe_to_restart() returns true, no sender can successfully send.
+    #[test]
+    fn test_no_send_after_safe_to_restart() {
+        use std::{
+            sync::{atomic::AtomicBool, Arc, Barrier},
+            thread,
+        };
+
+        const NUM_ITERATIONS: usize = 5_000;
+
+        for _ in 0..NUM_ITERATIONS {
+            let (sender, mut receiver) = record_channels(false);
+            receiver.restart(0);
+
+            let can_proceed = Arc::new(AtomicBool::new(false));
+            let sender_done = Arc::new(AtomicBool::new(false));
+            let barrier = Arc::new(Barrier::new(2));
+
+            // Sender thread: waits at barrier, then tries to send
+            let sender_clone = sender.clone();
+            let can_proceed_clone = can_proceed.clone();
+            let sender_done_clone = sender_done.clone();
+            let barrier_clone = barrier.clone();
+
+            let handle = thread::spawn(move || {
+                barrier_clone.wait();
+                // Spin until receiver signals we can proceed
+                while !can_proceed_clone.load(Ordering::Acquire) {
+                    thread::yield_now();
+                }
+                // Now try to send - this simulates a sender that was "in-flight"
+                let result = sender_clone.try_send(test_record(0, 1));
+                sender_done_clone.store(true, Ordering::Release);
+                result
+            });
+
+            // Receiver: sync with sender, then shutdown
+            barrier.wait();
+
+            // Shutdown and drain
+            receiver.shutdown();
+            while !receiver.is_safe_to_restart() {
+                let _ = receiver.try_recv();
+            }
+
+            // Now is_safe_to_restart() has returned true.
+            // Signal sender to proceed with its send attempt.
+            can_proceed.store(true, Ordering::Release);
+
+            // Wait for sender to complete
+            while !sender_done.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+
+            let send_result = handle.join().unwrap();
+
+            // The sender's send MUST have failed (Shutdown error)
+            // If it succeeded, we have a bug!
+            assert!(
+                matches!(send_result, Err(RecordSenderError::Shutdown)),
+                "Send succeeded after is_safe_to_restart() returned true! Result: {send_result:?}"
+            );
+
+            // Double-check channel is empty
+            assert!(
+                receiver.receiver.is_empty(),
+                "Channel not empty after is_safe_to_restart() returned true!"
+            );
+        }
+    }
 }
 
 #[cfg(all(test, feature = "shuttle-test"))]
 mod shuttle_tests {
     use super::{tests::test_record, *};
+
+    /// Test that reproduces the race condition where:
+    /// 1. Receiver calls shutdown(), is_safe_to_restart() returns true
+    /// 2. Sender that loaded state before shutdown completes its send
+    /// 3. Channel is non-empty when restart() is called
+    ///
+    /// The invariant we're testing: after shutdown() + drain loop completes with
+    /// is_safe_to_restart() == true, no more records can arrive in the channel.
+    #[test]
+    fn test_shutdown_drain_restart_race() {
+        const NUM_TEST_RUNS: usize = 100_000;
+        shuttle::check_random(
+            || {
+                let (sender, mut receiver) = record_channels(false);
+                receiver.restart(0);
+
+                let sender_clone = sender.clone();
+                shuttle::thread::spawn(move || {
+                    // Sender tries to send - may or may not succeed depending on timing
+                    let _ = sender_clone.try_send(test_record(0, 1));
+                });
+
+                // Simulate the drain loop from record_and_complete_block
+                receiver.shutdown();
+                while !receiver.is_safe_to_restart() {
+                    // Drain any records
+                    if receiver.try_recv().is_ok() {
+                        // Record received and processed
+                    }
+                }
+
+                // At this point, is_safe_to_restart() returned true.
+                // The invariant is: no more records should arrive after this.
+                // If the channel is not empty now, we have a bug!
+                assert!(
+                    receiver.receiver.is_empty(),
+                    "Channel not empty after is_safe_to_restart() returned true! This means a \
+                     sender completed a send after the drain loop exited."
+                );
+            },
+            NUM_TEST_RUNS,
+        )
+    }
+
+    /// Test the specific scenario from the bug report:
+    /// Sender loads state, gets preempted, receiver shuts down and exits drain loop,
+    /// then sender resumes and completes the send.
+    #[test]
+    fn test_sender_preempted_during_send() {
+        const NUM_TEST_RUNS: usize = 100_000;
+        shuttle::check_random(
+            || {
+                let (sender, mut receiver) = record_channels(false);
+                receiver.restart(0);
+
+                // Spawn multiple senders to increase chance of race
+                for _ in 0..3 {
+                    let sender_clone = sender.clone();
+                    shuttle::thread::spawn(move || {
+                        for _ in 0..10 {
+                            let _ = sender_clone.try_send(test_record(0, 1));
+                        }
+                    });
+                }
+
+                // Receiver does shutdown + drain multiple times
+                for _ in 0..5 {
+                    receiver.shutdown();
+
+                    // Drain loop
+                    while !receiver.is_safe_to_restart() {
+                        let _ = receiver.try_recv();
+                    }
+
+                    // CRITICAL CHECK: After drain loop exits, channel MUST be empty
+                    // and no more records should be able to arrive
+                    let empty_after_drain = receiver.receiver.is_empty();
+                    let active = sender.active_senders.load(Ordering::Acquire);
+
+                    // Give a tiny window for any in-flight operations
+                    shuttle::thread::yield_now();
+
+                    let empty_after_yield = receiver.receiver.is_empty();
+
+                    assert!(
+                        empty_after_drain && empty_after_yield,
+                        "Race detected! empty_after_drain={}, active_senders={}, \
+                         empty_after_yield={}",
+                        empty_after_drain,
+                        active,
+                        empty_after_yield
+                    );
+
+                    receiver.restart(0);
+                }
+            },
+            NUM_TEST_RUNS,
+        )
+    }
 
     #[test]
     fn test_sender_shutdown_safety_race() {

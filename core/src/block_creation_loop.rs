@@ -400,8 +400,17 @@ fn record_and_complete_block(
     );
     record_receiver.shutdown();
     let mut drain_iteration = 0u64;
-    for record in record_receiver.drain() {
+    while !record_receiver.is_safe_to_restart() {
         drain_iteration += 1;
+        let recv_result = record_receiver.recv_timeout(Duration::ZERO);
+        let Ok(record) = recv_result else {
+            error!(
+                "#ASH: record_and_complete_block: drain iteration={drain_iteration}, recv_timeout \
+                 returned Err, is_safe_to_restart={}",
+                record_receiver.is_safe_to_restart()
+            );
+            continue;
+        };
         error!(
             "#ASH: record_and_complete_block: drain iteration={drain_iteration}, received record \
              bank_id={}, num_batches={}",
