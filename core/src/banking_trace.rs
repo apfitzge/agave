@@ -423,6 +423,21 @@ impl BankingTracer {
     }
 }
 
+/// A small wrapper around the sender of crossbeam channels to message banking packet batches.
+///
+/// The underlying channels are used by the banking stage to receive packets from multiple sources.
+/// The sources are labelled as non-vote, tpu-vote, and gossip-vote respectively. As such, traced
+/// senders are separately constructed for each of these sources, then all are grouped under the
+/// `Channels` struct transiently during setup.
+///
+/// This wrapper exists to enable the banking trace functionality conditionally on creation.
+///
+/// Also, this wrapper can dynamically switch sending batches to an alternate channel, called the
+/// unified channel, depending on a flag. Both the actual crossbeam sender for the unified channel
+/// and the flag are expected to be shared among all of traced sender instances, which will be used
+/// by the trio of sources respectively. This routing functionality is needed for unified scheduler
+/// and its runtime switching.
+#[derive(Clone)]
 pub struct TracedSender {
     label: ChannelLabel,
     sender: Sender<BankingPacketBatch>,
