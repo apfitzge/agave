@@ -19,6 +19,10 @@ use {
     solana_streamer::streamer::{self, StreamerError},
     solana_time_utils as timing,
     std::{
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
         thread::{self, Builder, JoinHandle},
         time::Instant,
     },
@@ -54,7 +58,9 @@ pub trait SigVerifier {
         &mut self,
         batches: Vec<PacketBatch>,
         valid_packets: usize,
-    ) -> Result<usize, Self::SendType>;
+        total_valid_packets: Arc<AtomicUsize>,
+        total_verify_time_us: Arc<AtomicUsize>,
+    ) -> Result<(), Self::SendType>;
 }
 
 #[derive(Default, Clone)]
@@ -63,7 +69,6 @@ pub struct DisabledSigVerifier {}
 #[derive(Default)]
 struct SigVerifierStats {
     recv_batches_us_hist: histogram::Histogram, // time to call recv_batch
-    verify_batches_pp_us_hist: histogram::Histogram, // per-packet time to call verify_batch
     discard_packets_pp_us_hist: histogram::Histogram, // per-packet time to call verify_batch
     dedup_packets_pp_us_hist: histogram::Histogram, // per-packet time to call verify_batch
     batches_hist: histogram::Histogram,         // number of packet batches per verify call
@@ -73,12 +78,12 @@ struct SigVerifierStats {
     total_packets: usize,
     total_dedup: usize,
     total_excess_fail: usize,
-    total_valid_packets: usize,
+    total_valid_packets: Arc<AtomicUsize>,
     total_discard_random: usize,
     total_dedup_time_us: usize,
     total_discard_time_us: usize,
     total_discard_random_time_us: usize,
-    total_verify_time_us: usize,
+    total_verify_time_us: Arc<AtomicUsize>,
 }
 
 impl SigVerifierStats {
@@ -108,26 +113,6 @@ impl SigVerifierStats {
             (
                 "recv_batches_us_mean",
                 self.recv_batches_us_hist.mean().unwrap_or(0),
-                i64
-            ),
-            (
-                "verify_batches_pp_us_90pct",
-                self.verify_batches_pp_us_hist.percentile(90.0).unwrap_or(0),
-                i64
-            ),
-            (
-                "verify_batches_pp_us_min",
-                self.verify_batches_pp_us_hist.minimum().unwrap_or(0),
-                i64
-            ),
-            (
-                "verify_batches_pp_us_max",
-                self.verify_batches_pp_us_hist.maximum().unwrap_or(0),
-                i64
-            ),
-            (
-                "verify_batches_pp_us_mean",
-                self.verify_batches_pp_us_hist.mean().unwrap_or(0),
                 i64
             ),
             (
@@ -193,7 +178,11 @@ impl SigVerifierStats {
             ("total_packets", self.total_packets, i64),
             ("total_dedup", self.total_dedup, i64),
             ("total_excess_fail", self.total_excess_fail, i64),
-            ("total_valid_packets", self.total_valid_packets, i64),
+            (
+                "total_valid_packets",
+                self.total_valid_packets.load(Ordering::Relaxed) as i64,
+                i64
+            ),
             ("total_discard_random", self.total_discard_random, i64),
             ("total_dedup_time_us", self.total_dedup_time_us, i64),
             ("total_discard_time_us", self.total_discard_time_us, i64),
@@ -202,7 +191,11 @@ impl SigVerifierStats {
                 self.total_discard_random_time_us,
                 i64
             ),
-            ("total_verify_time_us", self.total_verify_time_us, i64),
+            (
+                "total_verify_time_us",
+                self.total_verify_time_us.load(Ordering::Relaxed) as i64,
+                i64
+            ),
         );
     }
 }
@@ -213,9 +206,15 @@ impl SigVerifier for DisabledSigVerifier {
         &mut self,
         mut batches: Vec<PacketBatch>,
         _valid_packets: usize,
-    ) -> Result<usize, Self::SendType> {
+        total_valid_packets: Arc<AtomicUsize>,
+        total_verify_time_us: Arc<AtomicUsize>,
+    ) -> Result<(), Self::SendType> {
+        let mut verify_time = Measure::start("sigverify_batch_time");
         sigverify::ed25519_verify_disabled(&mut batches);
-        Ok(count_valid_packets(&batches))
+        verify_time.stop();
+        total_valid_packets.fetch_add(count_valid_packets(&batches), Ordering::Relaxed);
+        total_verify_time_us.fetch_add(verify_time.as_us() as usize, Ordering::Relaxed);
+        Ok(())
     }
 }
 
@@ -297,26 +296,23 @@ impl SigVerifyStage {
         let excess_fail = num_unique.saturating_sub(MAX_SIGVERIFY_BATCH);
         discard_time.stop();
 
-        let mut verify_time = Measure::start("sigverify_batch_time");
-        let num_valid_packets = verifier.verify_and_send_packets(batches, num_packets_to_verify)?;
-        verify_time.stop();
+        verifier.verify_and_send_packets(
+            batches,
+            num_packets_to_verify,
+            stats.total_valid_packets.clone(),
+            stats.total_verify_time_us.clone(),
+        )?;
 
         debug!(
-            "@{:?} verifier: done. batches: {} total verify time: {:?} verified: {} v/s {}",
+            "@{:?} verifier: done. batches: {} packets: {}",
             timing::timestamp(),
             batches_len,
-            verify_time.as_ms(),
-            num_packets,
-            (num_packets as f32 / verify_time.as_s())
+            num_packets
         );
 
         stats
             .recv_batches_us_hist
             .increment(recv_duration.as_micros() as u64)
-            .unwrap();
-        stats
-            .verify_batches_pp_us_hist
-            .increment(verify_time.as_us() / (num_packets as u64))
             .unwrap();
         stats
             .discard_packets_pp_us_hist
@@ -331,13 +327,11 @@ impl SigVerifyStage {
         stats.total_batches += batches_len;
         stats.total_packets += num_packets;
         stats.total_dedup += discard_or_dedup_fail;
-        stats.total_valid_packets += num_valid_packets;
         stats.total_discard_random_time_us += discard_random_time.as_us() as usize;
         stats.total_discard_random += num_discarded_randomly;
         stats.total_excess_fail += excess_fail;
         stats.total_dedup_time_us += dedup_time.as_us() as usize;
         stats.total_discard_time_us += discard_time.as_us() as usize;
-        stats.total_verify_time_us += verify_time.as_us() as usize;
 
         Ok(())
     }

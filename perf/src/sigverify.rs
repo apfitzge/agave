@@ -38,6 +38,10 @@ pub type TxOffset = PinnedVec<u32>;
 
 type TxOffsets = (TxOffset, TxOffset, TxOffset, TxOffset, Vec<Vec<u32>>);
 
+pub fn sigverify_thread_pool() -> &'static ThreadPool {
+    &PAR_THREAD_POOL
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct PacketOffsets {
     pub sig_len: u32,
