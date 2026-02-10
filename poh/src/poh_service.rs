@@ -7,7 +7,7 @@ use {
         record_channels::RecordReceiver,
     },
     log::*,
-    solana_clock::DEFAULT_HASHES_PER_SECOND,
+    solana_clock::{Slot, DEFAULT_HASHES_PER_SECOND},
     solana_entry::poh::Poh,
     solana_measure::measure::Measure,
     solana_poh_config::PohConfig,
@@ -593,9 +593,11 @@ impl PohService {
                     reset_bank,
                     next_leader_slot,
                 } => {
+                    poh_service_reset(reset_bank.slot(), next_leader_slot);
                     recorder.reset(reset_bank, next_leader_slot);
                 }
                 PohServiceMessage::SetBank { bank } => {
+                    poh_service_set_bank(bank.slot());
                     let bank_id = bank.bank_id();
                     let bank_max_tick_height = bank.max_tick_height();
                     recorder.set_bank(bank);
@@ -624,6 +626,18 @@ impl PohService {
     pub fn join(self) -> thread::Result<()> {
         self.tick_producer.join()
     }
+}
+
+#[inline(never)]
+#[unsafe(no_mangle)]
+fn poh_service_set_bank(slot: Slot) {
+    log::trace!("poh_service_set_bank {slot}");
+}
+
+#[inline(never)]
+#[unsafe(no_mangle)]
+fn poh_service_reset(slot: Slot, next_leader_slot: Option<(Slot, Slot)>) {
+    log::trace!("poh_service_reset slot: {slot} next_leader_slot: {next_leader_slot:?}");
 }
 
 #[cfg(test)]

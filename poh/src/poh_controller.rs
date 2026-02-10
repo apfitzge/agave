@@ -62,6 +62,7 @@ impl PohController {
         &mut self,
         bank: BankWithScheduler,
     ) -> Result<(), SendError<PohServiceMessage>> {
+        poh_controller_set_bank(bank.slot());
         self.send_message(PohServiceMessage::SetBank { bank })
     }
 
@@ -82,6 +83,7 @@ impl PohController {
         reset_bank: Arc<Bank>,
         next_leader_slot: Option<(Slot, Slot)>,
     ) -> Result<(), SendError<PohServiceMessage>> {
+        poh_controller_reset(reset_bank.slot(), next_leader_slot);
         self.send_message(PohServiceMessage::Reset {
             reset_bank,
             next_leader_slot,
@@ -148,4 +150,16 @@ impl Drop for PohServiceMessageGuard<'_> {
             panic!("PohServiceMessageGuard dropped without processing the message");
         }
     }
+}
+
+#[inline(never)]
+#[unsafe(no_mangle)]
+fn poh_controller_set_bank(slot: Slot) {
+    log::trace!("poh_controller_set_bank {slot}");
+}
+
+#[inline(never)]
+#[unsafe(no_mangle)]
+fn poh_controller_reset(slot: Slot, next_leader_slot: Option<(Slot, Slot)>) {
+    log::trace!("poh_controller_reset {slot} next_leader_slot: {next_leader_slot:?}");
 }
