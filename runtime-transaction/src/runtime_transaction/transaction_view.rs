@@ -147,6 +147,7 @@ impl<D: TransactionData> TransactionWithMeta for RuntimeTransaction<ResolvedTran
                 loaded_addresses: Cow::Owned(self.loaded_addresses().unwrap().clone()),
                 is_writable_account_cache,
             }),
+            VersionedMessage::V1(_message) => panic!("TXV1 NOT SUPPORTED YET"),
         };
 
         // SAFETY:
