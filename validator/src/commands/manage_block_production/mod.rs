@@ -2,7 +2,7 @@ use {
     crate::{
         admin_rpc_service,
         cli::DefaultArgs,
-        commands::{FromClapArgMatches, Result},
+        commands::{FromClapArgMatches, Result, warn_on_deprecated_block_production_method},
     },
     clap::{App, Arg, ArgMatches, SubCommand, value_t},
     solana_core::{
@@ -90,6 +90,9 @@ pub fn command(default_args: &DefaultArgs) -> App<'_, '_> {
 
 pub fn execute(matches: &ArgMatches, ledger_path: &Path) -> Result<()> {
     let manage_block_production_args = ManageBlockProductionArgs::from_clap_arg_match(matches)?;
+    warn_on_deprecated_block_production_method(
+        &manage_block_production_args.block_production_method,
+    );
 
     println!(
         "Respawning block-production threads with method: {}, transaction structure: {}, \

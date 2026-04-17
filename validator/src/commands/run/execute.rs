@@ -3,7 +3,9 @@ use {
         admin_rpc_service::{self, StakedNodesOverrides, load_staked_nodes_overrides},
         bootstrap,
         cli::{self},
-        commands::{FromClapArgMatches, run::args::RunArgs},
+        commands::{
+            FromClapArgMatches, run::args::RunArgs, warn_on_deprecated_block_production_method,
+        },
         ledger_lockfile, lock_ledger,
     },
     agave_snapshots::{
@@ -903,6 +905,8 @@ pub fn execute(
             i8
         ),
     };
+
+    warn_on_deprecated_block_production_method(&validator_config.block_production_method);
 
     let vote_account = pubkey_of(matches, "vote_account").unwrap_or_else(|| {
         if !validator_config.voting_disabled {

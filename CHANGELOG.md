@@ -22,6 +22,7 @@ Release channels have their own copy of this changelog:
 #### Deprecations
 * Using `minimal` for `--accounts-index-limit` is now deprecated.
 * `--account-shrink-path` is now deprecated.
+* Using `central-scheduler` for `--block-production-method` is now deprecated. Use `central-scheduler-greedy` instead.
 * `sbf-sdk.tar.bz2` is not included anymore in the Agave release tarball. The file will be made available in the new
   [`cargo-build-sbf`](https://github.com/anza-xyz/cargo-build-sbf) repository.
 #### Changes

@@ -14,7 +14,7 @@ pub mod set_public_address;
 pub mod staked_nodes_overrides;
 pub mod wait_for_restart_window;
 
-use thiserror::Error;
+use {log::warn, solana_core::validator::BlockProductionMethod, thiserror::Error};
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -41,9 +41,21 @@ pub trait FromClapArgMatches {
         Self: Sized;
 }
 
+pub fn warn_on_deprecated_block_production_method(block_production_method: &BlockProductionMethod) {
+    if matches!(
+        block_production_method,
+        BlockProductionMethod::CentralScheduler
+    ) {
+        warn!(
+            "`central-scheduler` for `--block-production-method` is deprecated; using \
+             `central-scheduler-greedy` instead."
+        );
+    }
+}
+
 #[cfg(test)]
 pub mod tests {
-    use std::fmt::Debug;
+    use {super::*, std::fmt::Debug};
 
     pub fn verify_args_struct_by_command<T>(app: clap::App, vec: Vec<&str>, expected_arg: T)
     where
