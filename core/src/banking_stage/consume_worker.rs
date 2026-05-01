@@ -1049,6 +1049,10 @@ pub(crate) mod external {
 
         fn validate_message_flags(flags: u16) -> bool {
             if flags & pack_message_flags::EXECUTE != 0 {
+                if flags & execution_flags::REPLAY != 0 {
+                    return false;
+                }
+
                 const ALLOWED_EXECUTE_FLAGS: u16 = pack_message_flags::EXECUTE
                     | execution_flags::DROP_ON_FAILURE
                     | execution_flags::ALL_OR_NOTHING;
@@ -1415,6 +1419,9 @@ pub(crate) mod external {
             // Invalid execute flag
             assert!(!ExternalWorker::validate_message_flags(
                 pack_message_flags::EXECUTE | (1 << 15)
+            ));
+            assert!(!ExternalWorker::validate_message_flags(
+                pack_message_flags::EXECUTE | execution_flags::REPLAY
             ));
 
             // Check flags

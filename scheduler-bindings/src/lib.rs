@@ -35,14 +35,19 @@
 //! - [`TpuToPackMessage`] are sent from `tpu_to_pack` queue to the
 //!   external scheduler process. This passes in tpu transactions to be scheduled,
 //!   and optionally vote transactions.
+//! - [`ReplayToPackMessage`] are sent from replay to the external scheduler
+//!   process. This passes bank lifecycle events, entry headers, and transactions.
 //! - [`ProgressMessage`] are sent from `progress_tracker` queue to the
 //!   external scheduler process. This passes information about leader status
 //!   and slot progress to the external scheduler process.
+//! - [`ReplayBlockStatusMessage`] are sent from the external scheduler process
+//!   back to replay.
 //! - [`PackToWorkerMessage`] are sent from the external scheduler process
 //!   to worker threads within agave. This passes a batch of transactions
 //!   to be processed by the worker threads. This processing can also involve
 //!   resolving the transactions' addresses, or similar operations beyond
-//!   execution.
+//!   execution. Replay ingress messages are consumed by the scheduler and must
+//!   not be sent directly to workers.
 //! - [`WorkerToPackMessage`] are sent from worker threads within agave
 //!   back to the external scheduler process. This passes back the results
 //!   of processing the transactions.
@@ -154,6 +159,172 @@ pub mod tpu_message_flags {
     pub const FORWARDED: u8 = 1 << 1;
     /// The transaction was sent from a staked node.
     pub const FROM_STAKED_NODE: u8 = 1 << 2;
+}
+
+/// Header for an entry sent from replay to the external scheduler.
+///
+/// This header is sent as a [`ReplayToPackMessage`] with
+/// [`replay_to_pack_message_types::ENTRY_HEADER`], followed by exactly
+/// [`Self::num_transactions`] [`replay_to_pack_message_types::TRANSACTION`]
+/// messages. If `num_transactions` is zero, the header represents a tick entry
+/// and is not followed by any transaction messages. The header carries the
+/// bank slot for the entry; the immediately following transaction messages
+/// belong to the same slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct EntryHeader {
+    /// Bank slot for this entry.
+    pub slot: u64,
+    /// The number of hashes since the previous entry ID.
+    pub num_hashes: u64,
+    /// The SHA-256 hash `num_hashes` after the previous entry ID.
+    pub hash: [u8; 32],
+    /// Number of transaction messages that follow this header.
+    pub num_transactions: u32,
+}
+
+/// Bank lifecycle payload for [`ReplayToPackMessage`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct ReplayBankMessage {
+    /// See [`replay_bank_message_kinds`] for details.
+    pub kind: u8,
+    /// Bank slot.
+    pub slot: u64,
+    /// Starting hash for verifying the slot's entry chain when `kind` is
+    /// [`replay_bank_message_kinds::BEGIN`].
+    ///
+    /// This is typically the bank's initial last blockhash. It is ignored for
+    /// other message kinds.
+    pub last_entry_hash: [u8; 32],
+}
+
+pub mod replay_bank_message_kinds {
+    /// Begin replay scheduling for this bank.
+    pub const BEGIN: u8 = 0;
+    /// Abort replay scheduling for this bank.
+    pub const ABORT: u8 = 1;
+}
+
+/// Payload for [`ReplayToPackMessage`].
+///
+/// The active field is selected by [`ReplayToPackMessage::tag`].
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub union ReplayToPackMessagePayload {
+    /// Active when [`ReplayToPackMessage::tag`] is
+    /// [`replay_to_pack_message_types::BANK`].
+    pub bank: ReplayBankMessage,
+    /// Active when [`ReplayToPackMessage::tag`] is
+    /// [`replay_to_pack_message_types::ENTRY_HEADER`].
+    pub entry_header: EntryHeader,
+    /// Active when [`ReplayToPackMessage::tag`] is
+    /// [`replay_to_pack_message_types::TRANSACTION`].
+    pub transaction: SharableTransactionRegion,
+}
+
+/// Message: [Replay -> Pack]
+/// Replay passes bank lifecycle events, entry headers, and transactions to the
+/// external scheduler.
+///
+/// This is a tagged union. Transactions do not carry their entry header.
+/// Instead, the protocol is one [`EntryHeader`] message followed by exactly
+/// `EntryHeader::num_transactions` transaction messages. Bank lifecycle
+/// messages frame which bank subsequent replay ingress belongs to.
+///
+/// Transaction messages transfer ownership of the transaction memory to the
+/// external scheduler, as with [`TpuToPackMessage`].
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct ReplayToPackMessage {
+    /// Tag indicating the active union field.
+    /// See [`replay_to_pack_message_types`] for details.
+    pub tag: u8,
+    /// The tagged payload.
+    pub payload: ReplayToPackMessagePayload,
+}
+
+pub mod replay_to_pack_message_types {
+    /// [`crate::ReplayToPackMessage::payload`] contains a
+    /// [`crate::ReplayBankMessage`].
+    pub const BANK: u8 = 0;
+    /// [`crate::ReplayToPackMessage::payload`] contains an
+    /// [`crate::EntryHeader`].
+    pub const ENTRY_HEADER: u8 = 1;
+    /// [`crate::ReplayToPackMessage::payload`] contains a
+    /// [`crate::SharableTransactionRegion`].
+    pub const TRANSACTION: u8 = 2;
+}
+
+/// Message: [Pack -> Replay]
+/// External scheduler reports replay block status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct ReplayBlockStatusMessage {
+    /// Bank slot for the replayed block.
+    pub slot: u64,
+    /// See [`replay_block_status_codes`] for details.
+    pub status: u8,
+    /// See [`replay_block_status_reasons`] for details.
+    pub reason: u16,
+}
+
+pub mod replay_block_status_codes {
+    /// The block was replayed successfully.
+    pub const SUCCESS: u8 = 0;
+    /// The block failed replay.
+    pub const FAILED: u8 = 1;
+    /// The scheduler is done with an aborted bank.
+    ///
+    /// [`crate::ReplayBlockStatusMessage::reason`] should be
+    /// [`crate::replay_block_status_reasons::NONE`].
+    pub const ABORTED: u8 = 2;
+}
+
+pub mod replay_block_status_reasons {
+    /// No failure reason. Used with [`super::replay_block_status_codes::SUCCESS`]
+    /// and [`super::replay_block_status_codes::ABORTED`].
+    pub const NONE: u16 = 0;
+
+    /// Block did not have enough ticks and no shred marked it full.
+    pub const INCOMPLETE: u16 = 1;
+    /// Block entries hashes were invalid.
+    pub const INVALID_ENTRY_HASH: u16 = 2;
+    /// Block did not end in a valid last tick.
+    pub const INVALID_LAST_TICK: u16 = 3;
+    /// Block had too few ticks.
+    pub const TOO_FEW_TICKS: u16 = 4;
+    /// Block had too many ticks.
+    pub const TOO_MANY_TICKS: u16 = 5;
+    /// Block had an invalid tick hash count.
+    pub const INVALID_TICK_HASH_COUNT: u16 = 6;
+    /// Block had trailing transaction entries.
+    pub const TRAILING_ENTRY: u16 = 7;
+    /// Block was a duplicate block.
+    pub const DUPLICATE_BLOCK: u16 = 8;
+
+    /// Failed to load entries from blockstore.
+    pub const FAILED_TO_LOAD_ENTRIES: u16 = 9;
+    /// Failed to load blockstore metadata.
+    pub const FAILED_TO_LOAD_META: u16 = 10;
+    /// Failed to replay bank 0.
+    pub const FAILED_TO_REPLAY_BANK0: u16 = 11;
+    /// Invalid transaction while replaying the block.
+    pub const INVALID_TRANSACTION: u16 = 12;
+    /// No valid forks were found.
+    pub const NO_VALID_FORKS_FOUND: u16 = 13;
+    /// Invalid hard fork slot.
+    pub const INVALID_HARD_FORK: u16 = 14;
+    /// Root bank capitalization mismatched.
+    pub const ROOT_BANK_WITH_MISMATCHED_CAPITALIZATION: u16 = 15;
+    /// User transactions were found in a vote-only bank.
+    pub const USER_TRANSACTIONS_IN_VOTE_ONLY_BANK: u16 = 16;
+    /// Parent-child chained block ID check failed.
+    pub const CHAINED_BLOCK_ID_FAILURE: u16 = 17;
+    /// Block component processor failed.
+    pub const BLOCK_COMPONENT_PROCESSOR: u16 = 18;
+    /// Bank hash did not match the expected hash.
+    pub const BANK_HASH_MISMATCH: u16 = 19;
 }
 
 /// The node is not currently in a leader slot.
@@ -269,6 +440,13 @@ pub mod pack_message_flags {
         /// to be committed. If both flags are set then any failing transaction will cause all
         /// transactions to be aborted.
         pub const ALL_OR_NOTHING: u16 = 1 << 2;
+        /// Execute this batch as replay work.
+        ///
+        /// Replay uses the existing [`crate::PackToWorkerMessage`] path to reuse
+        /// external consume workers. Workers receive normal execution messages
+        /// with this flag set; workers must not receive
+        /// [`crate::ReplayToPackMessage`] values.
+        pub const REPLAY: u16 = 1 << 3;
     }
 
     pub mod check_flags {
