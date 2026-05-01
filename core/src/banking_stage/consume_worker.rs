@@ -412,13 +412,7 @@ pub(crate) mod external {
                 Self::translate_transaction_batch(&batch, bank);
 
             // Enforce all or nothing on translation_results.
-            let execution_flags = ExecutionFlags {
-                drop_on_failure: message.flags & execution_flags::DROP_ON_FAILURE != 0,
-                all_or_nothing: message.flags & execution_flags::ALL_OR_NOTHING != 0,
-                skip_account_locks: false,
-                skip_cost_tracking: false,
-                skip_poh_recording: false,
-            };
+            let execution_flags = Self::execution_flags_from_message_flags(message.flags);
             if execution_flags.all_or_nothing && translation_results.len() != transactions.len() {
                 self.send_execution_response(
                     message,
@@ -1049,13 +1043,10 @@ pub(crate) mod external {
 
         fn validate_message_flags(flags: u16) -> bool {
             if flags & pack_message_flags::EXECUTE != 0 {
-                if flags & execution_flags::REPLAY != 0 {
-                    return false;
-                }
-
                 const ALLOWED_EXECUTE_FLAGS: u16 = pack_message_flags::EXECUTE
                     | execution_flags::DROP_ON_FAILURE
-                    | execution_flags::ALL_OR_NOTHING;
+                    | execution_flags::ALL_OR_NOTHING
+                    | execution_flags::REPLAY;
 
                 flags & !ALLOWED_EXECUTE_FLAGS == 0
             } else {
@@ -1065,6 +1056,17 @@ pub(crate) mod external {
                     | check_flags::LOAD_ADDRESS_LOOKUP_TABLES;
 
                 flags != pack_message_flags::CHECK && flags & !ALLOWED_CHECK_BITS == 0
+            }
+        }
+
+        fn execution_flags_from_message_flags(flags: u16) -> ExecutionFlags {
+            let replay = flags & execution_flags::REPLAY != 0;
+            ExecutionFlags {
+                drop_on_failure: flags & execution_flags::DROP_ON_FAILURE != 0,
+                all_or_nothing: flags & execution_flags::ALL_OR_NOTHING != 0,
+                skip_account_locks: replay,
+                skip_cost_tracking: replay,
+                skip_poh_recording: replay,
             }
         }
 
@@ -1416,12 +1418,18 @@ pub(crate) mod external {
                     | execution_flags::DROP_ON_FAILURE
                     | execution_flags::ALL_OR_NOTHING
             ));
+            assert!(ExternalWorker::validate_message_flags(
+                pack_message_flags::EXECUTE | execution_flags::REPLAY
+            ));
+            assert!(ExternalWorker::validate_message_flags(
+                pack_message_flags::EXECUTE
+                    | execution_flags::DROP_ON_FAILURE
+                    | execution_flags::ALL_OR_NOTHING
+                    | execution_flags::REPLAY
+            ));
             // Invalid execute flag
             assert!(!ExternalWorker::validate_message_flags(
                 pack_message_flags::EXECUTE | (1 << 15)
-            ));
-            assert!(!ExternalWorker::validate_message_flags(
-                pack_message_flags::EXECUTE | execution_flags::REPLAY
             ));
 
             // Check flags
@@ -1432,6 +1440,29 @@ pub(crate) mod external {
             assert!(!ExternalWorker::validate_message_flags(
                 pack_message_flags::CHECK
             ))
+        }
+
+        #[test]
+        fn test_execution_flags_from_message_flags() {
+            let flags =
+                ExternalWorker::execution_flags_from_message_flags(pack_message_flags::EXECUTE);
+            assert!(!flags.drop_on_failure);
+            assert!(!flags.all_or_nothing);
+            assert!(!flags.skip_account_locks);
+            assert!(!flags.skip_cost_tracking);
+            assert!(!flags.skip_poh_recording);
+
+            let flags = ExternalWorker::execution_flags_from_message_flags(
+                pack_message_flags::EXECUTE
+                    | execution_flags::DROP_ON_FAILURE
+                    | execution_flags::ALL_OR_NOTHING
+                    | execution_flags::REPLAY,
+            );
+            assert!(flags.drop_on_failure);
+            assert!(flags.all_or_nothing);
+            assert!(flags.skip_account_locks);
+            assert!(flags.skip_cost_tracking);
+            assert!(flags.skip_poh_recording);
         }
 
         #[test]
@@ -2107,6 +2138,45 @@ pub(crate) mod external {
             assert!(responses[0].cost_units > 0);
             assert!(responses[0].fee_payer_balance > 0);
             assert_eq!(test_frame.bank.get_balance(&recipient), 1);
+
+            test_frame.free_batch(batch);
+        }
+
+        #[test]
+        fn test_run_execute_replay_skips_poh_and_cost_tracking() {
+            let mut test_frame = setup_external_test_frame();
+            test_frame.set_active_bank();
+
+            let recipient = Pubkey::new_unique();
+            let batch = test_frame.allocate_batch(&[wincode::serialize(&transfer(
+                &test_frame.mint_keypair,
+                &recipient,
+                1,
+                test_frame.bank.confirmed_last_blockhash(),
+            ))
+            .unwrap()]);
+
+            test_frame.send_message(PackToWorkerMessage {
+                flags: pack_message_flags::EXECUTE | execution_flags::REPLAY,
+                max_working_slot: test_frame.bank.slot(),
+                batch: batch.region,
+            });
+            test_frame.iterate().unwrap();
+            let response = test_frame.recv_response();
+            assert_eq!(response.processed_code, processed_codes::PROCESSED);
+            let responses = test_frame.execution_responses(&response.responses);
+            assert_eq!(responses.len(), 1);
+            assert_eq!(responses[0].execution_slot, test_frame.bank.slot());
+            assert_eq!(responses[0].not_included_reason, not_included_reasons::NONE);
+            assert_eq!(test_frame.bank.get_balance(&recipient), 1);
+            assert_eq!(
+                test_frame
+                    .bank
+                    .read_cost_tracker()
+                    .unwrap()
+                    .transaction_count(),
+                0
+            );
 
             test_frame.free_batch(batch);
         }

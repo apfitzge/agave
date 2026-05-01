@@ -54,18 +54,15 @@ pub struct ExecutionFlags {
     /// failing transaction will cause all transactions to be aborted.
     pub all_or_nothing: bool,
 
-    /// NOTE: Not currently exposed to scheduler-bindings.
     /// Use to skip locking accounts - i.e. rely on the scheduler to have
     /// scheduled transactions with no overlapping accounts.
     pub skip_account_locks: bool,
 
-    /// NOTE: Not currently exposed to scheduler-bindings.
     /// Used to skip cost-tracking - i.e. rely on the scheduler to have
     /// scheduled transactions with total cost within the block limits,
     /// or verifying it after execution.
     pub skip_cost_tracking: bool,
 
-    /// NOTE: Not currently exposed to scheduler-bindings.
     /// Used to skip recording transactions into PoH.
     /// This is useful for replay where we simply commit the transactions.
     pub skip_poh_recording: bool,
