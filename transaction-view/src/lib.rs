@@ -6,6 +6,7 @@ pub mod bytes;
 mod bytes;
 
 mod address_table_lookup_frame;
+pub mod entry_header_frame;
 mod instructions_frame;
 mod message_header_frame;
 pub mod resolved_transaction_view;

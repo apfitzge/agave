@@ -29,6 +29,7 @@ solana-transaction = { workspace = true }
 agave-transaction-view = { path = ".", features = ["agave-unstable-api", "dev-context-only-utils"] }
 bincode = { workspace = true }
 criterion = { workspace = true }
+solana-entry = { workspace = true }
 solana-instruction = { workspace = true }
 solana-keypair = { workspace = true }
 solana-message = { workspace = true, features = ["serde"] }
