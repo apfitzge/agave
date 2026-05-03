@@ -190,8 +190,8 @@ pub(crate) mod external {
             },
         },
         agave_scheduler_bindings::{
-            MAX_TRANSACTIONS_PER_MESSAGE, PackToWorkerMessage, SharablePubkeys,
-            TransactionResponseRegion, WorkerToPackMessage,
+            MAX_TRANSACTIONS_PER_MESSAGE, NO_REPLAY_BANK_SLOT, PackToWorkerMessage,
+            SharablePubkeys, TransactionResponseRegion, WorkerToPackMessage,
             pack_message_flags::{self, check_flags, execution_flags},
             processed_codes,
             worker_message_types::{
@@ -215,11 +215,11 @@ pub(crate) mod external {
         solana_pubkey::Pubkey,
         solana_runtime::{
             bank::Bank,
-            bank_forks::{BankPair, SharableBanks},
+            bank_forks::{BankForks, BankPair, SharableBanks},
         },
         solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
         solana_transaction::TransactionError,
-        std::ptr::NonNull,
+        std::{ptr::NonNull, sync::RwLock},
     };
 
     #[derive(Debug, Error)]
@@ -237,6 +237,7 @@ pub(crate) mod external {
         allocator: rts_alloc::Allocator,
 
         shared_leader_state: SharedLeaderState,
+        bank_forks: Arc<RwLock<BankForks>>,
         sharable_banks: SharableBanks,
         metrics: Arc<ConsumeWorkerMetrics>,
     }
@@ -249,6 +250,15 @@ pub(crate) mod external {
         Idle,
     }
 
+    enum ExecutionBank {
+        Available(Arc<Bank>),
+        Unavailable {
+            execution_slot: Slot,
+            should_drain_executes: bool,
+        },
+        MaxWorkingSlotExceeded,
+    }
+
     impl ExternalWorker {
         pub fn new(
             id: u32,
@@ -257,14 +267,16 @@ pub(crate) mod external {
             sender: shaq::spsc::Producer<WorkerToPackMessage>,
             allocator: rts_alloc::Allocator,
             shared_leader_state: SharedLeaderState,
-            sharable_banks: SharableBanks,
+            bank_forks: Arc<RwLock<BankForks>>,
         ) -> Self {
+            let sharable_banks = bank_forks.read().unwrap().sharable_banks();
             Self {
                 exit,
                 consumer,
                 sender,
                 allocator,
                 shared_leader_state,
+                bank_forks,
                 sharable_banks,
                 metrics: Arc::new(ConsumeWorkerMetrics::new(id)),
             }
@@ -368,37 +380,29 @@ pub(crate) mod external {
             message: &PackToWorkerMessage,
             should_drain_executes: bool,
         ) -> Result<bool, ExternalConsumeWorkerError> {
-            if should_drain_executes {
-                return self
-                    .return_not_included_with_reason(
-                        message,
-                        not_included_reasons::BANK_NOT_AVAILABLE,
-                        0,
-                    )
-                    .map(|()| true);
-            }
-
-            let Some(leader_state) = active_leader_state(&self.shared_leader_state) else {
-                return self
-                    .return_not_included_with_reason(
-                        message,
-                        not_included_reasons::BANK_NOT_AVAILABLE,
-                        0,
-                    )
-                    .map(|()| true);
+            let bank = match self.bank_for_execute(message, should_drain_executes) {
+                ExecutionBank::Available(bank) => bank,
+                ExecutionBank::Unavailable {
+                    execution_slot,
+                    should_drain_executes,
+                } => {
+                    return self
+                        .return_not_included_with_reason(
+                            message,
+                            not_included_reasons::BANK_NOT_AVAILABLE,
+                            execution_slot,
+                        )
+                        .map(|()| should_drain_executes);
+                }
+                ExecutionBank::MaxWorkingSlotExceeded => {
+                    return self
+                        .return_unprocessed_message(
+                            message,
+                            agave_scheduler_bindings::processed_codes::MAX_WORKING_SLOT_EXCEEDED,
+                        )
+                        .map(|()| false);
+                }
             };
-
-            let bank = leader_state
-                .working_bank()
-                .expect("active_leader_state should only return an active bank");
-            if bank.slot() > message.max_working_slot {
-                return self
-                    .return_unprocessed_message(
-                        message,
-                        agave_scheduler_bindings::processed_codes::MAX_WORKING_SLOT_EXCEEDED,
-                    )
-                    .map(|()| false);
-            }
 
             // SAFETY: Assumption that external scheduler does not pass messages with batch regions
             //         not pointing to valid regions in the allocator.
@@ -409,7 +413,7 @@ pub(crate) mod external {
                 )
             };
             let (translation_results, transactions, max_ages) =
-                Self::translate_transaction_batch(&batch, bank);
+                Self::translate_transaction_batch(&batch, &bank);
 
             // Enforce all or nothing on translation_results.
             let execution_flags = Self::execution_flags_from_message_flags(message.flags);
@@ -423,7 +427,7 @@ pub(crate) mod external {
             }
 
             let output = self.consumer.process_and_record_aged_transactions(
-                bank,
+                &bank,
                 &transactions,
                 &max_ages,
                 execution_flags,
@@ -453,11 +457,56 @@ pub(crate) mod external {
                     &translation_results,
                     &transactions,
                     &commit_results,
-                    bank,
+                    &bank,
                 ),
             )?;
 
             Ok(false)
+        }
+
+        fn bank_for_execute(
+            &self,
+            message: &PackToWorkerMessage,
+            should_drain_executes: bool,
+        ) -> ExecutionBank {
+            if Self::is_replay_message(message) {
+                return self
+                    .bank_forks
+                    .read()
+                    .unwrap()
+                    .get(message.max_working_slot)
+                    .map_or(
+                        ExecutionBank::Unavailable {
+                            execution_slot: 0,
+                            should_drain_executes: false,
+                        },
+                        ExecutionBank::Available,
+                    );
+            }
+
+            if should_drain_executes {
+                return ExecutionBank::Unavailable {
+                    execution_slot: 0,
+                    should_drain_executes: true,
+                };
+            }
+
+            let Some(leader_state) = active_leader_state(&self.shared_leader_state) else {
+                return ExecutionBank::Unavailable {
+                    execution_slot: 0,
+                    should_drain_executes: true,
+                };
+            };
+
+            let bank = leader_state
+                .working_bank()
+                .expect("active_leader_state should only return an active bank")
+                .clone();
+            if bank.slot() > message.max_working_slot {
+                return ExecutionBank::MaxWorkingSlotExceeded;
+            }
+
+            ExecutionBank::Available(bank)
         }
 
         fn check_batch(
@@ -1039,14 +1088,19 @@ pub(crate) mod external {
             message.batch.num_transactions > 0
                 && usize::from(message.batch.num_transactions) <= MAX_TRANSACTIONS_PER_MESSAGE
                 && Self::validate_message_flags(message.flags)
+                && (!Self::is_replay_message(message)
+                    || message.max_working_slot != NO_REPLAY_BANK_SLOT)
         }
 
         fn validate_message_flags(flags: u16) -> bool {
             if flags & pack_message_flags::EXECUTE != 0 {
+                if flags & execution_flags::REPLAY != 0 {
+                    return flags == pack_message_flags::EXECUTE | execution_flags::REPLAY;
+                }
+
                 const ALLOWED_EXECUTE_FLAGS: u16 = pack_message_flags::EXECUTE
                     | execution_flags::DROP_ON_FAILURE
-                    | execution_flags::ALL_OR_NOTHING
-                    | execution_flags::REPLAY;
+                    | execution_flags::ALL_OR_NOTHING;
 
                 flags & !ALLOWED_EXECUTE_FLAGS == 0
             } else {
@@ -1059,14 +1113,39 @@ pub(crate) mod external {
             }
         }
 
+        fn is_replay_message(message: &PackToWorkerMessage) -> bool {
+            message.flags & pack_message_flags::EXECUTE != 0
+                && message.flags & execution_flags::REPLAY != 0
+        }
+
         fn execution_flags_from_message_flags(flags: u16) -> ExecutionFlags {
-            let replay = flags & execution_flags::REPLAY != 0;
+            let replay =
+                flags & pack_message_flags::EXECUTE != 0 && flags & execution_flags::REPLAY != 0;
+            if replay {
+                return ExecutionFlags {
+                    drop_on_failure: false,
+                    // Replay must commit every transaction in the batch. If any
+                    // transaction cannot be committed, this lets execution stop
+                    // early instead of continuing through the rest of the batch.
+                    all_or_nothing: true,
+                    // Replay does not need backup account locks because no
+                    // other worker threads are locking the replay bank.
+                    skip_account_locks: true,
+                    // The scheduler is responsible for cost tracking during
+                    // replay.
+                    skip_cost_tracking: true,
+                    // PoH recording is leader-only, so replay execution skips
+                    // it.
+                    skip_poh_recording: true,
+                };
+            }
+
             ExecutionFlags {
                 drop_on_failure: flags & execution_flags::DROP_ON_FAILURE != 0,
                 all_or_nothing: flags & execution_flags::ALL_OR_NOTHING != 0,
-                skip_account_locks: replay,
-                skip_cost_tracking: replay,
-                skip_poh_recording: replay,
+                skip_account_locks: false,
+                skip_cost_tracking: false,
+                skip_poh_recording: false,
             }
         }
 
@@ -1354,7 +1433,7 @@ pub(crate) mod external {
                 agave_worker.worker_to_pack,
                 agave_worker.allocator,
                 shared_leader_state.clone(),
-                bank_forks.read().unwrap().sharable_banks(),
+                bank_forks.clone(),
             );
 
             ExternalTestFrame {
@@ -1399,6 +1478,13 @@ pub(crate) mod external {
 
             message.flags = pack_message_flags::EXECUTE;
             assert!(ExternalWorker::validate_message(&message));
+
+            message.flags = pack_message_flags::EXECUTE | execution_flags::REPLAY;
+            message.max_working_slot = NO_REPLAY_BANK_SLOT;
+            assert!(!ExternalWorker::validate_message(&message));
+
+            message.max_working_slot = 0;
+            assert!(ExternalWorker::validate_message(&message));
         }
 
         #[test]
@@ -1421,7 +1507,7 @@ pub(crate) mod external {
             assert!(ExternalWorker::validate_message_flags(
                 pack_message_flags::EXECUTE | execution_flags::REPLAY
             ));
-            assert!(ExternalWorker::validate_message_flags(
+            assert!(!ExternalWorker::validate_message_flags(
                 pack_message_flags::EXECUTE
                     | execution_flags::DROP_ON_FAILURE
                     | execution_flags::ALL_OR_NOTHING
@@ -1453,12 +1539,9 @@ pub(crate) mod external {
             assert!(!flags.skip_poh_recording);
 
             let flags = ExternalWorker::execution_flags_from_message_flags(
-                pack_message_flags::EXECUTE
-                    | execution_flags::DROP_ON_FAILURE
-                    | execution_flags::ALL_OR_NOTHING
-                    | execution_flags::REPLAY,
+                pack_message_flags::EXECUTE | execution_flags::REPLAY,
             );
-            assert!(flags.drop_on_failure);
+            assert!(!flags.drop_on_failure);
             assert!(flags.all_or_nothing);
             assert!(flags.skip_account_locks);
             assert!(flags.skip_cost_tracking);
@@ -2145,7 +2228,6 @@ pub(crate) mod external {
         #[test]
         fn test_run_execute_replay_skips_poh_and_cost_tracking() {
             let mut test_frame = setup_external_test_frame();
-            test_frame.set_active_bank();
 
             let recipient = Pubkey::new_unique();
             let batch = test_frame.allocate_batch(&[wincode::serialize(&transfer(
@@ -2177,6 +2259,33 @@ pub(crate) mod external {
                     .transaction_count(),
                 0
             );
+
+            test_frame.free_batch(batch);
+        }
+
+        #[test]
+        fn test_run_execute_replay_missing_bank() {
+            let mut test_frame = setup_external_test_frame();
+
+            let batch = test_frame.allocate_batch(&[test_serialized_transaction(
+                test_frame.bank.confirmed_last_blockhash(),
+            )]);
+
+            test_frame.send_message(PackToWorkerMessage {
+                flags: pack_message_flags::EXECUTE | execution_flags::REPLAY,
+                max_working_slot: test_frame.bank.slot() + 1,
+                batch: batch.region,
+            });
+            test_frame.iterate().unwrap();
+            let response = test_frame.recv_response();
+            assert_eq!(response.processed_code, processed_codes::PROCESSED);
+            let responses = test_frame.execution_responses(&response.responses);
+            assert_eq!(responses.len(), 1);
+            assert_eq!(
+                responses[0].not_included_reason,
+                not_included_reasons::BANK_NOT_AVAILABLE
+            );
+            assert_eq!(responses[0].execution_slot, 0);
 
             test_frame.free_batch(batch);
         }

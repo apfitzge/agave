@@ -389,6 +389,9 @@ pub struct ProgressMessage {
 // transactions sent. This is a conservative bound.
 pub const MAX_TRANSACTIONS_PER_MESSAGE: usize = 64;
 
+/// Sentinel used when a worker message is not a replay execution message.
+pub const NO_REPLAY_BANK_SLOT: u64 = u64::MAX;
+
 /// Message: [Pack -> Worker]
 /// External pack processe passes transactions to worker threads within agave.
 ///
@@ -404,6 +407,9 @@ pub struct PackToWorkerMessage {
     /// for. For execution, this will check the leader bank if it exists.
     /// If the working bank is ahead of the slot, the return message will
     /// be set with [`NOT_PROCESSED`].
+    ///
+    /// For replay execution messages, this is the exact bank slot to execute
+    /// against and must not be [`NO_REPLAY_BANK_SLOT`].
     pub max_working_slot: u64,
     /// Offset and number of transactions in the batch.
     /// See [`SharableTransactionBatchRegion`] for details.
