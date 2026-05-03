@@ -57,6 +57,17 @@ impl<D: TransactionData> TransactionView<true, D> {
         let unsanitized_view = TransactionView::try_new_unsanitized(data)?;
         unsanitized_view.sanitize(enable_instruction_accounts_limit)
     }
+
+    /// Verifies the transaction signatures against the serialized message data.
+    pub fn verify_signatures(&self) -> bool {
+        let signatures = self.signatures();
+        let signer_pubkeys =
+            &self.static_account_keys()[..usize::from(self.num_required_signatures())];
+        signatures
+            .iter()
+            .zip(signer_pubkeys.iter())
+            .all(|(signature, pubkey)| signature.verify(pubkey.as_ref(), self.message_data()))
+    }
 }
 
 impl<const SANITIZED: bool, D: TransactionData> TransactionView<SANITIZED, D> {
@@ -372,11 +383,13 @@ impl<D: TransactionData> SVMStaticMessage for &TransactionView<true, D> {
 mod tests {
     use {
         super::*,
+        solana_keypair::Keypair,
         solana_message::{
             Message, MessageHeader, VersionedMessage, compiled_instruction::CompiledInstruction, v1,
         },
         solana_pubkey::Pubkey,
         solana_signature::Signature,
+        solana_signer::Signer,
         solana_system_interface::instruction as system_instruction,
         solana_transaction::versioned::VersionedTransaction,
     };
@@ -512,5 +525,37 @@ mod tests {
         assert_eq!(instructions[0].program_id_index, 1);
         assert_eq!(instructions[0].accounts, &[0]);
         assert_eq!(instructions[0].data, &[1, 2, 3, 4]);
+    }
+
+    fn signed_transfer() -> VersionedTransaction {
+        let payer = Keypair::new();
+        VersionedTransaction::try_new(
+            VersionedMessage::Legacy(Message::new(
+                &[system_instruction::transfer(
+                    &payer.pubkey(),
+                    &Pubkey::new_unique(),
+                    1,
+                )],
+                Some(&payer.pubkey()),
+            )),
+            &[&payer],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_verify_signatures() {
+        let tx = signed_transfer();
+        let bytes = wincode::serialize(&tx).unwrap();
+        let view = SanitizedTransactionView::try_new_sanitized(bytes.as_ref(), true).unwrap();
+        assert!(view.verify_signatures());
+
+        let mut bytes = bytes;
+        // Legacy transactions begin with the compact signature count followed
+        // by signature bytes. Flipping a signature byte keeps the transaction
+        // parseable but makes verification fail.
+        bytes[1] ^= 1;
+        let view = SanitizedTransactionView::try_new_sanitized(bytes.as_ref(), true).unwrap();
+        assert!(!view.verify_signatures());
     }
 }
