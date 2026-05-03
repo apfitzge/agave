@@ -317,6 +317,7 @@ dependencies = [
  "agave-transaction-view",
  "bincode",
  "criterion",
+ "solana-entry",
  "solana-hash 4.3.0",
  "solana-instruction",
  "solana-keypair",
