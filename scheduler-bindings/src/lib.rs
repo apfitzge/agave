@@ -389,7 +389,7 @@ pub struct ProgressMessage {
 // transactions sent. This is a conservative bound.
 pub const MAX_TRANSACTIONS_PER_MESSAGE: usize = 64;
 
-/// Sentinel used when a worker message is not a replay execution message.
+/// Sentinel used when a worker message is not a replay execution or check message.
 pub const NO_REPLAY_BANK_SLOT: u64 = u64::MAX;
 
 /// Message: [Pack -> Worker]
@@ -404,12 +404,13 @@ pub struct PackToWorkerMessage {
     /// See [`pack_message_flags`] for details.
     pub flags: u16,
     /// Maximum working bank slot that this message will be processed
-    /// for. For execution, this will check the leader bank if it exists.
+    /// for. For leader-side checks and execution, this will check the
+    /// leader bank if it exists.
     /// If the working bank is ahead of the slot, the return message will
     /// be set with [`NOT_PROCESSED`].
     ///
-    /// For replay execution messages, this is the exact bank slot to execute
-    /// against and must not be [`NO_REPLAY_BANK_SLOT`].
+    /// For replay check and execution messages, this is the exact bank slot
+    /// to process against and must not be [`NO_REPLAY_BANK_SLOT`].
     pub max_working_slot: u64,
     /// Offset and number of transactions in the batch.
     /// See [`SharableTransactionBatchRegion`] for details.
@@ -465,6 +466,13 @@ pub mod pack_message_flags {
 
         /// Transactions should have ATL pubkeys resolved and returned.
         pub const LOAD_ADDRESS_LOOKUP_TABLES: u16 = 1 << 3;
+
+        /// Check this batch as replay work.
+        ///
+        /// Replay checks use the existing [`crate::PackToWorkerMessage`] path
+        /// to reuse external consume workers. The message's `max_working_slot`
+        /// is the exact replay bank slot to check against.
+        pub const REPLAY: u16 = 1 << 4;
     }
 }
 
@@ -476,6 +484,8 @@ pub mod processed_codes {
     /// The message was not processed because `max_working_slot`
     /// was exceeded.
     pub const MAX_WORKING_SLOT_EXCEEDED: u8 = 2;
+    /// The message was not processed because the requested bank was not available.
+    pub const BANK_NOT_AVAILABLE: u8 = 3;
 }
 
 /// Message: [Worker -> Pack]

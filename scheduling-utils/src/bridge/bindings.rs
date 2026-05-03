@@ -448,7 +448,10 @@ where
                         .cast()
                 })
             }
-            (processed_codes::MAX_WORKING_SLOT_EXCEEDED, _) => WorkerResponseBatch::Unprocessed,
+            (
+                processed_codes::MAX_WORKING_SLOT_EXCEEDED | processed_codes::BANK_NOT_AVAILABLE,
+                _,
+            ) => WorkerResponseBatch::Unprocessed,
             _ => panic!("Unexpected response; rep={rep:?}"),
         };
 

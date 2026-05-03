@@ -259,6 +259,17 @@ pub(crate) mod external {
         MaxWorkingSlotExceeded,
     }
 
+    struct CheckBanks {
+        parse_and_resolve_bank: Arc<Bank>,
+        working_bank: Arc<Bank>,
+    }
+
+    enum CheckBankResult {
+        Available(CheckBanks),
+        BankNotAvailable,
+        MaxWorkingSlotExceeded,
+    }
+
     impl ExternalWorker {
         pub fn new(
             id: u32,
@@ -513,17 +524,22 @@ pub(crate) mod external {
             &mut self,
             message: &PackToWorkerMessage,
         ) -> Result<(), ExternalConsumeWorkerError> {
-            let BankPair {
-                root_bank,
+            let CheckBanks {
+                parse_and_resolve_bank,
                 working_bank,
-            } = self.sharable_banks.load();
-
-            if working_bank.slot() > message.max_working_slot {
-                return self.return_unprocessed_message(
-                    message,
-                    processed_codes::MAX_WORKING_SLOT_EXCEEDED,
-                );
-            }
+            } = match self.bank_for_check(message) {
+                CheckBankResult::Available(banks) => banks,
+                CheckBankResult::BankNotAvailable => {
+                    return self
+                        .return_unprocessed_message(message, processed_codes::BANK_NOT_AVAILABLE);
+                }
+                CheckBankResult::MaxWorkingSlotExceeded => {
+                    return self.return_unprocessed_message(
+                        message,
+                        processed_codes::MAX_WORKING_SLOT_EXCEEDED,
+                    );
+                }
+            };
 
             // SAFETY: Assumption that external scheduler does not pass messages with batch regions
             //         not pointing to valid regions in the allocator.
@@ -546,7 +562,7 @@ pub(crate) mod external {
                 Self::parse_transactions_and_populate_initial_check_responses(
                     message,
                     &batch,
-                    &root_bank,
+                    &parse_and_resolve_bank,
                     responses_ptr,
                 )
             };
@@ -563,7 +579,7 @@ pub(crate) mod external {
 
             // Do resolving next since we (currently) need resolved transactions for status checks.
             let (parsing_and_resolve_results, txs, max_ages) =
-                Self::translate_transaction_batch(&batch, &root_bank);
+                Self::translate_transaction_batch(&batch, &parse_and_resolve_bank);
 
             if message.flags & check_flags::LOAD_ADDRESS_LOOKUP_TABLES != 0 {
                 self.check_resolve_pubkeys(
@@ -572,7 +588,7 @@ pub(crate) mod external {
                     &txs,
                     &max_ages,
                     response_slice,
-                    root_bank.slot(),
+                    parse_and_resolve_bank.slot(),
                 )?;
             }
 
@@ -596,6 +612,36 @@ pub(crate) mod external {
                 .map_err(|_| ExternalConsumeWorkerError::SenderDisconnected)?;
 
             Ok(())
+        }
+
+        fn bank_for_check(&self, message: &PackToWorkerMessage) -> CheckBankResult {
+            if Self::is_replay_check_message(message) {
+                return self
+                    .bank_forks
+                    .read()
+                    .unwrap()
+                    .get(message.max_working_slot)
+                    .map_or(CheckBankResult::BankNotAvailable, |bank| {
+                        CheckBankResult::Available(CheckBanks {
+                            parse_and_resolve_bank: bank.clone(),
+                            working_bank: bank,
+                        })
+                    });
+            }
+
+            let BankPair {
+                root_bank,
+                working_bank,
+            } = self.sharable_banks.load();
+
+            if working_bank.slot() > message.max_working_slot {
+                return CheckBankResult::MaxWorkingSlotExceeded;
+            }
+
+            CheckBankResult::Available(CheckBanks {
+                parse_and_resolve_bank: root_bank,
+                working_bank,
+            })
         }
 
         fn send_execution_response(
@@ -1088,7 +1134,7 @@ pub(crate) mod external {
             message.batch.num_transactions > 0
                 && usize::from(message.batch.num_transactions) <= MAX_TRANSACTIONS_PER_MESSAGE
                 && Self::validate_message_flags(message.flags)
-                && (!Self::is_replay_message(message)
+                && (!Self::is_replay_message(message) && !Self::is_replay_check_message(message)
                     || message.max_working_slot != NO_REPLAY_BANK_SLOT)
         }
 
@@ -1104,18 +1150,24 @@ pub(crate) mod external {
 
                 flags & !ALLOWED_EXECUTE_FLAGS == 0
             } else {
-                const ALLOWED_CHECK_BITS: u16 = pack_message_flags::CHECK
-                    | check_flags::STATUS_CHECKS
+                const CHECK_WORK_FLAGS: u16 = check_flags::STATUS_CHECKS
                     | check_flags::LOAD_FEE_PAYER_BALANCE
                     | check_flags::LOAD_ADDRESS_LOOKUP_TABLES;
+                const ALLOWED_CHECK_BITS: u16 =
+                    pack_message_flags::CHECK | CHECK_WORK_FLAGS | check_flags::REPLAY;
 
-                flags != pack_message_flags::CHECK && flags & !ALLOWED_CHECK_BITS == 0
+                flags & CHECK_WORK_FLAGS != 0 && flags & !ALLOWED_CHECK_BITS == 0
             }
         }
 
         fn is_replay_message(message: &PackToWorkerMessage) -> bool {
             message.flags & pack_message_flags::EXECUTE != 0
                 && message.flags & execution_flags::REPLAY != 0
+        }
+
+        fn is_replay_check_message(message: &PackToWorkerMessage) -> bool {
+            message.flags & pack_message_flags::EXECUTE == 0
+                && message.flags & check_flags::REPLAY != 0
         }
 
         fn execution_flags_from_message_flags(flags: u16) -> ExecutionFlags {
@@ -1201,14 +1253,20 @@ pub(crate) mod external {
             agave_scheduler_bindings::{SharableTransactionBatchRegion, worker_message_types},
             agave_scheduling_utils::{
                 handshake::{ClientLogon, client, server::Server},
+                pubkeys_ptr::PubkeysPtr,
                 responses_region::{CheckResponsesPtr, ExecutionResponsesPtr},
             },
             crossbeam_channel::unbounded,
             solana_account::AccountSharedData,
+            solana_address_lookup_table_interface::{
+                self as address_lookup_table,
+                state::{AddressLookupTable, LookupTableMeta},
+            },
             solana_genesis_config::GenesisConfig,
             solana_keypair::Keypair,
             solana_leader_schedule::SlotLeader,
             solana_ledger::genesis_utils::GenesisConfigInfo,
+            solana_message::{AddressLookupTableAccount, VersionedMessage, v0},
             solana_poh::{
                 record_channels::{RecordReceiver, record_channels},
                 transaction_recorder::TransactionRecorder,
@@ -1218,9 +1276,11 @@ pub(crate) mod external {
             },
             solana_sdk_ids::system_program,
             solana_signer::Signer,
+            solana_system_interface::instruction as system_instruction,
             solana_system_transaction::transfer,
-            solana_transaction::TransactionError,
+            solana_transaction::{TransactionError, versioned::VersionedTransaction},
             std::{
+                borrow::Cow,
                 collections::HashSet,
                 sync::{RwLock, atomic::AtomicBool},
             },
@@ -1235,7 +1295,7 @@ pub(crate) mod external {
             mint_keypair: Keypair,
             genesis_config: GenesisConfig,
             bank: Arc<Bank>,
-            _bank_forks: Arc<RwLock<BankForks>>,
+            bank_forks: Arc<RwLock<BankForks>>,
             _replay_vote_receiver: ReplayVoteReceiver,
             record_receiver: RecordReceiver,
             allocator: rts_alloc::Allocator,
@@ -1392,6 +1452,22 @@ pub(crate) mod external {
             }
         }
 
+        fn store_address_lookup_table(
+            bank: &Bank,
+            account_address: Pubkey,
+            addresses: Vec<Pubkey>,
+        ) {
+            let lookup_table = AddressLookupTable {
+                meta: LookupTableMeta::default(),
+                addresses: Cow::Owned(addresses),
+            };
+            let data = lookup_table.serialize_for_tests().unwrap();
+            let mut account =
+                AccountSharedData::new(1, data.len(), &address_lookup_table::program::id());
+            account.set_data(data);
+            bank.store_account(&account_address, &account);
+        }
+
         fn setup_external_test_frame() -> ExternalTestFrame {
             let GenesisConfigInfo {
                 genesis_config,
@@ -1440,7 +1516,7 @@ pub(crate) mod external {
                 mint_keypair,
                 genesis_config,
                 bank,
-                _bank_forks: bank_forks,
+                bank_forks,
                 _replay_vote_receiver: replay_vote_receiver,
                 record_receiver,
                 allocator: client_session.allocators.pop().unwrap(),
@@ -1485,6 +1561,15 @@ pub(crate) mod external {
 
             message.max_working_slot = 0;
             assert!(ExternalWorker::validate_message(&message));
+
+            message.flags = pack_message_flags::CHECK
+                | check_flags::LOAD_ADDRESS_LOOKUP_TABLES
+                | check_flags::REPLAY;
+            message.max_working_slot = NO_REPLAY_BANK_SLOT;
+            assert!(!ExternalWorker::validate_message(&message));
+
+            message.max_working_slot = 0;
+            assert!(ExternalWorker::validate_message(&message));
         }
 
         #[test]
@@ -1523,9 +1608,23 @@ pub(crate) mod external {
                 pack_message_flags::CHECK
                     | agave_scheduler_bindings::pack_message_flags::check_flags::LOAD_ADDRESS_LOOKUP_TABLES
             ));
+            assert!(ExternalWorker::validate_message_flags(
+                pack_message_flags::CHECK
+                    | agave_scheduler_bindings::pack_message_flags::check_flags::LOAD_ADDRESS_LOOKUP_TABLES
+                    | check_flags::REPLAY
+            ));
             assert!(!ExternalWorker::validate_message_flags(
                 pack_message_flags::CHECK
-            ))
+            ));
+            assert!(!ExternalWorker::validate_message_flags(
+                pack_message_flags::CHECK | check_flags::REPLAY
+            ));
+            assert!(!ExternalWorker::validate_message_flags(
+                pack_message_flags::CHECK
+                    | check_flags::LOAD_ADDRESS_LOOKUP_TABLES
+                    | check_flags::REPLAY
+                    | (1 << 15)
+            ));
         }
 
         #[test]
@@ -2131,6 +2230,193 @@ pub(crate) mod external {
             assert_eq!(responses[0].resolution_slot, test_frame.bank.slot());
             assert_eq!(responses[0].resolved_pubkeys.num_pubkeys, 0);
             assert_eq!(responses[0].min_alt_deactivation_slot, u64::MAX);
+
+            test_frame.free_batch(batch);
+        }
+
+        #[test]
+        fn test_run_check_replay_missing_bank() {
+            let mut test_frame = setup_external_test_frame();
+            let batch = test_frame.allocate_batch(&[test_serialized_transaction(
+                test_frame.bank.confirmed_last_blockhash(),
+            )]);
+
+            test_frame.send_message(PackToWorkerMessage {
+                flags: pack_message_flags::CHECK
+                    | check_flags::LOAD_ADDRESS_LOOKUP_TABLES
+                    | check_flags::REPLAY,
+                max_working_slot: test_frame.bank.slot() + 1,
+                batch: batch.region,
+            });
+            test_frame.iterate().unwrap();
+            let response = test_frame.recv_response();
+            assert_eq!(response.processed_code, processed_codes::BANK_NOT_AVAILABLE);
+            assert_eq!(response.responses.num_transaction_responses, 0);
+            assert_eq!(response.responses.transaction_responses_offset, 0);
+
+            test_frame.free_batch(batch);
+        }
+
+        #[test]
+        fn test_run_check_replay_resolve_uses_replay_bank() {
+            let mut test_frame = setup_external_test_frame();
+
+            let lookup_table_key = Pubkey::new_unique();
+            let looked_up_address = Pubkey::new_unique();
+            store_address_lookup_table(&test_frame.bank, lookup_table_key, vec![looked_up_address]);
+
+            let higher_bank = Bank::new_from_parent(
+                test_frame.bank.parent().unwrap(),
+                SlotLeader::new_unique(),
+                test_frame.bank.slot() + 1,
+            );
+            test_frame.bank_forks.write().unwrap().insert(higher_bank);
+
+            let fee_payer = Keypair::new();
+            let transaction = VersionedTransaction::try_new(
+                VersionedMessage::V0(
+                    v0::Message::try_compile(
+                        &fee_payer.pubkey(),
+                        &[system_instruction::transfer(
+                            &fee_payer.pubkey(),
+                            &looked_up_address,
+                            1,
+                        )],
+                        &[AddressLookupTableAccount {
+                            key: lookup_table_key,
+                            addresses: vec![looked_up_address],
+                        }],
+                        test_frame.bank.confirmed_last_blockhash(),
+                    )
+                    .unwrap(),
+                ),
+                &[&fee_payer],
+            )
+            .unwrap();
+            let batch = test_frame.allocate_batch(&[wincode::serialize(&transaction).unwrap()]);
+
+            test_frame.send_message(PackToWorkerMessage {
+                flags: pack_message_flags::CHECK
+                    | check_flags::LOAD_ADDRESS_LOOKUP_TABLES
+                    | check_flags::REPLAY,
+                max_working_slot: test_frame.bank.slot(),
+                batch: batch.region,
+            });
+            test_frame.iterate().unwrap();
+            let response = test_frame.recv_response();
+            assert_eq!(response.processed_code, processed_codes::PROCESSED);
+            let responses = test_frame.check_responses(&response.responses);
+            assert_eq!(responses.len(), 1);
+            assert_eq!(
+                responses[0].resolve_flags,
+                resolve_flags::REQUESTED | resolve_flags::PERFORMED
+            );
+            assert_eq!(responses[0].resolution_slot, test_frame.bank.slot());
+            assert_eq!(responses[0].resolved_pubkeys.num_pubkeys, 1);
+
+            let resolved_pubkeys = unsafe {
+                PubkeysPtr::from_sharable_pubkeys(
+                    &responses[0].resolved_pubkeys,
+                    &test_frame.allocator,
+                )
+            };
+            assert_eq!(resolved_pubkeys.as_slice(), &[looked_up_address]);
+            unsafe { resolved_pubkeys.free(&test_frame.allocator) };
+
+            test_frame.free_batch(batch);
+        }
+
+        #[test]
+        fn test_run_check_replay_fee_payer_balance_uses_replay_bank() {
+            let mut test_frame = setup_external_test_frame();
+
+            let fee_payer = Keypair::new();
+            let replay_balance = 111_111;
+            let higher_bank_balance = 222_222;
+            test_frame.bank.store_account(
+                &fee_payer.pubkey(),
+                &AccountSharedData::new(replay_balance, 0, &system_program::ID),
+            );
+
+            let higher_bank = Bank::new_from_parent(
+                test_frame.bank.parent().unwrap(),
+                SlotLeader::new_unique(),
+                test_frame.bank.slot() + 1,
+            );
+            higher_bank.store_account(
+                &fee_payer.pubkey(),
+                &AccountSharedData::new(higher_bank_balance, 0, &system_program::ID),
+            );
+            test_frame.bank_forks.write().unwrap().insert(higher_bank);
+
+            let batch = test_frame.allocate_batch(&[wincode::serialize(&transfer(
+                &fee_payer,
+                &Pubkey::new_unique(),
+                1,
+                test_frame.bank.confirmed_last_blockhash(),
+            ))
+            .unwrap()]);
+
+            test_frame.send_message(PackToWorkerMessage {
+                flags: pack_message_flags::CHECK
+                    | check_flags::LOAD_FEE_PAYER_BALANCE
+                    | check_flags::REPLAY,
+                max_working_slot: test_frame.bank.slot(),
+                batch: batch.region,
+            });
+            test_frame.iterate().unwrap();
+            let response = test_frame.recv_response();
+            assert_eq!(response.processed_code, processed_codes::PROCESSED);
+            let responses = test_frame.check_responses(&response.responses);
+            assert_eq!(responses.len(), 1);
+            assert_eq!(
+                responses[0].fee_payer_balance_flags,
+                fee_payer_balance_flags::REQUESTED | fee_payer_balance_flags::PERFORMED
+            );
+            assert_eq!(responses[0].balance_slot, test_frame.bank.slot());
+            assert_eq!(responses[0].fee_payer_balance, replay_balance);
+
+            test_frame.free_batch(batch);
+        }
+
+        #[test]
+        fn test_run_check_replay_status_uses_replay_bank() {
+            let mut test_frame = setup_external_test_frame();
+
+            let transaction = transfer(
+                &test_frame.mint_keypair,
+                &Pubkey::new_unique(),
+                1,
+                test_frame.bank.confirmed_last_blockhash(),
+            );
+            test_frame.bank.process_transaction(&transaction).unwrap();
+
+            let higher_bank = Bank::new_from_parent(
+                test_frame.bank.parent().unwrap(),
+                SlotLeader::new_unique(),
+                test_frame.bank.slot() + 1,
+            );
+            test_frame.bank_forks.write().unwrap().insert(higher_bank);
+
+            let batch = test_frame.allocate_batch(&[wincode::serialize(&transaction).unwrap()]);
+
+            test_frame.send_message(PackToWorkerMessage {
+                flags: pack_message_flags::CHECK | check_flags::STATUS_CHECKS | check_flags::REPLAY,
+                max_working_slot: test_frame.bank.slot(),
+                batch: batch.region,
+            });
+            test_frame.iterate().unwrap();
+            let response = test_frame.recv_response();
+            assert_eq!(response.processed_code, processed_codes::PROCESSED);
+            let responses = test_frame.check_responses(&response.responses);
+            assert_eq!(responses.len(), 1);
+            assert_eq!(
+                responses[0].status_check_flags,
+                status_check_flags::REQUESTED
+                    | status_check_flags::PERFORMED
+                    | status_check_flags::ALREADY_PROCESSED
+            );
+            assert_eq!(responses[0].included_slot, test_frame.bank.slot());
 
             test_frame.free_batch(batch);
         }
