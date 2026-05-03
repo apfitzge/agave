@@ -51,6 +51,20 @@ impl<D: TransactionData> TransactionView<false, D> {
     }
 }
 
+impl<'a> TransactionView<false, &'a [u8]> {
+    /// Creates a new `TransactionView` from the first serialized transaction
+    /// in `bytes`, without running sanitization checks.
+    ///
+    /// Trailing bytes are allowed and are not included in the returned view's
+    /// data. The returned `usize` is the number of bytes consumed by the
+    /// transaction and can be used to advance through a larger byte stream.
+    pub fn try_new_unsanitized_from_prefix(bytes: &'a [u8]) -> Result<(Self, usize)> {
+        let (frame, consumed_len) = TransactionFrame::try_new_from_prefix(bytes)?;
+        let data = &bytes[..consumed_len];
+        Ok((Self { data, frame }, consumed_len))
+    }
+}
+
 impl<D: TransactionData> TransactionView<true, D> {
     /// Creates a new `TransactionView`, running sanitization checks.
     pub fn try_new_sanitized(data: D, enable_instruction_accounts_limit: bool) -> Result<Self> {
@@ -67,6 +81,26 @@ impl<D: TransactionData> TransactionView<true, D> {
             .iter()
             .zip(signer_pubkeys.iter())
             .all(|(signature, pubkey)| signature.verify(pubkey.as_ref(), self.message_data()))
+    }
+}
+
+impl<'a> TransactionView<true, &'a [u8]> {
+    /// Creates a new sanitized `TransactionView` from the first serialized
+    /// transaction in `bytes`.
+    ///
+    /// Trailing bytes are allowed and are not included in the returned view's
+    /// data. The returned `usize` is the number of bytes consumed by the
+    /// transaction and can be used to advance through a larger byte stream.
+    pub fn try_new_sanitized_from_prefix(
+        bytes: &'a [u8],
+        enable_instruction_accounts_limit: bool,
+    ) -> Result<(Self, usize)> {
+        let (unsanitized_view, consumed_len) =
+            TransactionView::<false, &'a [u8]>::try_new_unsanitized_from_prefix(bytes)?;
+        Ok((
+            unsanitized_view.sanitize(enable_instruction_accounts_limit)?,
+            consumed_len,
+        ))
     }
 }
 
@@ -385,7 +419,8 @@ mod tests {
         super::*,
         solana_keypair::Keypair,
         solana_message::{
-            Message, MessageHeader, VersionedMessage, compiled_instruction::CompiledInstruction, v1,
+            Message, MessageHeader, VersionedMessage, compiled_instruction::CompiledInstruction,
+            v0, v1,
         },
         solana_pubkey::Pubkey,
         solana_signature::Signature,
@@ -443,6 +478,26 @@ mod tests {
                 ],
                 Some(&payer),
             )),
+        }
+    }
+
+    fn simple_transfer_v0() -> VersionedTransaction {
+        let payer = Pubkey::new_unique();
+        VersionedTransaction {
+            signatures: vec![Signature::default()],
+            message: VersionedMessage::V0(
+                v0::Message::try_compile(
+                    &payer,
+                    &[system_instruction::transfer(
+                        &payer,
+                        &Pubkey::new_unique(),
+                        1,
+                    )],
+                    &[],
+                    Hash::default(),
+                )
+                .unwrap(),
+            ),
         }
     }
 
@@ -527,6 +582,52 @@ mod tests {
         assert_eq!(instructions[0].data, &[1, 2, 3, 4]);
     }
 
+    fn assert_unsanitized_prefix_parses(tx: VersionedTransaction) {
+        let tx_bytes = wincode::serialize(&tx).unwrap();
+        let mut bytes = tx_bytes.clone();
+        bytes.extend_from_slice(&[1, 2, 3, 4]);
+
+        let (view, consumed_len) =
+            TransactionView::try_new_unsanitized_from_prefix(bytes.as_ref()).unwrap();
+        assert_eq!(consumed_len, tx_bytes.len());
+        assert_eq!(view.data(), tx_bytes.as_slice());
+        assert_eq!(view.num_signatures(), tx.signatures.len() as u8);
+    }
+
+    #[test]
+    fn test_unsanitized_prefix_parses_legacy_with_trailing_bytes() {
+        assert_unsanitized_prefix_parses(multiple_transfers());
+    }
+
+    #[test]
+    fn test_unsanitized_prefix_parses_v0_with_trailing_bytes() {
+        assert_unsanitized_prefix_parses(simple_transfer_v0());
+    }
+
+    #[test]
+    fn test_unsanitized_prefix_parses_v1_with_trailing_bytes() {
+        assert_unsanitized_prefix_parses(simple_v1_transaction());
+    }
+
+    #[test]
+    fn test_strict_unsanitized_rejects_trailing_bytes() {
+        let tx = multiple_transfers();
+        let mut bytes = wincode::serialize(&tx).unwrap();
+        bytes.push(0);
+
+        assert!(TransactionView::try_new_unsanitized(bytes.as_ref()).is_err());
+    }
+
+    #[test]
+    fn test_unsanitized_prefix_rejects_truncated_bytes() {
+        let tx = multiple_transfers();
+        let bytes = wincode::serialize(&tx).unwrap();
+
+        assert!(
+            TransactionView::try_new_unsanitized_from_prefix(&bytes[..bytes.len() - 1]).is_err()
+        );
+    }
+
     fn signed_transfer() -> VersionedTransaction {
         let payer = Keypair::new();
         VersionedTransaction::try_new(
@@ -541,6 +642,20 @@ mod tests {
             &[&payer],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn test_sanitized_prefix_parses_with_trailing_bytes() {
+        let tx = signed_transfer();
+        let tx_bytes = wincode::serialize(&tx).unwrap();
+        let mut bytes = tx_bytes.clone();
+        bytes.extend_from_slice(&[1, 2, 3, 4]);
+
+        let (view, consumed_len) =
+            SanitizedTransactionView::try_new_sanitized_from_prefix(bytes.as_ref(), true).unwrap();
+        assert_eq!(consumed_len, tx_bytes.len());
+        assert_eq!(view.data(), tx_bytes.as_slice());
+        assert!(view.verify_signatures());
     }
 
     #[test]

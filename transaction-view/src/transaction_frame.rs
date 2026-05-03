@@ -42,6 +42,20 @@ impl TransactionFrame {
     /// Parse a serialized transaction and verify basic structure.
     /// The `bytes` parameter must have no trailing data.
     pub(crate) fn try_new(bytes: &[u8]) -> Result<Self> {
+        let (frame, consumed_len) = Self::try_new_from_prefix(bytes)?;
+        if consumed_len != bytes.len() {
+            return Err(TransactionViewError::ParseError);
+        }
+        Ok(frame)
+    }
+
+    /// Parse a serialized transaction from the beginning of `bytes`, allowing
+    /// trailing data after the transaction.
+    ///
+    /// Returns the parsed frame and the number of bytes consumed by the
+    /// transaction. The consumed length is the first offset after the parsed
+    /// transaction and can be used to advance through a larger byte stream.
+    pub(crate) fn try_new_from_prefix(bytes: &[u8]) -> Result<(Self, usize)> {
         if Self::is_legacy_or_v0(bytes)? {
             Self::try_new_as_legacy_or_v0(bytes)
         } else {
@@ -49,7 +63,7 @@ impl TransactionFrame {
         }
     }
 
-    fn try_new_as_legacy_or_v0(bytes: &[u8]) -> Result<Self> {
+    fn try_new_as_legacy_or_v0(bytes: &[u8]) -> Result<(Self, usize)> {
         let mut offset = 0;
         let signature = SignatureFrame::try_new(bytes, &mut offset)?;
         let message_header = MessageHeaderFrame::try_new(bytes, &mut offset)?;
@@ -73,24 +87,22 @@ impl TransactionFrame {
             TransactionVersion::V1 => unreachable!("unexpected variant"),
         };
 
-        // Verify that the entire transaction was parsed.
-        if offset != bytes.len() {
-            return Err(TransactionViewError::ParseError);
-        }
-
-        Ok(Self {
-            signature,
-            message_header,
-            static_account_keys,
-            recent_blockhash_offset,
-            instructions,
-            address_table_lookup,
-            transaction_config_frame: TransactionConfigFrame::not_applicable(),
-            data_len: offset as u16,
-        })
+        Ok((
+            Self {
+                signature,
+                message_header,
+                static_account_keys,
+                recent_blockhash_offset,
+                instructions,
+                address_table_lookup,
+                transaction_config_frame: TransactionConfigFrame::not_applicable(),
+                data_len: offset as u16,
+            },
+            offset,
+        ))
     }
 
-    fn try_new_as_v1(bytes: &[u8]) -> Result<Self> {
+    fn try_new_as_v1(bytes: &[u8]) -> Result<(Self, usize)> {
         let mut offset: usize = 0;
 
         // Fixed-size txv1 prefix up through NumAddresses:
@@ -149,10 +161,6 @@ impl TransactionFrame {
             &mut offset,
             u16::from(num_required_signatures),
         )?;
-        // Verify that the entire transaction was parsed.
-        if offset != bytes.len() {
-            return Err(TransactionViewError::ParseError);
-        }
 
         let frame = Self {
             signature: SignatureFrame {
@@ -183,7 +191,7 @@ impl TransactionFrame {
             data_len: offset as u16,
         };
 
-        Ok(frame)
+        Ok((frame, offset))
     }
 
     fn is_legacy_or_v0(bytes: &[u8]) -> Result<bool> {
