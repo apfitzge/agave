@@ -196,7 +196,8 @@ pub(crate) mod external {
             processed_codes,
             worker_message_types::{
                 CheckResponse, ExecutionResponse, fee_payer_balance_flags, not_included_reasons,
-                parsing_and_sanitization_flags, resolve_flags, status_check_flags,
+                parsing_and_sanitization_flags, resolve_flags, signature_verification_flags,
+                status_check_flags,
             },
         },
         agave_scheduling_utils::{
@@ -566,6 +567,15 @@ pub(crate) mod external {
                     responses_ptr,
                 )
             };
+
+            // Verify transaction signatures if requested.
+            if message.flags & check_flags::VERIFY_SIGNATURES != 0 {
+                Self::check_verify_signatures(
+                    &parsing_results,
+                    &parsed_transactions,
+                    response_slice,
+                );
+            }
 
             // Check fee-payer if requested.
             if message.flags & check_flags::LOAD_FEE_PAYER_BALANCE != 0 {
@@ -939,6 +949,12 @@ pub(crate) mod external {
                 } else {
                     0
                 };
+            let initial_signature_verification_flags =
+                if message.flags & check_flags::VERIFY_SIGNATURES != 0 {
+                    signature_verification_flags::REQUESTED
+                } else {
+                    0
+                };
             // Setup initial responses with requested checks.
             // Values only filled in when check is performed.
             for (transaction_index, parsing_result) in parsing_results.iter().enumerate() {
@@ -956,6 +972,7 @@ pub(crate) mod external {
                         status_check_flags: initial_status_check_flags,
                         fee_payer_balance_flags: initial_fee_payer_balance_flags,
                         resolve_flags: initial_resolve_flags,
+                        signature_verification_flags: initial_signature_verification_flags,
                         included_slot: 0,
                         balance_slot: 0,
                         fee_payer_balance: 0,
@@ -967,6 +984,32 @@ pub(crate) mod external {
                         },
                     })
                 };
+            }
+        }
+
+        fn check_verify_signatures<D: TransactionData>(
+            parsing_results: &[Result<(), TransactionViewError>],
+            parsed_transactions: &[SanitizedTransactionView<D>],
+            responses: &mut [CheckResponse],
+        ) {
+            assert_eq!(responses.len(), parsing_results.len());
+
+            let mut parsed_transaction_iter = parsed_transactions.iter();
+            for (transaction_index, parsing_result) in parsing_results.iter().enumerate() {
+                if parsing_result.is_err() {
+                    continue;
+                }
+
+                let transaction = parsed_transaction_iter.next().expect(
+                    "parsed_transaction_iter iterator must contain element for each sent parsed \
+                     transaction",
+                );
+
+                let response = &mut responses[transaction_index];
+                response.signature_verification_flags |= signature_verification_flags::PERFORMED;
+                if !transaction.verify_signatures() {
+                    response.signature_verification_flags |= signature_verification_flags::FAILED;
+                }
             }
         }
 
@@ -1152,7 +1195,8 @@ pub(crate) mod external {
             } else {
                 const CHECK_WORK_FLAGS: u16 = check_flags::STATUS_CHECKS
                     | check_flags::LOAD_FEE_PAYER_BALANCE
-                    | check_flags::LOAD_ADDRESS_LOOKUP_TABLES;
+                    | check_flags::LOAD_ADDRESS_LOOKUP_TABLES
+                    | check_flags::VERIFY_SIGNATURES;
                 const ALLOWED_CHECK_BITS: u16 =
                     pack_message_flags::CHECK | CHECK_WORK_FLAGS | check_flags::REPLAY;
 
@@ -1562,6 +1606,17 @@ pub(crate) mod external {
             message.max_working_slot = 0;
             assert!(ExternalWorker::validate_message(&message));
 
+            message.flags = pack_message_flags::CHECK | check_flags::VERIFY_SIGNATURES;
+            message.max_working_slot = NO_REPLAY_BANK_SLOT;
+            assert!(ExternalWorker::validate_message(&message));
+
+            message.flags =
+                pack_message_flags::CHECK | check_flags::VERIFY_SIGNATURES | check_flags::REPLAY;
+            assert!(!ExternalWorker::validate_message(&message));
+
+            message.max_working_slot = 0;
+            assert!(ExternalWorker::validate_message(&message));
+
             message.flags = pack_message_flags::CHECK
                 | check_flags::LOAD_ADDRESS_LOOKUP_TABLES
                 | check_flags::REPLAY;
@@ -1609,9 +1664,15 @@ pub(crate) mod external {
                     | agave_scheduler_bindings::pack_message_flags::check_flags::LOAD_ADDRESS_LOOKUP_TABLES
             ));
             assert!(ExternalWorker::validate_message_flags(
+                pack_message_flags::CHECK | check_flags::VERIFY_SIGNATURES
+            ));
+            assert!(ExternalWorker::validate_message_flags(
                 pack_message_flags::CHECK
                     | agave_scheduler_bindings::pack_message_flags::check_flags::LOAD_ADDRESS_LOOKUP_TABLES
                     | check_flags::REPLAY
+            ));
+            assert!(ExternalWorker::validate_message_flags(
+                pack_message_flags::CHECK | check_flags::VERIFY_SIGNATURES | check_flags::REPLAY
             ));
             assert!(!ExternalWorker::validate_message_flags(
                 pack_message_flags::CHECK
@@ -1775,6 +1836,7 @@ pub(crate) mod external {
                     status_check_flags: 0,
                     fee_payer_balance_flags: 0,
                     resolve_flags: 0,
+                    signature_verification_flags: 0,
                     included_slot: 0,
                     balance_slot: 0,
                     fee_payer_balance: 0,
@@ -1839,6 +1901,15 @@ pub(crate) mod external {
                 recent_blockhash,
             );
             wincode::serialize(&tx).unwrap()
+        }
+
+        fn test_transaction_with_invalid_signature(recent_blockhash: solana_hash::Hash) -> Vec<u8> {
+            let mut transaction = test_serialized_transaction(recent_blockhash);
+            // Legacy transactions start with a compact signature count followed
+            // by the signature bytes. Flipping a signature byte keeps the
+            // transaction parseable while making verification fail.
+            transaction[1] ^= 1;
+            transaction
         }
 
         #[test]
@@ -2235,6 +2306,47 @@ pub(crate) mod external {
         }
 
         #[test]
+        fn test_run_check_verify_signatures() {
+            let mut test_frame = setup_external_test_frame();
+            let batch = test_frame.allocate_batch(&[
+                test_serialized_transaction(test_frame.bank.confirmed_last_blockhash()),
+                test_transaction_with_invalid_signature(test_frame.bank.confirmed_last_blockhash()),
+                vec![0xff],
+            ]);
+
+            test_frame.send_message(PackToWorkerMessage {
+                flags: pack_message_flags::CHECK | check_flags::VERIFY_SIGNATURES,
+                max_working_slot: test_frame.bank.slot(),
+                batch: batch.region,
+            });
+            test_frame.iterate().unwrap();
+            let response = test_frame.recv_response();
+            assert_eq!(response.processed_code, processed_codes::PROCESSED);
+            let responses = test_frame.check_responses(&response.responses);
+            assert_eq!(responses.len(), 3);
+            assert_eq!(
+                responses[0].signature_verification_flags,
+                signature_verification_flags::REQUESTED | signature_verification_flags::PERFORMED
+            );
+            assert_eq!(
+                responses[1].signature_verification_flags,
+                signature_verification_flags::REQUESTED
+                    | signature_verification_flags::PERFORMED
+                    | signature_verification_flags::FAILED
+            );
+            assert_eq!(
+                responses[2].parsing_and_sanitization_flags,
+                parsing_and_sanitization_flags::FAILED
+            );
+            assert_eq!(
+                responses[2].signature_verification_flags,
+                signature_verification_flags::REQUESTED
+            );
+
+            test_frame.free_batch(batch);
+        }
+
+        #[test]
         fn test_run_check_replay_missing_bank() {
             let mut test_frame = setup_external_test_frame();
             let batch = test_frame.allocate_batch(&[test_serialized_transaction(
@@ -2253,6 +2365,33 @@ pub(crate) mod external {
             assert_eq!(response.processed_code, processed_codes::BANK_NOT_AVAILABLE);
             assert_eq!(response.responses.num_transaction_responses, 0);
             assert_eq!(response.responses.transaction_responses_offset, 0);
+
+            test_frame.free_batch(batch);
+        }
+
+        #[test]
+        fn test_run_check_replay_verify_signatures() {
+            let mut test_frame = setup_external_test_frame();
+            let batch = test_frame.allocate_batch(&[test_serialized_transaction(
+                test_frame.bank.confirmed_last_blockhash(),
+            )]);
+
+            test_frame.send_message(PackToWorkerMessage {
+                flags: pack_message_flags::CHECK
+                    | check_flags::VERIFY_SIGNATURES
+                    | check_flags::REPLAY,
+                max_working_slot: test_frame.bank.slot(),
+                batch: batch.region,
+            });
+            test_frame.iterate().unwrap();
+            let response = test_frame.recv_response();
+            assert_eq!(response.processed_code, processed_codes::PROCESSED);
+            let responses = test_frame.check_responses(&response.responses);
+            assert_eq!(responses.len(), 1);
+            assert_eq!(
+                responses[0].signature_verification_flags,
+                signature_verification_flags::REQUESTED | signature_verification_flags::PERFORMED
+            );
 
             test_frame.free_batch(batch);
         }

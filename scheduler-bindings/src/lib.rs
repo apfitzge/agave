@@ -473,6 +473,9 @@ pub mod pack_message_flags {
         /// to reuse external consume workers. The message's `max_working_slot`
         /// is the exact replay bank slot to check against.
         pub const REPLAY: u16 = 1 << 4;
+
+        /// Transaction signatures should be verified.
+        pub const VERIFY_SIGNATURES: u16 = 1 << 5;
     }
 }
 
@@ -684,6 +687,16 @@ pub mod worker_message_types {
         pub const FAILED: u8 = 1 << 2;
     }
 
+    pub mod signature_verification_flags {
+        /// Flag set if signature verification was requested.
+        pub const REQUESTED: u8 = 1 << 0;
+        /// Flag set if signature verification was performed. A previous
+        /// failure could have caused verification to be skipped.
+        pub const PERFORMED: u8 = 1 << 1;
+        /// Flag set if signature verification failed.
+        pub const FAILED: u8 = 1 << 2;
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     #[repr(C)]
     pub struct CheckResponse {
@@ -695,6 +708,8 @@ pub mod worker_message_types {
         pub fee_payer_balance_flags: u8,
         /// See [`resolve_flags`] for details.
         pub resolve_flags: u8,
+        /// See [`signature_verification_flags`] for details.
+        pub signature_verification_flags: u8,
 
         /// If [`status_check_flags::ALREADY_PROCESSED`] is set,
         /// this is the slot the transaction was previously included in.
