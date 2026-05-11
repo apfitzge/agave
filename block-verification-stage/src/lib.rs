@@ -2,4 +2,5 @@
 
 //! Block verification stage.
 
+pub mod scheduler;
 pub mod setup;
