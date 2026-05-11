@@ -65,6 +65,12 @@ dependencies = [
 [[package]]
 name = "agave-block-verification-stage"
 version = "4.1.0-alpha.0"
+dependencies = [
+ "agave-scheduler-bindings",
+ "agave-scheduling-utils",
+ "rts-alloc",
+ "shaq",
+]
 
 [[package]]
 name = "agave-bls-cert-verify"
