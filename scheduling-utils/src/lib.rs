@@ -9,4 +9,6 @@ pub mod bridge;
 pub mod handshake;
 pub mod pubkeys_ptr;
 pub mod responses_region;
+#[cfg(unix)]
+pub mod shared_memory;
 pub mod transaction_ptr;

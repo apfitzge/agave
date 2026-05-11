@@ -1,10 +1,13 @@
 use {
-    crate::handshake::{
-        AgaveHandshakeError, AgaveTpuToPackSession, AgaveWorkerSession, ClientLogon,
-        shared::{
-            AgaveSession, GLOBAL_ALLOCATORS, LOGON_FAILURE, LOGON_SUCCESS, MAX_ALLOCATOR_HANDLES,
-            MAX_WORKERS, VERSION,
+    crate::{
+        handshake::{
+            AgaveHandshakeError, AgaveTpuToPackSession, AgaveWorkerSession, ClientLogon,
+            shared::{
+                AgaveSession, GLOBAL_ALLOCATORS, LOGON_FAILURE, LOGON_SUCCESS,
+                MAX_ALLOCATOR_HANDLES, MAX_WORKERS, VERSION,
+            },
         },
+        shared_memory::{self, SharedMemoryError},
     },
     agave_scheduler_bindings::PackToWorkerMessage,
     nix::sys::socket::{self, ControlMessage, MsgFlags, UnixAddr},
@@ -14,7 +17,7 @@ use {
         fs::File,
         io::{IoSlice, Read, Write},
         os::{
-            fd::{AsRawFd, FromRawFd},
+            fd::AsRawFd,
             unix::net::{UnixListener, UnixStream},
         },
         path::Path,
@@ -22,11 +25,9 @@ use {
     },
 };
 
-type ShaqError = shaq::error::Error;
-type RtsAllocError = rts_alloc::error::Error;
-
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(1);
 const SHMEM_NAME: &CStr = c"/agave-scheduler-bindings";
+const ALLOCATOR_SLAB_SIZE: u32 = 2 * 1024 * 1024;
 
 /// Implements the Agave side of the scheduler bindings handshake protocol.
 pub struct Server {
@@ -151,9 +152,9 @@ impl Server {
 
         // Setup the global queues.
         let (tpu_to_pack_file, tpu_to_pack_queue) =
-            Self::create_producer(logon.tpu_to_pack_capacity, true)?;
+            shared_memory::create_producer(SHMEM_NAME, logon.tpu_to_pack_capacity, true)?;
         let (progress_tracker_file, progress_tracker) =
-            Self::create_producer(logon.progress_tracker_capacity, false)?;
+            shared_memory::create_producer(SHMEM_NAME, logon.progress_tracker_capacity, false)?;
 
         // Setup the worker sessions.
         let (worker_files, workers) = (0..logon.worker_count).try_fold(
@@ -162,9 +163,16 @@ impl Server {
                 let allocator = Allocator::join(&allocator_file)?;
 
                 let (pack_to_worker_file, pack_to_worker) =
-                    Self::create_consumer(logon.pack_to_worker_capacity)?;
-                let (worker_to_pack_file, worker_to_pack) =
-                    Self::create_producer(logon.worker_to_pack_capacity, true)?;
+                    shared_memory::create_consumer::<PackToWorkerMessage>(
+                        SHMEM_NAME,
+                        logon.pack_to_worker_capacity,
+                        true,
+                    )?;
+                let (worker_to_pack_file, worker_to_pack) = shared_memory::create_producer(
+                    SHMEM_NAME,
+                    logon.worker_to_pack_capacity,
+                    true,
+                )?;
 
                 fds.extend([pack_to_worker_file, worker_to_pack_file]);
                 workers.push(AgaveWorkerSession {
@@ -194,146 +202,29 @@ impl Server {
         ))
     }
 
-    fn create_allocator(logon: &ClientLogon) -> Result<(File, Allocator), RtsAllocError> {
+    fn create_allocator(logon: &ClientLogon) -> Result<(File, Allocator), AgaveHandshakeError> {
         let allocator_count = GLOBAL_ALLOCATORS
             .checked_add(logon.worker_count)
             .unwrap()
             .checked_add(logon.allocator_handles)
             .unwrap();
 
-        let create = |huge: bool| {
-            let allocator_file = Self::create_shmem(huge)?;
-            let allocator_file_size = Self::align_file_size(logon.allocator_size, huge);
-
-            // SAFETY: We just created this file and thus can uniquely initialize it.
-            unsafe {
-                Allocator::create(
-                    &allocator_file,
-                    allocator_file_size,
-                    u32::try_from(allocator_count).unwrap(),
-                    2 * 1024 * 1024,
-                )
-            }
-            .map(|allocator| (allocator_file, allocator))
-        };
-
-        // Try to create with huge pages, fallback to regular pages.
-        create(true).or_else(|_| create(false))
+        shared_memory::create_allocator(
+            SHMEM_NAME,
+            logon.allocator_size,
+            u32::try_from(allocator_count).unwrap(),
+            ALLOCATOR_SLAB_SIZE,
+        )
+        .map_err(Into::into)
     }
+}
 
-    fn create_producer<T>(
-        capacity: usize,
-        huge: bool,
-    ) -> Result<(File, shaq::spsc::Producer<T>), ShaqError> {
-        let create = |huge: bool| {
-            let file = Self::create_shmem(huge)?;
-            let minimum_file_size = shaq::spsc::minimum_file_size::<T>(capacity);
-            let file_size = Self::align_file_size(minimum_file_size, huge);
-
-            // SAFETY: uniqely creating as producer
-            unsafe { shaq::spsc::Producer::create(&file, file_size) }
-                .map(|producer| (file, producer))
-        };
-
-        // Try to create with huge pages, fallback to regular pages.
-        match huge {
-            true => create(true).or_else(|_| create(false)),
-            false => create(false),
-        }
-    }
-
-    fn create_consumer(
-        capacity: usize,
-    ) -> Result<(File, shaq::spsc::Consumer<PackToWorkerMessage>), ShaqError> {
-        let create = |huge: bool| {
-            let file = Self::create_shmem(huge)?;
-            let minimum_file_size = shaq::spsc::minimum_file_size::<PackToWorkerMessage>(capacity);
-            let file_size = Self::align_file_size(minimum_file_size, huge);
-
-            // SAFETY: uniquely creating as consumer.
-            unsafe { shaq::spsc::Consumer::create(&file, file_size) }
-                .map(|producer| (file, producer))
-        };
-
-        // Try to create with huge pages, fallback to regular pages.
-        create(true).or_else(|_| create(false))
-    }
-
-    #[cfg(any(
-        target_os = "linux",
-        target_os = "l4re",
-        target_os = "android",
-        target_os = "emscripten"
-    ))]
-    fn create_shmem(huge: bool) -> Result<File, std::io::Error> {
-        let flags = match huge {
-            true => libc::MFD_HUGETLB | libc::MFD_HUGE_2MB,
-            false => 0,
-        };
-
-        unsafe {
-            let ret = libc::memfd_create(SHMEM_NAME.as_ptr(), flags);
-            if ret == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-
-            Ok(File::from_raw_fd(ret))
-        }
-    }
-
-    #[cfg(not(any(
-        target_os = "linux",
-        target_os = "l4re",
-        target_os = "android",
-        target_os = "emscripten"
-    )))]
-    fn create_shmem(huge: bool) -> Result<File, std::io::Error> {
-        if huge {
-            return Err(std::io::ErrorKind::Unsupported.into());
-        }
-
-        unsafe {
-            // Clean up the previous link if one exists.
-            let ret = libc::shm_unlink(SHMEM_NAME.as_ptr());
-            if ret == -1 {
-                let err = std::io::Error::last_os_error();
-                if err.kind() != std::io::ErrorKind::NotFound {
-                    return Err(err);
-                }
-            }
-
-            // Create a new shared memory object.
-            let ret = libc::shm_open(
-                SHMEM_NAME.as_ptr(),
-                libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
-                #[cfg(not(target_os = "macos"))]
-                {
-                    libc::S_IRUSR | libc::S_IWUSR
-                },
-                #[cfg(any(target_os = "macos", target_os = "ios"))]
-                {
-                    (libc::S_IRUSR | libc::S_IWUSR) as libc::c_uint
-                },
-            );
-            if ret == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            let file = File::from_raw_fd(ret);
-
-            // Clean up after ourself.
-            let ret = libc::shm_unlink(SHMEM_NAME.as_ptr());
-            if ret == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-
-            Ok(file)
-        }
-    }
-
-    fn align_file_size(size: usize, huge: bool) -> usize {
-        match huge {
-            true => size.next_multiple_of(2 * 1024 * 1024),
-            false => size.next_multiple_of(4096),
+impl From<SharedMemoryError> for AgaveHandshakeError {
+    fn from(value: SharedMemoryError) -> Self {
+        match value {
+            SharedMemoryError::Io(err) => Self::Io(err),
+            SharedMemoryError::RtsAlloc(err) => Self::RtsAlloc(err),
+            SharedMemoryError::Shaq(err) => Self::Shaq(err),
         }
     }
 }
