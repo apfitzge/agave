@@ -63,6 +63,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "agave-block-verification-stage"
+version = "4.1.0-alpha.0"
+
+[[package]]
 name = "agave-bls-cert-verify"
 version = "4.1.0-alpha.0"
 dependencies = [
