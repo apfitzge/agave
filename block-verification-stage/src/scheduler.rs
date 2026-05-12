@@ -18,7 +18,8 @@ use {
         },
     },
     agave_scheduling_utils::{
-        responses_region::CheckResponsesPtr, transaction_ptr::TransactionPtrBatch,
+        responses_region::CheckResponsesPtr,
+        transaction_ptr::{TransactionPtr, TransactionPtrBatch},
     },
     agave_transaction_view::transaction_view::UnsanitizedTransactionView,
     solana_entry::entry::EntryVerificationData,
@@ -86,7 +87,7 @@ struct SchedulingState {
     // Scheduler-owned transaction allocations retained until the slot is
     // cleaned up. Dispatch queues and later checked-result buffers store
     // indices into this vector.
-    owned_transactions: Vec<SharableTransactionRegion>,
+    owned_transactions: Vec<TransactionPtr>,
     pending_transaction_checks: VecDeque<PendingTransactionCheck>,
     checked_transactions: BTreeMap<usize, CheckedTransaction>,
     entry_verification: EntryVerificationProgress,
@@ -146,7 +147,6 @@ impl SchedulingState {
 #[derive(Clone, Copy)]
 struct PendingTransactionCheck {
     transaction_index: usize,
-    transaction: SharableTransactionRegion,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -408,19 +408,23 @@ impl BlockVerificationScheduler {
 
     fn handle_transaction(&mut self, slot: u64, transaction: SharableTransactionRegion) -> bool {
         if !self.is_slot_accepting_work(slot) {
-            self.free_transaction_allocation(transaction);
+            self.free_transaction_region_allocation(transaction);
             return false;
         }
+
+        // SAFETY: Replay transaction messages transfer ownership of valid
+        // shared-memory regions to the scheduler. The resulting pointer is
+        // retained in scheduling state until the slot is cleaned up.
+        let transaction = unsafe {
+            TransactionPtr::from_sharable_transaction_region(&transaction, &self.session.allocator)
+        };
 
         let state = self.scheduling_state_mut(slot);
         let transaction_index = state.owned_transactions.len();
         state.owned_transactions.push(transaction);
         state
             .pending_transaction_checks
-            .push_back(PendingTransactionCheck {
-                transaction_index,
-                transaction,
-            });
+            .push_back(PendingTransactionCheck { transaction_index });
         true
     }
 
@@ -528,8 +532,9 @@ impl BlockVerificationScheduler {
         // batch allocation. CHECK dispatches intentionally send one transaction
         // per worker message, so writing the first transaction region is
         // in-bounds.
+        let transaction = self.transaction_region_for_check(slot, pending_check);
         unsafe {
-            batch_ptr.as_ptr().write(pending_check.transaction);
+            batch_ptr.as_ptr().write(transaction);
         }
         // SAFETY: `meta_ptr` points at the first `PendingWorkerCheck`
         // metadata slot computed from `TransactionPtrBatch`'s layout.
@@ -544,6 +549,25 @@ impl BlockVerificationScheduler {
             num_transactions: 1,
             transactions_offset,
         })
+    }
+
+    fn transaction_region_for_check(
+        &self,
+        slot: u64,
+        pending_check: PendingTransactionCheck,
+    ) -> SharableTransactionRegion {
+        let state = self
+            .scheduling_states
+            .get(&slot)
+            .expect("transaction check dispatch for unknown slot");
+        let transaction = state
+            .owned_transactions
+            .get(pending_check.transaction_index)
+            .expect("transaction check dispatch for unknown transaction");
+
+        // SAFETY: `owned_transactions` contains pointers constructed from
+        // regions allocated by this scheduler's shared allocator.
+        unsafe { transaction.to_sharable_transaction_region(&self.session.allocator) }
     }
 
     /// Drain completed worker CHECK responses.
@@ -811,11 +835,19 @@ impl BlockVerificationScheduler {
         }
     }
 
-    fn free_transaction_allocation(&mut self, transaction: SharableTransactionRegion) {
+    fn free_transaction_allocation(&mut self, transaction: TransactionPtr) {
         // SAFETY: Replay transaction messages transfer ownership to the
         // scheduler. We only call this for transactions still owned by this
-        // scheduler state, or for aborted-slot transactions we intentionally
-        // drop instead of retaining.
+        // scheduler state.
+        unsafe {
+            transaction.free(&self.session.allocator);
+        }
+    }
+
+    fn free_transaction_region_allocation(&mut self, transaction: SharableTransactionRegion) {
+        // SAFETY: Replay transaction messages transfer ownership to the
+        // scheduler. We only call this for aborted-slot transactions we
+        // intentionally drop instead of retaining.
         unsafe {
             self.session.allocator.free_offset(transaction.offset);
         }
@@ -1016,15 +1048,6 @@ mod tests {
         }
     }
 
-    fn transaction(offset: usize) -> ReplayToPackMessage {
-        ReplayToPackMessage {
-            tag: replay_to_pack_message_types::TRANSACTION,
-            payload: ReplayToPackMessagePayload {
-                transaction: SharableTransactionRegion { offset, length: 0 },
-            },
-        }
-    }
-
     fn transaction_message(transaction: SharableTransactionRegion) -> ReplayToPackMessage {
         ReplayToPackMessage {
             tag: replay_to_pack_message_types::TRANSACTION,
@@ -1071,6 +1094,20 @@ mod tests {
         };
 
         transactions.to_vec()
+    }
+
+    fn transaction_ptr_regions(
+        allocator: &rts_alloc::Allocator,
+        transactions: &[TransactionPtr],
+    ) -> Vec<SharableTransactionRegion> {
+        transactions
+            .iter()
+            .map(|transaction| {
+                // SAFETY: Test transaction pointers are constructed from
+                // regions allocated by this shared allocator.
+                unsafe { transaction.to_sharable_transaction_region(allocator) }
+            })
+            .collect()
     }
 
     fn transaction_check_metadata(
@@ -1281,10 +1318,8 @@ mod tests {
             NonZeroUsize::new(1).unwrap(),
         );
 
-        let thread_hdl = thread::spawn(move || scheduler.run());
         exit.store(true, Ordering::Relaxed);
-
-        thread_hdl.join().unwrap();
+        scheduler.run();
     }
 
     #[test]
@@ -1304,13 +1339,15 @@ mod tests {
     #[test]
     fn service_ingress_queue_finishes_entry_over_message_limit() {
         let (mut scheduler, mut replay_stage) = setup_scheduler_and_replay_stage();
+        let first_transaction = allocate_transaction(&replay_stage.allocator, &[1]);
+        let second_transaction = allocate_transaction(&replay_stage.allocator, &[2]);
         write_replay_messages(
             &mut replay_stage,
             [
                 begin(42),
                 entry(42, 2),
-                transaction(11),
-                transaction(12),
+                transaction_message(first_transaction),
+                transaction_message(second_transaction),
                 begin(43),
             ],
         );
@@ -1318,9 +1355,10 @@ mod tests {
         assert_eq!(scheduler.service_ingress_queue(2), 4);
         let state = scheduler.scheduling_states.get(&42).unwrap();
         assert_eq!(state.entry_headers.len(), 1);
-        assert_eq!(state.owned_transactions.len(), 2);
-        assert_eq!(state.owned_transactions[0].offset, 11);
-        assert_eq!(state.owned_transactions[1].offset, 12);
+        assert_eq!(
+            transaction_ptr_regions(&scheduler.session.allocator, &state.owned_transactions),
+            vec![first_transaction, second_transaction],
+        );
         assert!(!scheduler.scheduling_states.contains_key(&43));
 
         assert_eq!(scheduler.service_ingress_queue(1), 1);
@@ -1330,13 +1368,14 @@ mod tests {
     #[test]
     fn service_ingress_queue_routes_entries_by_slot() {
         let (mut scheduler, mut replay_stage) = setup_scheduler_and_replay_stage();
+        let transaction = allocate_transaction(&replay_stage.allocator, &[21]);
         write_replay_messages(
             &mut replay_stage,
             [
                 begin(1),
                 begin(2),
                 entry(2, 1),
-                transaction(21),
+                transaction_message(transaction),
                 entry(1, 0),
             ],
         );
@@ -1347,8 +1386,10 @@ mod tests {
         assert_eq!(state_1.entry_headers.len(), 1);
         assert!(state_1.owned_transactions.is_empty());
         assert_eq!(state_2.entry_headers.len(), 1);
-        assert_eq!(state_2.owned_transactions.len(), 1);
-        assert_eq!(state_2.owned_transactions[0].offset, 21);
+        assert_eq!(
+            transaction_ptr_regions(&scheduler.session.allocator, &state_2.owned_transactions),
+            vec![transaction],
+        );
     }
 
     #[test]
@@ -1380,7 +1421,7 @@ mod tests {
 
         assert_eq!(verification_data.num_transactions, 1);
         assert_eq!(verification_data.signatures, vec![signature]);
-        scheduler.free_transaction_allocation(transaction);
+        scheduler.free_transaction_region_allocation(transaction);
     }
 
     #[test]
@@ -1525,7 +1566,10 @@ mod tests {
 
         let state = scheduler.scheduling_states.get(&42).unwrap();
         assert_eq!(state.in_flight_worker_messages, 0);
-        assert_eq!(state.owned_transactions, vec![transaction]);
+        assert_eq!(
+            transaction_ptr_regions(&scheduler.session.allocator, &state.owned_transactions),
+            vec![transaction],
+        );
         assert!(state.checked_transactions.contains_key(&0));
         assert_eq!(
             state.checked_transactions[&0]
