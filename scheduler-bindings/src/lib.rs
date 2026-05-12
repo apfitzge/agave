@@ -202,8 +202,10 @@ pub struct ReplayBankMessage {
 pub mod replay_bank_message_kinds {
     /// Begin replay scheduling for this bank.
     pub const BEGIN: u8 = 0;
+    /// Replay-stage has sent all entry and transaction messages for this bank.
+    pub const COMPLETE: u8 = 1;
     /// Abort replay scheduling for this bank.
-    pub const ABORT: u8 = 1;
+    pub const ABORT: u8 = 2;
 }
 
 /// Payload for [`ReplayToPackMessage`].
