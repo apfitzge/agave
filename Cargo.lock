@@ -68,8 +68,17 @@ version = "4.1.0-alpha.0"
 dependencies = [
  "agave-scheduler-bindings",
  "agave-scheduling-utils",
+ "agave-transaction-view",
+ "crossbeam-channel",
  "rts-alloc",
  "shaq",
+ "solana-entry",
+ "solana-hash 4.3.0",
+ "solana-message",
+ "solana-pubkey 4.2.0",
+ "solana-signature",
+ "solana-transaction",
+ "wincode",
 ]
 
 [[package]]
