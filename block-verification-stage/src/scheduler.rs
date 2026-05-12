@@ -6,10 +6,13 @@ use {
         setup::BlockVerificationStageSession,
     },
     agave_scheduler_bindings::{
-        EntryHeader, ReplayBankMessage, ReplayBlockStatusMessage, SharableTransactionRegion,
+        EntryHeader, PackToWorkerMessage, ReplayBankMessage, ReplayBlockStatusMessage,
+        SharableTransactionBatchRegion, SharableTransactionRegion,
+        pack_message_flags::{self, check_flags},
         replay_bank_message_kinds, replay_block_status_codes, replay_block_status_reasons,
         replay_to_pack_message_types,
     },
+    agave_scheduling_utils::transaction_ptr::TransactionPtrBatch,
     agave_transaction_view::transaction_view::UnsanitizedTransactionView,
     solana_entry::entry::EntryVerificationData,
     solana_hash::Hash,
@@ -28,10 +31,18 @@ use {
 const IDLE_SLEEP: Duration = Duration::from_millis(1);
 const INGRESS_MESSAGE_LIMIT: usize = 1024;
 const ENTRY_VERIFICATION_RESULT_LIMIT: usize = 1024;
+const SIGNATURE_CHECK_DISPATCH_LIMIT: usize = 1024;
 const ABORTED_SLOT_CLEANUP_LIMIT: usize = 1024;
 const SCHEDULING_STATE_POOL_LIMIT: usize = 5;
 const POOLED_ENTRY_HEADERS_CAPACITY: usize = 0;
-const POOLED_TRANSACTIONS_CAPACITY: usize = 0;
+const POOLED_OWNED_TRANSACTIONS_CAPACITY: usize = 0;
+const POOLED_PENDING_TRANSACTION_CHECKS_CAPACITY: usize = 0;
+const TRANSACTION_BATCH_ALLOCATION_SIZE: u32 =
+    TransactionPtrBatch::<PendingWorkerCheck>::TRANSACTION_META_END as u32;
+const REPLAY_TRANSACTION_CHECK_FLAGS: u16 = pack_message_flags::CHECK
+    | check_flags::VERIFY_SIGNATURES
+    | check_flags::LOAD_ADDRESS_LOOKUP_TABLES
+    | check_flags::REPLAY;
 
 /// Main block verification scheduler.
 pub struct BlockVerificationScheduler {
@@ -47,7 +58,11 @@ struct SchedulingState {
     slot: u64,
     last_entry_hash: Hash,
     entry_headers: Vec<EntryHeader>,
-    transactions: Vec<SharableTransactionRegion>,
+    // Scheduler-owned transaction allocations retained until the slot is
+    // cleaned up. Dispatch queues and later checked-result buffers store
+    // indices into this vector.
+    owned_transactions: Vec<SharableTransactionRegion>,
+    pending_transaction_checks: VecDeque<PendingTransactionCheck>,
     entry_verification: EntryVerificationProgress,
     in_flight_worker_messages: usize,
     aborted: bool,
@@ -59,7 +74,8 @@ impl SchedulingState {
             slot,
             last_entry_hash,
             entry_headers: Vec::new(),
-            transactions: Vec::new(),
+            owned_transactions: Vec::new(),
+            pending_transaction_checks: VecDeque::new(),
             entry_verification: EntryVerificationProgress::default(),
             in_flight_worker_messages: 0,
             aborted: false,
@@ -70,7 +86,8 @@ impl SchedulingState {
         self.slot = slot;
         self.last_entry_hash = last_entry_hash;
         self.entry_headers.clear();
-        self.transactions.clear();
+        self.owned_transactions.clear();
+        self.pending_transaction_checks.clear();
         self.entry_verification = EntryVerificationProgress::default();
         self.in_flight_worker_messages = 0;
         self.aborted = false;
@@ -80,11 +97,26 @@ impl SchedulingState {
         self.slot = 0;
         self.last_entry_hash = Hash::default();
         self.entry_headers = Vec::with_capacity(POOLED_ENTRY_HEADERS_CAPACITY);
-        self.transactions = Vec::with_capacity(POOLED_TRANSACTIONS_CAPACITY);
+        self.owned_transactions = Vec::with_capacity(POOLED_OWNED_TRANSACTIONS_CAPACITY);
+        self.pending_transaction_checks =
+            VecDeque::with_capacity(POOLED_PENDING_TRANSACTION_CHECKS_CAPACITY);
         self.entry_verification = EntryVerificationProgress::default();
         self.in_flight_worker_messages = 0;
         self.aborted = false;
     }
+}
+
+#[derive(Clone, Copy)]
+struct PendingTransactionCheck {
+    transaction_index: usize,
+    transaction: SharableTransactionRegion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+struct PendingWorkerCheck {
+    slot: u64,
+    transaction_index: usize,
 }
 
 #[derive(Default)]
@@ -114,8 +146,14 @@ impl BlockVerificationScheduler {
             let ingress_count = self.service_ingress_queue(INGRESS_MESSAGE_LIMIT);
             let entry_verification_count =
                 self.service_entry_verification_results(ENTRY_VERIFICATION_RESULT_LIMIT);
+            let signature_check_dispatch_count =
+                self.service_transaction_check_dispatches(SIGNATURE_CHECK_DISPATCH_LIMIT);
             let aborted_cleanup_count = self.service_aborted_slots(ABORTED_SLOT_CLEANUP_LIMIT);
-            if ingress_count == 0 && entry_verification_count == 0 && aborted_cleanup_count == 0 {
+            if ingress_count == 0
+                && entry_verification_count == 0
+                && signature_check_dispatch_count == 0
+                && aborted_cleanup_count == 0
+            {
                 thread::sleep(IDLE_SLEEP);
             }
         }
@@ -330,10 +368,138 @@ impl BlockVerificationScheduler {
             return false;
         }
 
-        self.scheduling_state_mut(slot)
-            .transactions
-            .push(transaction);
+        let state = self.scheduling_state_mut(slot);
+        let transaction_index = state.owned_transactions.len();
+        state.owned_transactions.push(transaction);
+        state
+            .pending_transaction_checks
+            .push_back(PendingTransactionCheck {
+                transaction_index,
+                transaction,
+            });
         true
+    }
+
+    fn service_transaction_check_dispatches(&mut self, max_checks: usize) -> usize {
+        if max_checks == 0 || self.session.workers.is_empty() {
+            return 0;
+        }
+
+        let slots: Vec<_> = self.scheduling_states.keys().copied().collect();
+        let mut dispatched = 0;
+        for slot in slots {
+            while dispatched < max_checks && self.has_pending_transaction_checks(slot) {
+                let mut made_progress = false;
+                for worker_index in 0..self.session.workers.len() {
+                    if dispatched == max_checks {
+                        return dispatched;
+                    }
+                    let Some(pending_check) = self.pending_transaction_check(slot) else {
+                        break;
+                    };
+                    if !self.worker_queue_has_capacity(worker_index) {
+                        continue;
+                    }
+
+                    let Some(batch) = self.allocate_transaction_check_batch(slot, pending_check)
+                    else {
+                        return dispatched;
+                    };
+
+                    let message = PackToWorkerMessage {
+                        flags: REPLAY_TRANSACTION_CHECK_FLAGS,
+                        max_working_slot: slot,
+                        batch,
+                    };
+                    if let Err(returned_message) = self.session.workers[worker_index]
+                        .pack_to_worker
+                        .try_write(message)
+                    {
+                        self.free_transaction_batch_allocation(returned_message.batch);
+                        return dispatched;
+                    }
+                    self.session.workers[worker_index].pack_to_worker.commit();
+
+                    let state = self.scheduling_state_mut(slot);
+                    state.pending_transaction_checks.pop_front();
+                    state.in_flight_worker_messages += 1;
+                    dispatched += 1;
+                    made_progress = true;
+                }
+
+                if !made_progress {
+                    return dispatched;
+                }
+            }
+        }
+
+        dispatched
+    }
+
+    fn has_pending_transaction_checks(&self, slot: u64) -> bool {
+        self.scheduling_states
+            .get(&slot)
+            .filter(|state| !state.aborted)
+            .is_some_and(|state| !state.pending_transaction_checks.is_empty())
+    }
+
+    fn pending_transaction_check(&self, slot: u64) -> Option<PendingTransactionCheck> {
+        let state = self.scheduling_states.get(&slot)?;
+        if state.aborted {
+            return None;
+        }
+
+        state.pending_transaction_checks.front().copied()
+    }
+
+    fn worker_queue_has_capacity(&mut self, worker_index: usize) -> bool {
+        let queue = &mut self.session.workers[worker_index].pack_to_worker;
+        queue.sync();
+        queue.len() < queue.capacity()
+    }
+
+    fn allocate_transaction_check_batch(
+        &self,
+        slot: u64,
+        pending_check: PendingTransactionCheck,
+    ) -> Option<SharableTransactionBatchRegion> {
+        let ptr = self
+            .session
+            .allocator
+            .allocate(TRANSACTION_BATCH_ALLOCATION_SIZE)?;
+        // SAFETY: `ptr` was allocated by this scheduler's allocator above.
+        let transactions_offset = unsafe { self.session.allocator.offset(ptr) };
+        let batch_ptr = ptr.cast::<SharableTransactionRegion>();
+
+        // SAFETY: The allocation size is
+        // `TransactionPtrBatch::<PendingWorkerCheck>::TRANSACTION_META_END`,
+        // and `TRANSACTION_META_START` is the aligned offset for the metadata
+        // region within that allocation.
+        let meta_ptr = unsafe {
+            ptr.byte_add(TransactionPtrBatch::<PendingWorkerCheck>::TRANSACTION_META_START)
+                .cast::<PendingWorkerCheck>()
+        };
+
+        // SAFETY: `batch_ptr` points at the transaction-region portion of the
+        // batch allocation. CHECK dispatches intentionally send one transaction
+        // per worker message, so writing the first transaction region is
+        // in-bounds.
+        unsafe {
+            batch_ptr.as_ptr().write(pending_check.transaction);
+        }
+        // SAFETY: `meta_ptr` points at the first `PendingWorkerCheck`
+        // metadata slot computed from `TransactionPtrBatch`'s layout.
+        unsafe {
+            meta_ptr.as_ptr().write(PendingWorkerCheck {
+                slot,
+                transaction_index: pending_check.transaction_index,
+            });
+        }
+
+        Some(SharableTransactionBatchRegion {
+            num_transactions: 1,
+            transactions_offset,
+        })
     }
 
     fn spawn_entry_hash_verification(
@@ -437,7 +603,7 @@ impl BlockVerificationScheduler {
     }
 
     fn free_scheduling_state_allocations(&mut self, state: &mut SchedulingState) {
-        for transaction in state.transactions.drain(..) {
+        for transaction in state.owned_transactions.drain(..) {
             self.free_transaction_allocation(transaction);
         }
     }
@@ -449,6 +615,17 @@ impl BlockVerificationScheduler {
         // drop instead of retaining.
         unsafe {
             self.session.allocator.free_offset(transaction.offset);
+        }
+    }
+
+    fn free_transaction_batch_allocation(&mut self, batch: SharableTransactionBatchRegion) {
+        // SAFETY: Transaction batch regions are allocated by this scheduler
+        // and remain scheduler-owned until a worker response returns them or
+        // a dispatch attempt fails before handing the batch to a worker.
+        unsafe {
+            self.session
+                .allocator
+                .free_offset(batch.transactions_offset);
         }
     }
 
@@ -488,7 +665,8 @@ mod tests {
     use {
         super::*,
         crate::setup::{
-            BlockVerificationStageSessions, BlockVerificationStageSetupConfig, ReplayStageSession,
+            BlockVerificationStageSessions, BlockVerificationStageSetupConfig,
+            BlockVerificationWorkerSession, ReplayStageSession,
         },
         agave_scheduler_bindings::{ReplayToPackMessage, ReplayToPackMessagePayload},
         solana_entry::entry as solana_entry,
@@ -499,7 +677,7 @@ mod tests {
     };
 
     fn setup_sessions() -> BlockVerificationStageSessions {
-        BlockVerificationStageSessions::setup(BlockVerificationStageSetupConfig {
+        setup_sessions_with_config(BlockVerificationStageSetupConfig {
             allocator_size: 64 * 1024 * 1024,
             replay_to_pack_capacity: 8,
             replay_block_status_capacity: 8,
@@ -507,7 +685,12 @@ mod tests {
             pack_to_worker_capacity: 8,
             worker_to_pack_capacity: 8,
         })
-        .unwrap()
+    }
+
+    fn setup_sessions_with_config(
+        config: BlockVerificationStageSetupConfig,
+    ) -> BlockVerificationStageSessions {
+        BlockVerificationStageSessions::setup(config).unwrap()
     }
 
     fn setup_scheduler_and_replay_stage() -> (BlockVerificationScheduler, ReplayStageSession) {
@@ -520,6 +703,24 @@ mod tests {
         );
 
         (scheduler, sessions.replay_stage)
+    }
+
+    fn setup_scheduler_replay_stage_and_workers(
+        config: BlockVerificationStageSetupConfig,
+    ) -> (
+        BlockVerificationScheduler,
+        ReplayStageSession,
+        Vec<BlockVerificationWorkerSession>,
+    ) {
+        let sessions = setup_sessions_with_config(config);
+        let exit = Arc::new(AtomicBool::new(false));
+        let scheduler = BlockVerificationScheduler::new(
+            exit,
+            sessions.block_verification_stage,
+            NonZeroUsize::new(1).unwrap(),
+        );
+
+        (scheduler, sessions.replay_stage, sessions.workers)
     }
 
     fn write_replay_messages(
@@ -603,6 +804,13 @@ mod tests {
         }
     }
 
+    fn transaction_message(transaction: SharableTransactionRegion) -> ReplayToPackMessage {
+        ReplayToPackMessage {
+            tag: replay_to_pack_message_types::TRANSACTION,
+            payload: ReplayToPackMessagePayload { transaction },
+        }
+    }
+
     fn allocate_transaction(
         allocator: &rts_alloc::Allocator,
         data: &[u8],
@@ -616,6 +824,45 @@ mod tests {
             offset: unsafe { allocator.offset(ptr) },
             length: data.len().try_into().unwrap(),
         }
+    }
+
+    fn read_pack_to_worker_message(
+        worker: &mut BlockVerificationWorkerSession,
+    ) -> Option<PackToWorkerMessage> {
+        worker.pack_to_worker.sync();
+        let message = worker.pack_to_worker.try_read().copied();
+        worker.pack_to_worker.finalize();
+
+        message
+    }
+
+    fn transaction_batch_regions(
+        allocator: &rts_alloc::Allocator,
+        batch: SharableTransactionBatchRegion,
+    ) -> Vec<SharableTransactionRegion> {
+        let ptr = unsafe {
+            allocator
+                .ptr_from_offset(batch.transactions_offset)
+                .cast::<SharableTransactionRegion>()
+        };
+        let transactions = unsafe {
+            core::slice::from_raw_parts(ptr.as_ptr(), usize::from(batch.num_transactions))
+        };
+
+        transactions.to_vec()
+    }
+
+    fn transaction_check_metadata(
+        allocator: &rts_alloc::Allocator,
+        batch: SharableTransactionBatchRegion,
+    ) -> Vec<PendingWorkerCheck> {
+        let ptr_batch = unsafe {
+            TransactionPtrBatch::<PendingWorkerCheck>::from_sharable_transaction_batch_region(
+                &batch, allocator,
+            )
+        };
+
+        ptr_batch.iter().map(|(_, meta)| meta).collect()
     }
 
     fn read_replay_block_status(
@@ -712,9 +959,9 @@ mod tests {
         assert_eq!(scheduler.service_ingress_queue(2), 4);
         let state = scheduler.scheduling_states.get(&42).unwrap();
         assert_eq!(state.entry_headers.len(), 1);
-        assert_eq!(state.transactions.len(), 2);
-        assert_eq!(state.transactions[0].offset, 11);
-        assert_eq!(state.transactions[1].offset, 12);
+        assert_eq!(state.owned_transactions.len(), 2);
+        assert_eq!(state.owned_transactions[0].offset, 11);
+        assert_eq!(state.owned_transactions[1].offset, 12);
         assert!(!scheduler.scheduling_states.contains_key(&43));
 
         assert_eq!(scheduler.service_ingress_queue(1), 1);
@@ -739,10 +986,10 @@ mod tests {
         let state_1 = scheduler.scheduling_states.get(&1).unwrap();
         let state_2 = scheduler.scheduling_states.get(&2).unwrap();
         assert_eq!(state_1.entry_headers.len(), 1);
-        assert!(state_1.transactions.is_empty());
+        assert!(state_1.owned_transactions.is_empty());
         assert_eq!(state_2.entry_headers.len(), 1);
-        assert_eq!(state_2.transactions.len(), 1);
-        assert_eq!(state_2.transactions[0].offset, 21);
+        assert_eq!(state_2.owned_transactions.len(), 1);
+        assert_eq!(state_2.owned_transactions[0].offset, 21);
     }
 
     #[test]
@@ -775,6 +1022,120 @@ mod tests {
         assert_eq!(verification_data.num_transactions, 1);
         assert_eq!(verification_data.signatures, vec![signature]);
         scheduler.free_transaction_allocation(transaction);
+    }
+
+    #[test]
+    fn entry_transactions_are_sent_to_workers_one_by_one() {
+        let (mut scheduler, mut replay_stage, mut workers) =
+            setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
+                allocator_size: 64 * 1024 * 1024,
+                replay_to_pack_capacity: 8,
+                replay_block_status_capacity: 8,
+                worker_count: 1,
+                pack_to_worker_capacity: 8,
+                worker_to_pack_capacity: 8,
+            });
+        let first_transaction = allocate_transaction(&replay_stage.allocator, &[1, 2, 3]);
+        let second_transaction = allocate_transaction(&replay_stage.allocator, &[4, 5, 6]);
+
+        write_replay_messages(
+            &mut replay_stage,
+            [
+                begin(42),
+                entry(42, 2),
+                transaction_message(first_transaction),
+                transaction_message(second_transaction),
+            ],
+        );
+
+        assert_eq!(scheduler.service_ingress_queue(4), 4);
+        assert_eq!(scheduler.service_transaction_check_dispatches(1024), 2);
+
+        for (transaction_index, transaction) in [first_transaction, second_transaction]
+            .into_iter()
+            .enumerate()
+        {
+            let worker_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
+            assert_eq!(
+                worker_message.flags,
+                pack_message_flags::CHECK
+                    | check_flags::VERIFY_SIGNATURES
+                    | check_flags::LOAD_ADDRESS_LOOKUP_TABLES
+                    | check_flags::REPLAY,
+            );
+            assert_eq!(worker_message.max_working_slot, 42);
+            assert_eq!(worker_message.batch.num_transactions, 1);
+            assert_eq!(
+                transaction_check_metadata(&replay_stage.allocator, worker_message.batch),
+                vec![PendingWorkerCheck {
+                    slot: 42,
+                    transaction_index,
+                }],
+            );
+            assert_eq!(
+                transaction_batch_regions(&replay_stage.allocator, worker_message.batch),
+                vec![transaction],
+            );
+        }
+
+        let state = scheduler.scheduling_states.get(&42).unwrap();
+        assert!(state.pending_transaction_checks.is_empty());
+        assert_eq!(state.in_flight_worker_messages, 2);
+    }
+
+    #[test]
+    fn transaction_checks_round_robin_across_available_workers() {
+        let transaction_count = 8;
+        let (mut scheduler, mut replay_stage, mut workers) =
+            setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
+                allocator_size: 64 * 1024 * 1024,
+                replay_to_pack_capacity: 16,
+                replay_block_status_capacity: 8,
+                worker_count: 4,
+                pack_to_worker_capacity: 8,
+                worker_to_pack_capacity: 8,
+            });
+        let transactions: Vec<_> = (0..transaction_count)
+            .map(|index| allocate_transaction(&replay_stage.allocator, &[index as u8]))
+            .collect();
+        let mut messages = Vec::with_capacity(transaction_count + 2);
+        messages.push(begin(42));
+        messages.push(entry(42, transaction_count.try_into().unwrap()));
+        messages.extend(transactions.iter().copied().map(transaction_message));
+
+        write_replay_messages(&mut replay_stage, messages);
+
+        assert_eq!(
+            scheduler.service_ingress_queue(transaction_count + 2),
+            transaction_count + 2
+        );
+        assert_eq!(
+            scheduler.service_transaction_check_dispatches(1024),
+            transaction_count,
+        );
+
+        for worker_index in 0..4 {
+            for transaction_index in [worker_index, worker_index + 4] {
+                let worker_message =
+                    read_pack_to_worker_message(&mut workers[worker_index]).unwrap();
+                assert_eq!(worker_message.batch.num_transactions, 1);
+                assert_eq!(
+                    transaction_batch_regions(&replay_stage.allocator, worker_message.batch),
+                    vec![transactions[transaction_index]],
+                );
+                assert_eq!(
+                    transaction_check_metadata(&replay_stage.allocator, worker_message.batch),
+                    vec![PendingWorkerCheck {
+                        slot: 42,
+                        transaction_index,
+                    }],
+                );
+            }
+        }
+
+        let state = scheduler.scheduling_states.get(&42).unwrap();
+        assert!(state.pending_transaction_checks.is_empty());
+        assert_eq!(state.in_flight_worker_messages, transaction_count);
     }
 
     #[test]
@@ -884,7 +1245,11 @@ mod tests {
         assert!(!scheduler.scheduling_states.contains_key(&42));
         assert_eq!(scheduler.scheduling_state_pool.len(), 1);
         assert!(scheduler.scheduling_state_pool[0].entry_headers.is_empty());
-        assert!(scheduler.scheduling_state_pool[0].transactions.is_empty());
+        assert!(
+            scheduler.scheduling_state_pool[0]
+                .owned_transactions
+                .is_empty()
+        );
         assert_eq!(
             read_replay_block_status(&mut replay_stage),
             Some(ReplayBlockStatusMessage {
@@ -932,7 +1297,7 @@ mod tests {
         assert_eq!(scheduler.service_ingress_queue(2), 2);
         let state = scheduler.scheduling_states.get(&42).unwrap();
         assert!(state.entry_headers.is_empty());
-        assert!(state.transactions.is_empty());
+        assert!(state.owned_transactions.is_empty());
 
         scheduler
             .scheduling_states
@@ -966,8 +1331,16 @@ mod tests {
             POOLED_ENTRY_HEADERS_CAPACITY,
         );
         assert_eq!(
-            scheduler.scheduling_state_pool[0].transactions.capacity(),
-            POOLED_TRANSACTIONS_CAPACITY,
+            scheduler.scheduling_state_pool[0]
+                .owned_transactions
+                .capacity(),
+            POOLED_OWNED_TRANSACTIONS_CAPACITY,
+        );
+        assert_eq!(
+            scheduler.scheduling_state_pool[0]
+                .pending_transaction_checks
+                .capacity(),
+            POOLED_PENDING_TRANSACTION_CHECKS_CAPACITY,
         );
 
         write_replay_messages(&mut replay_stage, [begin(43)]);
@@ -977,7 +1350,7 @@ mod tests {
         let state = scheduler.scheduling_states.get(&43).unwrap();
         assert_eq!(state.slot, 43);
         assert!(state.entry_headers.is_empty());
-        assert!(state.transactions.is_empty());
+        assert!(state.owned_transactions.is_empty());
     }
 
     #[test]
@@ -1011,9 +1384,11 @@ mod tests {
         {
             let state = scheduler.scheduling_states.get_mut(&42).unwrap();
             state.entry_headers.reserve(128);
-            state.transactions.reserve(128);
+            state.owned_transactions.reserve(128);
+            state.pending_transaction_checks.reserve(128);
             assert!(state.entry_headers.capacity() >= 128);
-            assert!(state.transactions.capacity() >= 128);
+            assert!(state.owned_transactions.capacity() >= 128);
+            assert!(state.pending_transaction_checks.capacity() >= 128);
         }
 
         write_replay_messages(&mut replay_stage, [abort(42)]);
@@ -1026,8 +1401,12 @@ mod tests {
             POOLED_ENTRY_HEADERS_CAPACITY,
         );
         assert_eq!(
-            pooled_state.transactions.capacity(),
-            POOLED_TRANSACTIONS_CAPACITY,
+            pooled_state.owned_transactions.capacity(),
+            POOLED_OWNED_TRANSACTIONS_CAPACITY,
+        );
+        assert_eq!(
+            pooled_state.pending_transaction_checks.capacity(),
+            POOLED_PENDING_TRANSACTION_CHECKS_CAPACITY,
         );
     }
 }
