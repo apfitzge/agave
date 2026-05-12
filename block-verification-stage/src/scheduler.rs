@@ -41,7 +41,7 @@ const INGRESS_MESSAGE_LIMIT: usize = 1024;
 const ENTRY_VERIFICATION_RESULT_LIMIT: usize = 1024;
 const SIGNATURE_CHECK_DISPATCH_LIMIT: usize = 1024;
 const WORKER_RESPONSE_LIMIT: usize = 1024;
-const ABORTED_SLOT_CLEANUP_LIMIT: usize = 1024;
+const TERMINAL_SLOT_CLEANUP_LIMIT: usize = 1024;
 const SCHEDULING_STATE_POOL_LIMIT: usize = 5;
 const POOLED_ENTRY_HEADERS_CAPACITY: usize = 0;
 const POOLED_OWNED_TRANSACTIONS_CAPACITY: usize = 0;
@@ -76,7 +76,7 @@ pub struct BlockVerificationScheduler {
     session: BlockVerificationStageSession,
     scheduling_states: HashMap<u64, SchedulingState>,
     scheduling_state_pool: Vec<SchedulingState>,
-    aborted_slot_queue: VecDeque<u64>,
+    terminal_slot_queue: VecDeque<u64>,
     entry_hash_verifier: EntryHashVerifier,
 }
 
@@ -92,7 +92,7 @@ struct SchedulingState {
     checked_transactions: BTreeMap<usize, CheckedTransaction>,
     entry_verification: EntryVerificationProgress,
     in_flight_worker_messages: usize,
-    aborted: bool,
+    terminal_status: Option<SlotTerminalStatus>,
 }
 
 impl SchedulingState {
@@ -106,7 +106,7 @@ impl SchedulingState {
             checked_transactions: BTreeMap::new(),
             entry_verification: EntryVerificationProgress::default(),
             in_flight_worker_messages: 0,
-            aborted: false,
+            terminal_status: None,
         }
     }
 
@@ -119,7 +119,7 @@ impl SchedulingState {
         self.checked_transactions.clear();
         self.entry_verification = EntryVerificationProgress::default();
         self.in_flight_worker_messages = 0;
-        self.aborted = false;
+        self.terminal_status = None;
     }
 
     fn clear_for_pool(&mut self) {
@@ -132,16 +132,39 @@ impl SchedulingState {
         self.checked_transactions = BTreeMap::new();
         self.entry_verification = EntryVerificationProgress::default();
         self.in_flight_worker_messages = 0;
-        self.aborted = false;
+        self.terminal_status = None;
     }
 
     fn accepts_work(&self) -> bool {
-        !self.aborted && !self.is_failed()
+        self.terminal_status.is_none()
     }
+}
 
-    fn is_failed(&self) -> bool {
-        self.entry_verification.first_failure.is_some()
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotTerminalStatus {
+    Failed(u16),
+    Aborted,
+}
+
+impl SlotTerminalStatus {
+    fn into_replay_block_status(self, slot: u64) -> ReplayBlockStatusMessage {
+        match self {
+            Self::Failed(reason) => ReplayBlockStatusMessage {
+                slot,
+                status: replay_block_status_codes::FAILED,
+                reason,
+            },
+            Self::Aborted => ReplayBlockStatusMessage {
+                slot,
+                status: replay_block_status_codes::ABORTED,
+                reason: replay_block_status_reasons::NONE,
+            },
+        }
     }
+}
+
+struct FinishedSlotStatus {
+    message: ReplayBlockStatusMessage,
 }
 
 #[derive(Clone, Copy)]
@@ -164,7 +187,6 @@ struct CheckedTransaction {
 #[derive(Default)]
 struct EntryVerificationProgress {
     pending_jobs: usize,
-    first_failure: Option<u16>,
 }
 
 impl BlockVerificationScheduler {
@@ -178,7 +200,7 @@ impl BlockVerificationScheduler {
             session,
             scheduling_states: HashMap::new(),
             scheduling_state_pool: Vec::new(),
-            aborted_slot_queue: VecDeque::new(),
+            terminal_slot_queue: VecDeque::new(),
             entry_hash_verifier: EntryHashVerifier::new(entry_verification_threads),
         }
     }
@@ -191,12 +213,12 @@ impl BlockVerificationScheduler {
             let signature_check_dispatch_count =
                 self.service_transaction_check_dispatches(SIGNATURE_CHECK_DISPATCH_LIMIT);
             let worker_response_count = self.service_worker_responses(WORKER_RESPONSE_LIMIT);
-            let aborted_cleanup_count = self.service_aborted_slots(ABORTED_SLOT_CLEANUP_LIMIT);
+            let terminal_cleanup_count = self.service_terminal_slots(TERMINAL_SLOT_CLEANUP_LIMIT);
             if ingress_count == 0
                 && entry_verification_count == 0
                 && signature_check_dispatch_count == 0
                 && worker_response_count == 0
-                && aborted_cleanup_count == 0
+                && terminal_cleanup_count == 0
             {
                 thread::sleep(IDLE_SLEEP);
             }
@@ -252,8 +274,8 @@ impl BlockVerificationScheduler {
     /// This method is intentionally bounded and nonblocking so the scheduler
     /// can interleave replay ingress with verification result handling. Each
     /// drained result decrements the slot's pending entry-hash job count; the
-    /// first invalid result records `FAILED / INVALID_ENTRY_HASH` for that
-    /// slot.
+    /// first invalid result marks the slot terminal with
+    /// `FAILED / INVALID_ENTRY_HASH`.
     ///
     /// Returns the number of verification results consumed.
     pub fn service_entry_verification_results(&mut self, max_results: usize) -> usize {
@@ -287,37 +309,38 @@ impl BlockVerificationScheduler {
         };
 
         if should_record_failure {
-            self.record_slot_failure(slot, replay_block_status_reasons::INVALID_ENTRY_HASH);
+            self.mark_slot_failed(slot, replay_block_status_reasons::INVALID_ENTRY_HASH);
         }
     }
 
-    /// Attempt cleanup for queued aborted slots.
+    /// Attempt cleanup for queued terminal slots.
     ///
-    /// `handle_bank_abort()` only marks a slot aborted and appends it to the
-    /// cleanup queue. This method is the only path that drops aborted slot
-    /// state and sends `ReplayBlockStatusMessage::ABORTED`. A slot is cleaned
-    /// up only after all retained scheduler-owned work has returned, including
-    /// entry hash verification jobs and worker messages. Slots that are still
+    /// Terminal markers such as failures and aborts only append slots to the
+    /// cleanup queue. This method is the only path that drops terminal slot
+    /// state and sends a `ReplayBlockStatusMessage`. A slot is cleaned up only
+    /// after all retained scheduler-owned work has returned, including entry
+    /// hash verification jobs and worker messages. Slots that are still
     /// waiting on work are requeued for a later scheduler loop iteration.
     ///
-    /// Returns the number of aborted slots fully cleaned up.
-    fn service_aborted_slots(&mut self, max_slots: usize) -> usize {
+    /// Returns the number of terminal slots fully cleaned up and reported.
+    fn service_terminal_slots(&mut self, max_slots: usize) -> usize {
         if max_slots == 0 {
             return 0;
         }
 
         let mut cleaned = 0;
-        let slots_to_check = max_slots.min(self.aborted_slot_queue.len());
+        let slots_to_check = max_slots.min(self.terminal_slot_queue.len());
         for _ in 0..slots_to_check {
-            let slot = self.aborted_slot_queue.pop_front().unwrap();
-            if self.try_cleanup_aborted_slot(slot) {
+            let slot = self.terminal_slot_queue.pop_front().unwrap();
+            if let Some(status) = self.try_finish_terminal_slot(slot) {
+                self.send_replay_block_status(status);
                 cleaned += 1;
             } else if self
                 .scheduling_states
                 .get(&slot)
-                .is_some_and(|state| state.aborted)
+                .is_some_and(|state| state.terminal_status.is_some())
             {
-                self.aborted_slot_queue.push_back(slot);
+                self.terminal_slot_queue.push_back(slot);
             }
         }
 
@@ -354,14 +377,7 @@ impl BlockVerificationScheduler {
     }
 
     fn handle_bank_abort(&mut self, slot: u64) {
-        let state = self
-            .scheduling_states
-            .get_mut(&slot)
-            .expect("abort received for unknown slot");
-        if !state.aborted {
-            state.aborted = true;
-            self.aborted_slot_queue.push_back(slot);
-        }
+        self.mark_slot_terminal(slot, SlotTerminalStatus::Aborted);
     }
 
     fn handle_entry(&mut self, entry_header: EntryHeader) -> usize {
@@ -645,7 +661,7 @@ impl BlockVerificationScheduler {
 
         if check_response_is_invalid(&check_response) {
             self.free_check_response_allocations(check_response);
-            self.record_slot_failure(slot, replay_block_status_reasons::INVALID_TRANSACTION);
+            self.mark_slot_failed(slot, replay_block_status_reasons::INVALID_TRANSACTION);
         } else {
             self.record_successful_check(worker_check, check_response);
         }
@@ -800,15 +816,16 @@ impl BlockVerificationScheduler {
             .expect("replay ingress received for unknown slot")
     }
 
-    fn try_cleanup_aborted_slot(&mut self, slot: u64) -> bool {
+    fn try_finish_terminal_slot(&mut self, slot: u64) -> Option<FinishedSlotStatus> {
         let Some(state) = self.scheduling_states.get(&slot) else {
-            return false;
+            return None;
         };
-        if !state.aborted
-            || state.in_flight_worker_messages != 0
+        let terminal_status = state.terminal_status?;
+        if state.in_flight_worker_messages != 0
             || state.entry_verification.pending_jobs != 0
+            || !state.pending_transaction_checks.is_empty()
         {
-            return false;
+            return None;
         }
 
         let mut state = self.scheduling_states.remove(&slot).unwrap();
@@ -817,13 +834,10 @@ impl BlockVerificationScheduler {
             state.clear_for_pool();
             self.scheduling_state_pool.push(state);
         }
-        self.send_replay_block_status(ReplayBlockStatusMessage {
-            slot,
-            status: replay_block_status_codes::ABORTED,
-            reason: replay_block_status_reasons::NONE,
-        });
 
-        true
+        Some(FinishedSlotStatus {
+            message: terminal_status.into_replay_block_status(slot),
+        })
     }
 
     fn free_scheduling_state_allocations(&mut self, state: &mut SchedulingState) {
@@ -846,7 +860,7 @@ impl BlockVerificationScheduler {
 
     fn free_transaction_region_allocation(&mut self, transaction: SharableTransactionRegion) {
         // SAFETY: Replay transaction messages transfer ownership to the
-        // scheduler. We only call this for aborted-slot transactions we
+        // scheduler. We only call this for terminal-slot transactions we
         // intentionally drop instead of retaining.
         unsafe {
             self.session.allocator.free_offset(transaction.offset);
@@ -880,33 +894,25 @@ impl BlockVerificationScheduler {
         }
     }
 
-    fn record_slot_failure(&mut self, slot: u64, reason: u16) {
-        let should_send = {
-            let Some(state) = self.scheduling_states.get_mut(&slot) else {
-                return;
-            };
-            if state.entry_verification.first_failure.is_some() {
-                false
-            } else {
-                state.entry_verification.first_failure = Some(reason);
-                state.pending_transaction_checks.clear();
-                !state.aborted
-            }
-        };
+    fn mark_slot_failed(&mut self, slot: u64, reason: u16) {
+        self.mark_slot_terminal(slot, SlotTerminalStatus::Failed(reason));
+    }
 
-        if should_send {
-            self.send_replay_block_status(ReplayBlockStatusMessage {
-                slot,
-                status: replay_block_status_codes::FAILED,
-                reason,
-            });
+    fn mark_slot_terminal(&mut self, slot: u64, terminal_status: SlotTerminalStatus) {
+        let Some(state) = self.scheduling_states.get_mut(&slot) else {
+            return;
+        };
+        if state.terminal_status.is_none() {
+            state.terminal_status = Some(terminal_status);
+            state.pending_transaction_checks.clear();
+            self.terminal_slot_queue.push_back(slot);
         }
     }
 
-    fn send_replay_block_status(&mut self, message: ReplayBlockStatusMessage) {
+    fn send_replay_block_status(&mut self, status: FinishedSlotStatus) {
         self.session
             .replay_block_status
-            .try_write(message)
+            .try_write(status.message)
             .expect("replay block status queue full");
         self.session.replay_block_status.commit();
     }
@@ -1689,9 +1695,90 @@ mod tests {
         assert_eq!(state.in_flight_worker_messages, 0);
         assert!(state.checked_transactions.is_empty());
         assert_eq!(
-            state.entry_verification.first_failure,
-            Some(replay_block_status_reasons::INVALID_TRANSACTION),
+            state.terminal_status,
+            Some(SlotTerminalStatus::Failed(
+                replay_block_status_reasons::INVALID_TRANSACTION,
+            )),
         );
+        assert_eq!(scheduler.service_terminal_slots(1), 0);
+        assert_eq!(read_replay_block_status(&mut replay_stage), None);
+
+        wait_for_entry_verification(&mut scheduler, 42);
+        assert_eq!(scheduler.service_terminal_slots(1), 1);
+        assert!(!scheduler.scheduling_states.contains_key(&42));
+        assert_eq!(
+            read_replay_block_status(&mut replay_stage),
+            Some(ReplayBlockStatusMessage {
+                slot: 42,
+                status: replay_block_status_codes::FAILED,
+                reason: replay_block_status_reasons::INVALID_TRANSACTION,
+            }),
+        );
+    }
+
+    #[test]
+    fn failed_slot_waits_for_all_pending_work_before_status() {
+        let (mut scheduler, mut replay_stage, mut workers) =
+            setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
+                allocator_size: 64 * 1024 * 1024,
+                replay_to_pack_capacity: 8,
+                replay_block_status_capacity: 8,
+                worker_count: 2,
+                pack_to_worker_capacity: 8,
+                worker_to_pack_capacity: 8,
+            });
+        let start_hash = Hash::new_from_array([9; 32]);
+        let entry_hash = next_tick_hash(&start_hash, 1);
+        let first_transaction = allocate_transaction(&replay_stage.allocator, &[1, 2, 3]);
+        let second_transaction = allocate_transaction(&replay_stage.allocator, &[4, 5, 6]);
+        write_replay_messages(
+            &mut replay_stage,
+            [
+                begin_with_last_entry_hash(42, start_hash),
+                entry_with_hash(42, 1, entry_hash, 2),
+                transaction_message(first_transaction),
+                transaction_message(second_transaction),
+            ],
+        );
+        assert_eq!(scheduler.service_ingress_queue(4), 4);
+        assert_eq!(scheduler.service_transaction_check_dispatches(1024), 2);
+        let first_worker_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        let second_worker_message = read_pack_to_worker_message(&mut workers[1]).unwrap();
+
+        queue_worker_check_response(
+            &mut workers[0],
+            first_worker_message.batch,
+            signature_failed_check_response(),
+        );
+        assert_eq!(scheduler.service_worker_responses(1), 1);
+
+        let state = scheduler.scheduling_states.get(&42).unwrap();
+        assert_eq!(
+            state.terminal_status,
+            Some(SlotTerminalStatus::Failed(
+                replay_block_status_reasons::INVALID_TRANSACTION,
+            )),
+        );
+        assert_eq!(state.in_flight_worker_messages, 1);
+        assert_eq!(state.entry_verification.pending_jobs, 1);
+        assert_eq!(scheduler.service_terminal_slots(1), 0);
+        assert_eq!(read_replay_block_status(&mut replay_stage), None);
+
+        wait_for_entry_verification(&mut scheduler, 42);
+        let state = scheduler.scheduling_states.get(&42).unwrap();
+        assert_eq!(state.entry_verification.pending_jobs, 0);
+        assert_eq!(state.in_flight_worker_messages, 1);
+        assert_eq!(scheduler.service_terminal_slots(1), 0);
+        assert_eq!(read_replay_block_status(&mut replay_stage), None);
+
+        queue_worker_check_response(
+            &mut workers[1],
+            second_worker_message.batch,
+            successful_check_response(),
+        );
+        assert_eq!(scheduler.service_worker_responses(1), 1);
+        assert_eq!(scheduler.service_terminal_slots(1), 1);
+        assert!(!scheduler.scheduling_states.contains_key(&42));
         assert_eq!(
             read_replay_block_status(&mut replay_stage),
             Some(ReplayBlockStatusMessage {
@@ -1733,6 +1820,17 @@ mod tests {
         assert_eq!(state.in_flight_worker_messages, 0);
         assert!(state.checked_transactions.is_empty());
         assert_eq!(
+            state.terminal_status,
+            Some(SlotTerminalStatus::Failed(
+                replay_block_status_reasons::INVALID_TRANSACTION,
+            )),
+        );
+        assert_eq!(read_replay_block_status(&mut replay_stage), None);
+
+        wait_for_entry_verification(&mut scheduler, 42);
+        assert_eq!(scheduler.service_terminal_slots(1), 1);
+        assert!(!scheduler.scheduling_states.contains_key(&42));
+        assert_eq!(
             read_replay_block_status(&mut replay_stage),
             Some(ReplayBlockStatusMessage {
                 slot: 42,
@@ -1772,6 +1870,17 @@ mod tests {
         let state = scheduler.scheduling_states.get(&42).unwrap();
         assert_eq!(state.in_flight_worker_messages, 0);
         assert!(state.checked_transactions.is_empty());
+        assert_eq!(
+            state.terminal_status,
+            Some(SlotTerminalStatus::Failed(
+                replay_block_status_reasons::INVALID_TRANSACTION,
+            )),
+        );
+        assert_eq!(read_replay_block_status(&mut replay_stage), None);
+
+        wait_for_entry_verification(&mut scheduler, 42);
+        assert_eq!(scheduler.service_terminal_slots(1), 1);
+        assert!(!scheduler.scheduling_states.contains_key(&42));
         assert_eq!(
             read_replay_block_status(&mut replay_stage),
             Some(ReplayBlockStatusMessage {
@@ -1875,7 +1984,7 @@ mod tests {
 
         let state = scheduler.scheduling_states.get(&42).unwrap();
         assert_eq!(state.entry_verification.pending_jobs, 0);
-        assert_eq!(state.entry_verification.first_failure, None);
+        assert_eq!(state.terminal_status, None);
         assert_eq!(read_replay_block_status(&mut replay_stage), None);
     }
 
@@ -1897,9 +2006,15 @@ mod tests {
         let state = scheduler.scheduling_states.get(&42).unwrap();
         assert_eq!(state.entry_verification.pending_jobs, 0);
         assert_eq!(
-            state.entry_verification.first_failure,
-            Some(replay_block_status_reasons::INVALID_ENTRY_HASH),
+            state.terminal_status,
+            Some(SlotTerminalStatus::Failed(
+                replay_block_status_reasons::INVALID_ENTRY_HASH,
+            )),
         );
+        assert_eq!(read_replay_block_status(&mut replay_stage), None);
+
+        assert_eq!(scheduler.service_terminal_slots(1), 1);
+        assert!(!scheduler.scheduling_states.contains_key(&42));
         assert_eq!(
             read_replay_block_status(&mut replay_stage),
             Some(ReplayBlockStatusMessage {
@@ -1931,7 +2046,7 @@ mod tests {
         let state = scheduler.scheduling_states.get(&42).unwrap();
         assert_eq!(state.last_entry_hash, second_entry_hash);
         assert_eq!(state.entry_verification.pending_jobs, 0);
-        assert_eq!(state.entry_verification.first_failure, None);
+        assert_eq!(state.terminal_status, None);
         assert_eq!(read_replay_block_status(&mut replay_stage), None);
     }
 
@@ -1954,13 +2069,13 @@ mod tests {
 
         assert_eq!(scheduler.service_ingress_queue(4), 4);
         let state = scheduler.scheduling_states.get(&42).unwrap();
-        assert!(state.aborted);
+        assert_eq!(state.terminal_status, Some(SlotTerminalStatus::Aborted));
         assert_eq!(state.entry_verification.pending_jobs, 1);
         assert!(scheduler.scheduling_state_pool.is_empty());
         assert_eq!(read_replay_block_status(&mut replay_stage), None);
 
         wait_for_entry_verification(&mut scheduler, 42);
-        assert_eq!(scheduler.service_aborted_slots(1), 1);
+        assert_eq!(scheduler.service_terminal_slots(1), 1);
         assert!(!scheduler.scheduling_states.contains_key(&42));
         assert_eq!(scheduler.scheduling_state_pool.len(), 1);
         assert!(scheduler.scheduling_state_pool[0].entry_headers.is_empty());
@@ -1993,11 +2108,11 @@ mod tests {
         write_replay_messages(&mut replay_stage, [abort(42)]);
         assert_eq!(scheduler.service_ingress_queue(1), 1);
         let state = scheduler.scheduling_states.get(&42).unwrap();
-        assert!(state.aborted);
+        assert_eq!(state.terminal_status, Some(SlotTerminalStatus::Aborted));
         assert_eq!(state.in_flight_worker_messages, 1);
         assert!(scheduler.scheduling_state_pool.is_empty());
         assert_eq!(read_replay_block_status(&mut replay_stage), None);
-        assert_eq!(scheduler.service_aborted_slots(1), 0);
+        assert_eq!(scheduler.service_terminal_slots(1), 0);
         assert!(scheduler.scheduling_states.contains_key(&42));
 
         let dropped_transaction = allocate_transaction(&replay_stage.allocator, &[9, 10, 11]);
@@ -2023,7 +2138,7 @@ mod tests {
             .get_mut(&42)
             .unwrap()
             .in_flight_worker_messages = 0;
-        assert_eq!(scheduler.service_aborted_slots(1), 1);
+        assert_eq!(scheduler.service_terminal_slots(1), 1);
         assert!(!scheduler.scheduling_states.contains_key(&42));
         assert_eq!(scheduler.scheduling_state_pool.len(), 1);
         assert_eq!(
@@ -2065,7 +2180,7 @@ mod tests {
         write_replay_messages(&mut replay_stage, [abort(42)]);
         assert_eq!(scheduler.service_ingress_queue(1), 1);
         wait_for_entry_verification(&mut scheduler, 42);
-        assert_eq!(scheduler.service_aborted_slots(1), 0);
+        assert_eq!(scheduler.service_terminal_slots(1), 0);
         assert!(scheduler.scheduling_states.contains_key(&42));
         assert_eq!(read_replay_block_status(&mut replay_stage), None);
 
@@ -2075,7 +2190,7 @@ mod tests {
             successful_check_response(),
         );
         assert_eq!(scheduler.service_worker_responses(1), 1);
-        assert_eq!(scheduler.service_aborted_slots(1), 1);
+        assert_eq!(scheduler.service_terminal_slots(1), 1);
 
         assert!(!scheduler.scheduling_states.contains_key(&42));
         assert_eq!(
@@ -2094,7 +2209,7 @@ mod tests {
         write_replay_messages(&mut replay_stage, [begin(42), entry(42, 0), abort(42)]);
         assert_eq!(scheduler.service_ingress_queue(3), 3);
         wait_for_entry_verification(&mut scheduler, 42);
-        assert_eq!(scheduler.service_aborted_slots(1), 1);
+        assert_eq!(scheduler.service_terminal_slots(1), 1);
 
         assert_eq!(scheduler.scheduling_state_pool.len(), 1);
         assert_eq!(
@@ -2136,7 +2251,7 @@ mod tests {
         write_replay_messages(&mut replay_stage, slots.iter().copied().map(abort));
         assert_eq!(scheduler.service_ingress_queue(slots.len()), slots.len());
         assert_eq!(
-            scheduler.service_aborted_slots(slots.len()),
+            scheduler.service_terminal_slots(slots.len()),
             SCHEDULING_STATE_POOL_LIMIT + 2,
         );
 
@@ -2164,7 +2279,7 @@ mod tests {
 
         write_replay_messages(&mut replay_stage, [abort(42)]);
         assert_eq!(scheduler.service_ingress_queue(1), 1);
-        assert_eq!(scheduler.service_aborted_slots(1), 1);
+        assert_eq!(scheduler.service_terminal_slots(1), 1);
 
         let pooled_state = &scheduler.scheduling_state_pool[0];
         assert_eq!(
