@@ -19,6 +19,7 @@ agave-transaction-view = { workspace = true }
 crossbeam-channel = { workspace = true }
 rts-alloc = { workspace = true }
 shaq = { workspace = true }
+slab = { workspace = true }
 solana-entry = { workspace = true }
 solana-hash = { workspace = true }
 solana-signature = { workspace = true }
