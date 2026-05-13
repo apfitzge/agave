@@ -13,13 +13,14 @@ use {
         processed_codes, replay_bank_message_kinds, replay_block_status_codes,
         replay_block_status_reasons, replay_to_pack_message_types,
         worker_message_types::{
-            CHECK_RESPONSE, CheckResponse, parsing_and_sanitization_flags, resolve_flags,
+            CHECK_RESPONSE, CheckResponse, EXECUTION_RESPONSE, ExecutionResponse,
+            not_included_reasons, parsing_and_sanitization_flags, resolve_flags,
             signature_verification_flags,
         },
     },
     agave_scheduling_utils::{
         pubkeys_ptr::PubkeysPtr,
-        responses_region::CheckResponsesPtr,
+        responses_region::{CheckResponsesPtr, ExecutionResponsesPtr},
         thread_aware_account_locks::{ThreadAwareAccountLocks, ThreadId, ThreadSet},
         transaction_ptr::{TransactionPtr, TransactionPtrBatch},
     },
@@ -46,6 +47,8 @@ const IDLE_SLEEP: Duration = Duration::from_millis(1);
 const INGRESS_MESSAGE_LIMIT: usize = 1024;
 const ENTRY_VERIFICATION_RESULT_LIMIT: usize = 1024;
 const SIGNATURE_CHECK_DISPATCH_LIMIT: usize = 1024;
+const TRANSACTION_EXECUTION_DISPATCH_LIMIT: usize = 1024;
+const TRANSACTION_EXECUTION_SCAN_LIMIT: usize = 1024;
 const MAX_OUTSTANDING_EXECUTIONS_PER_WORKER: usize = 16;
 const WORKER_RESPONSE_LIMIT: usize = 1024;
 const TERMINAL_SLOT_CLEANUP_LIMIT: usize = 1024;
@@ -74,12 +77,25 @@ fn is_check_response_region(
         && responses.num_transaction_responses == batch.num_transactions
 }
 
+fn is_execution_response_region(
+    batch: SharableTransactionBatchRegion,
+    responses: TransactionResponseRegion,
+) -> bool {
+    batch.num_transactions == 1
+        && responses.tag == EXECUTION_RESPONSE
+        && responses.num_transaction_responses == batch.num_transactions
+}
+
 fn check_response_is_invalid(response: &CheckResponse) -> bool {
     response.parsing_and_sanitization_flags & parsing_and_sanitization_flags::FAILED != 0
         || response.signature_verification_flags & signature_verification_flags::FAILED != 0
         || response.signature_verification_flags & signature_verification_flags::PERFORMED == 0
         || response.resolve_flags & resolve_flags::FAILED != 0
         || response.resolve_flags & resolve_flags::PERFORMED == 0
+}
+
+fn execution_response_is_invalid(response: &ExecutionResponse) -> bool {
+    response.not_included_reason != not_included_reasons::NONE
 }
 
 /// Main block verification scheduler.
@@ -335,7 +351,6 @@ impl SchedulingState {
             .ok()
     }
 
-    #[allow(dead_code)]
     fn unlock_transaction_accounts(&mut self, transaction_index: usize, thread_id: ThreadId) {
         let Self {
             transactions,
@@ -380,7 +395,6 @@ impl SchedulingState {
         self.in_flight_execution_messages += 1;
     }
 
-    #[allow(dead_code)]
     fn finish_in_flight_transaction(
         &mut self,
         transaction_index: usize,
@@ -388,20 +402,29 @@ impl SchedulingState {
     ) -> TransactionState {
         self.unlock_transaction_accounts(transaction_index, thread_id);
 
-        let transaction_state = self
-            .transactions
-            .get_mut(transaction_index)
-            .expect("executed transaction must exist");
-        let previous_transaction_state =
-            core::mem::replace(transaction_state, TransactionState::Executed);
-        let state_thread_id = match &previous_transaction_state {
-            TransactionState::InFlight { thread_id, .. } => *thread_id,
-            _ => panic!("execution response for transaction that was not in-flight"),
+        let previous_transaction_state = {
+            let transaction_state = self
+                .transactions
+                .get_mut(transaction_index)
+                .expect("executed transaction must exist");
+            let previous_transaction_state =
+                core::mem::replace(transaction_state, TransactionState::Executed);
+            let state_thread_id = match &previous_transaction_state {
+                TransactionState::InFlight { thread_id, .. } => *thread_id,
+                _ => panic!("execution response for transaction that was not in-flight"),
+            };
+            assert_eq!(
+                state_thread_id, thread_id,
+                "execution response thread id mismatch",
+            );
+            previous_transaction_state
         };
-        assert_eq!(
-            state_thread_id, thread_id,
-            "execution response thread id mismatch",
-        );
+
+        self.in_flight_execution_messages = self
+            .in_flight_execution_messages
+            .checked_sub(1)
+            .expect("execution response without in-flight execution");
+        self.prune_scheduled_ready_prefix();
 
         previous_transaction_state
     }
@@ -650,7 +673,6 @@ struct PendingWorkerExecution {
     thread_id: ThreadId,
 }
 
-#[allow(dead_code)]
 enum TransactionState {
     Pending {
         transaction: TransactionPtr,
@@ -689,7 +711,6 @@ impl TransactionState {
         }
     }
 
-    #[allow(dead_code)]
     fn transaction_view(&self) -> &SanitizedTransactionView<TransactionPtr> {
         match self {
             Self::Checked { transaction, .. } | Self::InFlight { transaction, .. } => transaction,
@@ -813,11 +834,17 @@ impl BlockVerificationScheduler {
             let signature_check_dispatch_count =
                 self.service_transaction_check_dispatches(SIGNATURE_CHECK_DISPATCH_LIMIT);
             let worker_response_count = self.service_worker_responses(WORKER_RESPONSE_LIMIT);
+            let transaction_execution_dispatch_count = self
+                .service_transaction_execution_dispatches(
+                    TRANSACTION_EXECUTION_DISPATCH_LIMIT,
+                    TRANSACTION_EXECUTION_SCAN_LIMIT,
+                );
             let terminal_cleanup_count = self.service_terminal_slots(TERMINAL_SLOT_CLEANUP_LIMIT);
             if ingress_count == 0
                 && entry_verification_count == 0
                 && signature_check_dispatch_count == 0
                 && worker_response_count == 0
+                && transaction_execution_dispatch_count == 0
                 && terminal_cleanup_count == 0
             {
                 thread::sleep(IDLE_SLEEP);
@@ -1273,7 +1300,7 @@ impl BlockVerificationScheduler {
         counts.scheduled
     }
 
-    /// Drain completed worker CHECK responses.
+    /// Drain completed worker responses.
     ///
     /// All worker response queues are synchronized before any response is
     /// handled, then responses are consumed in a bounded round-robin pass
@@ -1325,11 +1352,12 @@ impl BlockVerificationScheduler {
         assert_eq!(
             message.processed_code,
             processed_codes::PROCESSED,
-            "replay CHECK worker response was not processed",
+            "replay worker response was not processed",
         );
 
         match message.responses.tag {
             CHECK_RESPONSE => self.handle_worker_check_response(message),
+            EXECUTION_RESPONSE => self.handle_worker_execution_response(message),
             tag => panic!("unsupported replay worker response tag: {tag}"),
         }
     }
@@ -1343,7 +1371,9 @@ impl BlockVerificationScheduler {
         let worker_check = self.worker_check_metadata(message.batch);
         let slot = worker_check.slot;
 
-        let check_response = self.read_check_response(message.responses);
+        let check_responses = self.check_response_ptr(message.responses);
+        let check_response = Self::read_check_response(&check_responses);
+        self.free_check_response_region(check_responses);
         self.free_transaction_batch_allocation(message.batch);
 
         if check_response_is_invalid(&check_response) {
@@ -1354,6 +1384,29 @@ impl BlockVerificationScheduler {
         }
 
         self.decrement_in_flight_worker_messages(slot);
+    }
+
+    fn handle_worker_execution_response(&mut self, message: WorkerToPackMessage) {
+        assert!(
+            is_execution_response_region(message.batch, message.responses),
+            "malformed replay EXECUTION worker response",
+        );
+
+        let worker_execution = self.worker_execution_metadata(message.batch);
+        let slot = worker_execution.slot;
+
+        let execution_responses = self.execution_response_ptr(message.responses);
+        let execution_response = Self::read_execution_response(&execution_responses);
+        self.free_execution_response_region(execution_responses);
+        self.free_transaction_batch_allocation(message.batch);
+
+        let previous_transaction_state = self.finish_worker_execution(worker_execution);
+        self.free_transaction_state_allocations(previous_transaction_state);
+        self.decrement_in_flight_execution_messages(worker_execution.thread_id);
+
+        if execution_response_is_invalid(&execution_response) {
+            self.mark_slot_failed(slot, replay_block_status_reasons::INVALID_TRANSACTION);
+        }
     }
 
     fn worker_check_metadata(&self, batch: SharableTransactionBatchRegion) -> PendingWorkerCheck {
@@ -1375,20 +1428,86 @@ impl BlockVerificationScheduler {
         metadata
     }
 
-    fn read_check_response(&self, responses: TransactionResponseRegion) -> CheckResponse {
-        let responses_ptr = unsafe {
+    fn worker_execution_metadata(
+        &self,
+        batch: SharableTransactionBatchRegion,
+    ) -> PendingWorkerExecution {
+        let ptr_batch = unsafe {
+            // SAFETY: EXECUTION dispatch allocates every worker batch with
+            // `TransactionPtrBatch<PendingWorkerExecution>` layout.
+            TransactionPtrBatch::<PendingWorkerExecution>::from_sharable_transaction_batch_region(
+                &batch,
+                &self.session.allocator,
+            )
+        };
+        assert_eq!(
+            ptr_batch.len(),
+            1,
+            "replay EXECUTION batches are one transaction",
+        );
+        let metadata = ptr_batch.iter().next().unwrap().1;
+
+        metadata
+    }
+
+    fn check_response_ptr(&self, responses: TransactionResponseRegion) -> CheckResponsesPtr {
+        unsafe {
             // SAFETY: Caller validated that `responses` is a CHECK_RESPONSE
             // region with one response allocated by the shared allocator.
             CheckResponsesPtr::from_transaction_response_region(&responses, &self.session.allocator)
-        };
-        let response = *responses_ptr.iter().next().unwrap();
-        unsafe {
-            // SAFETY: `responses_ptr` is exclusively owned by this scheduler
-            // after the worker returned the response message.
-            responses_ptr.free(&self.session.allocator);
         }
+    }
+
+    fn read_check_response(responses: &CheckResponsesPtr) -> CheckResponse {
+        let response = *responses.iter().next().unwrap();
 
         response
+    }
+
+    fn free_check_response_region(&self, responses: CheckResponsesPtr) {
+        unsafe {
+            // SAFETY: The response region is exclusively owned by this
+            // scheduler after the worker returned the response message.
+            responses.free(&self.session.allocator);
+        }
+    }
+
+    fn execution_response_ptr(
+        &self,
+        responses: TransactionResponseRegion,
+    ) -> ExecutionResponsesPtr {
+        unsafe {
+            // SAFETY: Caller validated that `responses` is an
+            // EXECUTION_RESPONSE region with one response allocated by the
+            // shared allocator.
+            ExecutionResponsesPtr::from_transaction_response_region(
+                &responses,
+                &self.session.allocator,
+            )
+        }
+    }
+
+    fn read_execution_response(responses: &ExecutionResponsesPtr) -> ExecutionResponse {
+        *responses.iter().next().unwrap()
+    }
+
+    fn free_execution_response_region(&self, responses: ExecutionResponsesPtr) {
+        unsafe {
+            // SAFETY: The response region is exclusively owned by this
+            // scheduler after the worker returned the response message.
+            responses.free(&self.session.allocator);
+        }
+    }
+
+    fn finish_worker_execution(
+        &mut self,
+        worker_execution: PendingWorkerExecution,
+    ) -> TransactionState {
+        self.scheduling_state_mut(worker_execution.slot)
+            .finish_in_flight_transaction(
+                worker_execution.transaction_index,
+                worker_execution.thread_id,
+            )
     }
 
     fn record_successful_check(
@@ -1455,6 +1574,17 @@ impl BlockVerificationScheduler {
                 .checked_sub(1)
                 .expect("worker response without in-flight worker message");
         }
+    }
+
+    fn decrement_in_flight_execution_messages(&mut self, thread_id: ThreadId) {
+        self.in_flight_execution_messages = self
+            .in_flight_execution_messages
+            .checked_sub(1)
+            .expect("execution response without in-flight execution");
+        self.in_flight_executions_per_thread[thread_id] = self.in_flight_executions_per_thread
+            [thread_id]
+            .checked_sub(1)
+            .expect("execution response without in-flight execution on thread");
     }
 
     fn spawn_entry_hash_verification(
@@ -1551,8 +1681,10 @@ impl BlockVerificationScheduler {
             return None;
         }
         if state.in_flight_worker_messages != 0
+            || state.in_flight_execution_messages != 0
             || state.entry_verification.pending_jobs != 0
             || !state.pending_transaction_checks.is_empty()
+            || !state.ready_transactions.is_empty()
         {
             return None;
         }
@@ -1714,7 +1846,9 @@ mod tests {
             BlockVerificationWorkerSession, ReplayStageSession,
         },
         agave_scheduler_bindings::{ReplayToPackMessage, ReplayToPackMessagePayload},
-        agave_scheduling_utils::responses_region::resolve_responses_from_iter,
+        agave_scheduling_utils::responses_region::{
+            execution_responses_from_iter, resolve_responses_from_iter,
+        },
         solana_entry::entry as solana_entry,
         solana_message::{Message, MessageHeader, VersionedMessage},
         solana_pubkey::Pubkey,
@@ -2063,6 +2197,33 @@ mod tests {
     ) {
         let responses =
             resolve_responses_from_iter(&worker.allocator, [response].into_iter()).unwrap();
+        worker
+            .worker_to_pack
+            .try_write(WorkerToPackMessage {
+                batch,
+                processed_code: processed_codes::PROCESSED,
+                responses,
+            })
+            .unwrap();
+        worker.worker_to_pack.commit();
+    }
+
+    fn successful_execution_response() -> ExecutionResponse {
+        ExecutionResponse {
+            execution_slot: 42,
+            not_included_reason: not_included_reasons::NONE,
+            cost_units: 0,
+            fee_payer_balance: 0,
+        }
+    }
+
+    fn queue_worker_execution_response(
+        worker: &mut BlockVerificationWorkerSession,
+        batch: SharableTransactionBatchRegion,
+        response: ExecutionResponse,
+    ) {
+        let responses =
+            execution_responses_from_iter(&worker.allocator, [response].into_iter()).unwrap();
         worker
             .worker_to_pack
             .try_write(WorkerToPackMessage {
@@ -2659,6 +2820,113 @@ mod tests {
         assert_eq!(scheduler.in_flight_execution_messages, 1);
         assert_eq!(scheduler.in_flight_executions_per_thread, vec![1]);
         assert_eq!(in_flight_transaction_thread_id(state, 0), 0);
+    }
+
+    #[test]
+    fn successful_execution_response_finishes_transaction() {
+        let (mut scheduler, mut replay_stage, mut workers) =
+            setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
+                allocator_size: 64 * 1024 * 1024,
+                replay_to_pack_capacity: 8,
+                replay_block_status_capacity: 8,
+                worker_count: 1,
+                pack_to_worker_capacity: 8,
+                worker_to_pack_capacity: 8,
+            });
+        let transaction = allocate_minimal_transaction_region(&replay_stage.allocator, 1);
+        write_replay_messages(
+            &mut replay_stage,
+            [begin(42), entry(42, 1), transaction_message(transaction)],
+        );
+        assert_eq!(scheduler.service_ingress_queue(3), 3);
+        assert_eq!(scheduler.service_transaction_check_dispatches(1024), 1);
+        let check_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        queue_worker_check_response(
+            &mut workers[0],
+            check_message.batch,
+            successful_check_response(),
+        );
+        assert_eq!(scheduler.service_worker_responses(1), 1);
+        assert_eq!(scheduler.service_transaction_execution_dispatches(1, 1), 1);
+        let execution_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
+
+        queue_worker_execution_response(
+            &mut workers[0],
+            execution_message.batch,
+            successful_execution_response(),
+        );
+        assert_eq!(scheduler.service_worker_responses(1), 1);
+
+        let state = scheduler.scheduling_states.get(&42).unwrap();
+        assert_eq!(state.in_flight_execution_messages, 0);
+        assert_eq!(scheduler.in_flight_execution_messages, 0);
+        assert_eq!(scheduler.in_flight_executions_per_thread, vec![0]);
+        assert!(state.ready_transactions.is_empty());
+        assert!(matches!(
+            state.transactions.get(0).unwrap(),
+            TransactionState::Executed,
+        ));
+    }
+
+    #[test]
+    fn execution_failure_sends_invalid_transaction() {
+        let (mut scheduler, mut replay_stage, mut workers) =
+            setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
+                allocator_size: 64 * 1024 * 1024,
+                replay_to_pack_capacity: 8,
+                replay_block_status_capacity: 8,
+                worker_count: 1,
+                pack_to_worker_capacity: 8,
+                worker_to_pack_capacity: 8,
+            });
+        let start_hash = Hash::new_from_array([9; 32]);
+        let signature = Signature::from([9; SIGNATURE_BYTES]);
+        let transaction = minimal_transaction(signature);
+        let entry = solana_entry::next_versioned_entry(&start_hash, 1, vec![transaction.clone()]);
+        let transaction_region = allocate_transaction(
+            &replay_stage.allocator,
+            &wincode::serialize(&transaction).unwrap(),
+        );
+        write_replay_messages(
+            &mut replay_stage,
+            [
+                begin_with_last_entry_hash(42, start_hash),
+                entry_with_hash(42, entry.num_hashes, entry.hash, 1),
+                transaction_message(transaction_region),
+                complete(42),
+            ],
+        );
+        assert_eq!(scheduler.service_ingress_queue(4), 4);
+        assert_eq!(scheduler.service_transaction_check_dispatches(1024), 1);
+        let check_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        wait_for_entry_verification(&mut scheduler, 42);
+        queue_worker_check_response(
+            &mut workers[0],
+            check_message.batch,
+            successful_check_response(),
+        );
+        assert_eq!(scheduler.service_worker_responses(1), 1);
+        assert_eq!(scheduler.service_transaction_execution_dispatches(1, 1), 1);
+        let execution_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        queue_worker_execution_response(
+            &mut workers[0],
+            execution_message.batch,
+            ExecutionResponse {
+                not_included_reason: not_included_reasons::ACCOUNT_IN_USE,
+                ..successful_execution_response()
+            },
+        );
+
+        assert_eq!(scheduler.service_worker_responses(1), 1);
+        assert_eq!(scheduler.service_terminal_slots(1), 1);
+        assert_eq!(
+            read_replay_block_status(&mut replay_stage),
+            Some(ReplayBlockStatusMessage {
+                slot: 42,
+                status: replay_block_status_codes::FAILED,
+                reason: replay_block_status_reasons::INVALID_TRANSACTION,
+            }),
+        );
     }
 
     #[test]
@@ -3322,7 +3590,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "replay CHECK worker response was not processed")]
+    #[should_panic(expected = "replay worker response was not processed")]
     fn unprocessed_worker_check_panics() {
         let (mut scheduler, mut replay_stage, mut workers) =
             setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
@@ -3476,7 +3744,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_slot_waits_for_worker_checks_before_success() {
+    fn complete_slot_waits_for_transaction_execution_before_success() {
         let (mut scheduler, mut replay_stage, mut workers) =
             setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
                 allocator_size: 64 * 1024 * 1024,
@@ -3515,6 +3783,20 @@ mod tests {
             &mut workers[0],
             worker_message.batch,
             successful_check_response(),
+        );
+        assert_eq!(scheduler.service_worker_responses(1), 1);
+        assert_eq!(scheduler.service_terminal_slots(1), 0);
+        assert_eq!(read_replay_block_status(&mut replay_stage), None);
+
+        assert_eq!(scheduler.service_transaction_execution_dispatches(1, 1), 1);
+        let execution_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        assert_eq!(scheduler.service_terminal_slots(1), 0);
+        assert_eq!(read_replay_block_status(&mut replay_stage), None);
+
+        queue_worker_execution_response(
+            &mut workers[0],
+            execution_message.batch,
+            successful_execution_response(),
         );
         assert_eq!(scheduler.service_worker_responses(1), 1);
         assert_eq!(scheduler.service_terminal_slots(1), 1);
@@ -3738,6 +4020,71 @@ mod tests {
             &mut workers[0],
             worker_message.batch,
             successful_check_response(),
+        );
+        assert_eq!(scheduler.service_worker_responses(1), 1);
+        assert_eq!(scheduler.service_terminal_slots(1), 1);
+
+        assert!(!scheduler.scheduling_states.contains_key(&42));
+        assert_eq!(
+            read_replay_block_status(&mut replay_stage),
+            Some(ReplayBlockStatusMessage {
+                slot: 42,
+                status: replay_block_status_codes::ABORTED,
+                reason: replay_block_status_reasons::NONE,
+            }),
+        );
+    }
+
+    #[test]
+    fn aborted_slot_waits_for_worker_execution_response_before_cleanup() {
+        let (mut scheduler, mut replay_stage, mut workers) =
+            setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
+                allocator_size: 64 * 1024 * 1024,
+                replay_to_pack_capacity: 8,
+                replay_block_status_capacity: 8,
+                worker_count: 1,
+                pack_to_worker_capacity: 8,
+                worker_to_pack_capacity: 8,
+            });
+        let start_hash = Hash::new_from_array([9; 32]);
+        let signature = Signature::from([9; SIGNATURE_BYTES]);
+        let transaction = minimal_transaction(signature);
+        let entry = solana_entry::next_versioned_entry(&start_hash, 1, vec![transaction.clone()]);
+        let transaction_region = allocate_transaction(
+            &replay_stage.allocator,
+            &wincode::serialize(&transaction).unwrap(),
+        );
+        write_replay_messages(
+            &mut replay_stage,
+            [
+                begin_with_last_entry_hash(42, start_hash),
+                entry_with_hash(42, entry.num_hashes, entry.hash, 1),
+                transaction_message(transaction_region),
+            ],
+        );
+        assert_eq!(scheduler.service_ingress_queue(3), 3);
+        assert_eq!(scheduler.service_transaction_check_dispatches(1024), 1);
+        let check_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        wait_for_entry_verification(&mut scheduler, 42);
+        queue_worker_check_response(
+            &mut workers[0],
+            check_message.batch,
+            successful_check_response(),
+        );
+        assert_eq!(scheduler.service_worker_responses(1), 1);
+        assert_eq!(scheduler.service_transaction_execution_dispatches(1, 1), 1);
+        let execution_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
+
+        write_replay_messages(&mut replay_stage, [abort(42)]);
+        assert_eq!(scheduler.service_ingress_queue(1), 1);
+        assert_eq!(scheduler.service_terminal_slots(1), 0);
+        assert!(scheduler.scheduling_states.contains_key(&42));
+        assert_eq!(read_replay_block_status(&mut replay_stage), None);
+
+        queue_worker_execution_response(
+            &mut workers[0],
+            execution_message.batch,
+            successful_execution_response(),
         );
         assert_eq!(scheduler.service_worker_responses(1), 1);
         assert_eq!(scheduler.service_terminal_slots(1), 1);
