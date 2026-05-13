@@ -2573,6 +2573,20 @@ impl ReplayStage {
         replay_progress: &mut ConfirmationProgress,
     ) -> result::Result<(), BlockstoreProcessorError> {
         let slot = bank.slot();
+        process_active_banks_context
+            .block_verification_session
+            .lock()
+            .unwrap()
+            .clean_remote_free_lists();
+        if process_active_banks_context
+            .pending_replay_tick_registrations
+            .lock()
+            .unwrap()
+            .contains_key(&slot)
+        {
+            return Ok(());
+        }
+
         let slot_entries_load_result = {
             let mut load_elapsed = Measure::start("load_elapsed");
             let load_result = process_active_banks_context
@@ -2601,12 +2615,6 @@ impl ReplayStage {
             replay_progress,
             &entries,
         );
-
-        process_active_banks_context
-            .block_verification_session
-            .lock()
-            .unwrap()
-            .clean_remote_free_lists();
 
         if entries.is_empty() && !slot_full {
             return Ok(());
@@ -5887,6 +5895,29 @@ pub(crate) mod tests {
         entries
     }
 
+    fn entries_to_test_shreds_with_next_index(
+        entries: &[Entry],
+        slot: Slot,
+        parent_slot: Slot,
+        is_full_slot: bool,
+        next_shred_index: u32,
+    ) -> Vec<Shred> {
+        Shredder::new(slot, parent_slot, 0, 0)
+            .unwrap()
+            .make_merkle_shreds_from_entries(
+                &Keypair::new(),
+                entries,
+                is_full_slot,
+                Hash::new_unique(),
+                next_shred_index,
+                0,
+                &ReedSolomonCache::default(),
+                &mut ProcessShredsStats::default(),
+            )
+            .filter(Shred::is_data)
+            .collect()
+    }
+
     enum CompleteBankFailure {
         ReplayError,
         VerifyError,
@@ -6007,6 +6038,118 @@ pub(crate) mod tests {
     #[test]
     fn test_dead_slot_on_complete_bank_verify_err() {
         do_test_dead_slot_on_complete_bank(CompleteBankFailure::VerifyError);
+    }
+
+    #[test]
+    fn test_replay_blockstore_into_bank_sends_incremental_entries_before_complete() {
+        let ReplayBlockstoreComponents {
+            blockstore,
+            vote_simulator,
+            ..
+        } = replay_blockstore_components(Some(tr(0)), 1, None);
+        let funded_keypair = vote_simulator
+            .validator_keypairs
+            .values()
+            .next()
+            .unwrap()
+            .node_keypair
+            .insecure_clone();
+        let bank_forks = vote_simulator.bank_forks;
+        let mut progress = ProgressMap::default();
+
+        let bank0 = bank_forks.read().unwrap().get(0).unwrap();
+        let bank = Bank::new_from_parent(bank0, SlotLeader::default(), 1);
+        let bank = bank_forks.write().unwrap().insert(bank);
+        let slot = bank.slot();
+        let bank_progress = progress
+            .entry(slot)
+            .or_insert_with(|| ForkProgress::new(bank.last_blockhash(), None, None, 0, 0, None));
+        let tx = system_transaction::transfer(
+            &funded_keypair,
+            &Keypair::new().pubkey(),
+            1,
+            bank.last_blockhash(),
+        );
+        let entries = make_complete_slot_entries(&bank, vec![tx]);
+        let first_shreds =
+            entries_to_test_shreds(&entries[..1], slot, bank.parent_slot(), false, 0);
+        let next_shred_index = first_shreds.len() as u32;
+        blockstore.insert_shreds(first_shreds, None, false).unwrap();
+
+        let (replay_vote_sender, _replay_vote_receiver) = unbounded();
+        let process_active_banks_context =
+            ProcessActiveBanksContextForTest::new(bank_forks, blockstore, replay_vote_sender);
+
+        let first_replay_result = ReplayStage::replay_blockstore_into_bank(
+            &process_active_banks_context,
+            &bank,
+            &bank_progress.replay_stats,
+            &bank_progress.replay_progress,
+        );
+        assert_matches!(first_replay_result, Ok(1));
+        assert!(
+            !process_active_banks_context
+                .pending_replay_tick_registrations
+                .lock()
+                .unwrap()
+                .contains_key(&slot)
+        );
+
+        let final_shreds = entries_to_test_shreds_with_next_index(
+            &entries[1..],
+            slot,
+            bank.parent_slot(),
+            true,
+            next_shred_index,
+        );
+        process_active_banks_context
+            .blockstore
+            .insert_shreds(final_shreds, None, false)
+            .unwrap();
+
+        let second_replay_result = ReplayStage::replay_blockstore_into_bank(
+            &process_active_banks_context,
+            &bank,
+            &bank_progress.replay_stats,
+            &bank_progress.replay_progress,
+        );
+        assert_matches!(second_replay_result, Ok(0));
+        assert!(
+            process_active_banks_context
+                .pending_replay_tick_registrations
+                .lock()
+                .unwrap()
+                .contains_key(&slot)
+        );
+
+        let progress_after_complete = {
+            let replay_progress = bank_progress.replay_progress.read().unwrap();
+            (
+                replay_progress.num_shreds,
+                replay_progress.num_entries,
+                replay_progress.num_txs,
+                replay_progress.num_ticks,
+                replay_progress.last_entry,
+            )
+        };
+        let duplicate_complete_result = ReplayStage::replay_blockstore_into_bank(
+            &process_active_banks_context,
+            &bank,
+            &bank_progress.replay_stats,
+            &bank_progress.replay_progress,
+        );
+        assert_matches!(duplicate_complete_result, Ok(0));
+        let progress_after_duplicate_complete = {
+            let replay_progress = bank_progress.replay_progress.read().unwrap();
+            (
+                replay_progress.num_shreds,
+                replay_progress.num_entries,
+                replay_progress.num_txs,
+                replay_progress.num_ticks,
+                replay_progress.last_entry,
+            )
+        };
+        assert_eq!(progress_after_duplicate_complete, progress_after_complete);
     }
 
     #[test]
