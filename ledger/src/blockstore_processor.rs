@@ -1174,15 +1174,15 @@ pub struct ConfirmationTiming {
     /// and replay.  As replay can run in parallel with the verification, this value can not be
     /// recovered from the `replay_elapsed` and or `{poh,transaction}_verify_elapsed`.  This
     /// includes failed cases, when `confirm_slot_entries` exist with an error.  In microseconds.
-    /// When unified scheduler is enabled, replay excludes the transaction execution, only
-    /// accounting for task creation and submission to the scheduler.
+    /// For async task-submission replay, replay excludes transaction execution, only accounting
+    /// for task creation and submission.
     pub confirmation_elapsed: u64,
 
     /// Wall clock time used by the entry replay code.  Does not include the PoH or the transaction
     /// signature/precompiles verification, but can overlap with the PoH and signature verification.
     /// In microseconds.
-    /// When unified scheduler is enabled, replay excludes the transaction execution, only
-    /// accounting for task creation and submission to the scheduler.
+    /// For async task-submission replay, this excludes transaction execution, only accounting for
+    /// task creation and submission.
     pub replay_elapsed: u64,
 
     /// Wall clock times, used for the PoH verification of entries.  In microseconds.
@@ -1336,19 +1336,19 @@ impl ReplaySlotStats {
         num_entries: usize,
         num_shreds: u64,
         bank_complete_time_us: u64,
-        is_unified_scheduler_enabled: bool,
+        uses_task_submission_metrics: bool,
     ) {
-        let confirmation_elapsed = if is_unified_scheduler_enabled {
+        let confirmation_elapsed = if uses_task_submission_metrics {
             "confirmation_without_replay_us"
         } else {
             "confirmation_time_us"
         };
-        let replay_elapsed = if is_unified_scheduler_enabled {
+        let replay_elapsed = if uses_task_submission_metrics {
             "task_submission_us"
         } else {
             "replay_time"
         };
-        let execute_batches_us = if is_unified_scheduler_enabled {
+        let execute_batches_us = if uses_task_submission_metrics {
             None
         } else {
             Some(self.batch_execute.wall_clock_us.0 as i64)
@@ -1388,15 +1388,15 @@ impl ReplaySlotStats {
                 ("total_shreds", num_shreds as i64, i64),
                 // Everything inside the `eager!` block will be eagerly expanded before
                 // evaluation of the rest of the surrounding macro.
-                eager!{report_execute_timings!(self.batch_execute.totals, is_unified_scheduler_enabled)}
+                eager!{report_execute_timings!(self.batch_execute.totals, uses_task_submission_metrics)}
             );
         };
 
-        // Skip reporting replay-slot-end-to-end-stats entirely if unified scheduler is enabled,
+        // Skip reporting replay-slot-end-to-end-stats entirely for async task-submission replay,
         // because the whole metrics itself is only meaningful for rayon-based worker threads.
         //
         // See slowest_thread doc comment for details.
-        if !is_unified_scheduler_enabled {
+        if !uses_task_submission_metrics {
             self.batch_execute.slowest_thread.report_stats(slot);
         }
 
@@ -1462,6 +1462,8 @@ pub struct ConfirmationProgress {
     pub num_shreds: u64,
     pub num_entries: usize,
     pub num_txs: usize,
+    pub num_ticks: u64,
+    pub last_entry_was_tick: bool,
     async_verification: Option<AsyncVerificationProgress>,
 }
 
@@ -1871,6 +1873,8 @@ fn confirm_slot_entries(
     let slot = bank.slot();
     let (entries, num_shreds, slot_full) = slot_entries_load_result;
     let num_entries = entries.len();
+    let tick_count = entries.tick_count();
+    let last_entry_was_tick = entries.last().is_some_and(Entry::is_tick);
     let mut entry_tx_starting_indexes = Vec::with_capacity(num_entries);
     let mut entry_tx_starting_index = progress.num_txs;
     let num_txs = entries
@@ -2088,8 +2092,10 @@ fn confirm_slot_entries(
     progress.num_shreds += num_shreds;
     progress.num_entries += num_entries;
     progress.num_txs += num_txs;
+    progress.num_ticks += tick_count;
     if let Some(last_entry_hash) = last_entry_hash {
         progress.last_entry = last_entry_hash;
+        progress.last_entry_was_tick = last_entry_was_tick;
     }
 
     Ok(())

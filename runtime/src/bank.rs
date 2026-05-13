@@ -3166,19 +3166,17 @@ impl Bank {
         }
     }
 
-    /// Tell the bank which Entry IDs exist on the ledger. This function assumes subsequent calls
-    /// correspond to later entries, and will boot the oldest ones once its internal cache is full.
-    /// Once boot, the bank will reject transactions using that `hash`.
-    ///
-    /// This is NOT thread safe because if tick height is updated by two different threads, the
-    /// block boundary condition could be missed.
-    pub fn register_tick(&self, hash: &Hash, scheduler: &InstalledSchedulerRwLock) {
+    fn register_ticks(&self, hash: &Hash, tick_count: u64, scheduler: &InstalledSchedulerRwLock) {
         assert!(
             !self.freeze_started(),
-            "register_tick() working on a bank that is already frozen or is undergoing freezing!"
+            "register_ticks() working on a bank that is already frozen or is undergoing freezing!"
         );
 
-        if self.is_block_boundary(self.tick_height.load(Relaxed) + 1) {
+        if tick_count == 0 {
+            return;
+        }
+
+        if self.is_block_boundary(self.tick_height.load(Relaxed) + tick_count) {
             self.register_recent_blockhash(hash, scheduler);
         }
 
@@ -3187,7 +3185,25 @@ impl Bank {
         // needs to guarantee all account updates for the slot have been
         // committed before this tick height is incremented (like the blockhash
         // sysvar above)
-        self.tick_height.fetch_add(1, Relaxed);
+        self.tick_height.fetch_add(tick_count, Relaxed);
+    }
+
+    /// Tell the bank which Entry IDs exist on the ledger. This function assumes subsequent calls
+    /// correspond to later entries, and will boot the oldest ones once its internal cache is full.
+    /// Once boot, the bank will reject transactions using that `hash`.
+    ///
+    /// This is NOT thread safe because if tick height is updated by two different threads, the
+    /// block boundary condition could be missed.
+    pub fn register_tick(&self, hash: &Hash, scheduler: &InstalledSchedulerRwLock) {
+        self.register_ticks(hash, 1, scheduler);
+    }
+
+    pub fn register_ticks_for_replay(&self, final_tick_hash: &Hash, tick_count: u64) {
+        self.register_ticks(
+            final_tick_hash,
+            tick_count,
+            &BankWithScheduler::no_scheduler_available(),
+        );
     }
 
     #[cfg(feature = "dev-context-only-utils")]

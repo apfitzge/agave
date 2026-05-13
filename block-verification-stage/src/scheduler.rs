@@ -106,6 +106,7 @@ pub struct BlockVerificationScheduler {
     scheduling_states: HashMap<u64, SchedulingState>,
     scheduling_state_pool: Vec<SchedulingState>,
     terminal_slot_queue: VecDeque<u64>,
+    pending_entry: Option<PendingEntryIngress>,
     entry_hash_verifier: EntryHashVerifier,
     in_flight_execution_messages: usize,
     in_flight_executions_per_thread: Vec<usize>,
@@ -642,6 +643,32 @@ impl ExecutionDispatchContext<'_> {
     }
 }
 
+struct PendingEntryIngress {
+    header: EntryHeader,
+    received_transactions: usize,
+    retained_transactions: Vec<SharableTransactionRegion>,
+}
+
+impl PendingEntryIngress {
+    fn new(header: EntryHeader) -> Self {
+        Self {
+            header,
+            received_transactions: 0,
+            retained_transactions: Vec::with_capacity(
+                usize::try_from(header.num_transactions).unwrap(),
+            ),
+        }
+    }
+
+    fn num_transactions(&self) -> usize {
+        usize::try_from(self.header.num_transactions).unwrap()
+    }
+
+    fn is_complete(&self) -> bool {
+        self.received_transactions == self.num_transactions()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SlotTerminalStatus {
     Success,
@@ -885,6 +912,7 @@ impl BlockVerificationScheduler {
             scheduling_states: HashMap::new(),
             scheduling_state_pool: Vec::new(),
             terminal_slot_queue: VecDeque::new(),
+            pending_entry: None,
             entry_hash_verifier: EntryHashVerifier::new(entry_verification_threads),
             in_flight_execution_messages: 0,
             in_flight_executions_per_thread: vec![0; worker_count],
@@ -932,28 +960,38 @@ impl BlockVerificationScheduler {
             };
 
             consumed += 1;
-            match message.tag {
-                replay_to_pack_message_types::BANK => {
-                    // SAFETY: The replay ingress protocol is owned by Agave, and
-                    // we trust Agave to set the BANK tag only when the bank
-                    // payload field is active.
-                    let bank_message = unsafe { message.payload.bank };
-                    self.handle_bank_message(bank_message);
+            if self.pending_entry.is_some() {
+                assert_eq!(
+                    message.tag,
+                    replay_to_pack_message_types::TRANSACTION,
+                    "entry header followed by non-transaction message",
+                );
+                // SAFETY: We asserted that this message is tagged as TRANSACTION,
+                // and we trust Agave to make the transaction payload active for
+                // that tag.
+                let transaction = unsafe { message.payload.transaction };
+                self.handle_pending_entry_transaction(transaction);
+            } else {
+                match message.tag {
+                    replay_to_pack_message_types::BANK => {
+                        // SAFETY: The replay ingress protocol is owned by Agave, and
+                        // we trust Agave to set the BANK tag only when the bank
+                        // payload field is active.
+                        let bank_message = unsafe { message.payload.bank };
+                        self.handle_bank_message(bank_message);
+                    }
+                    replay_to_pack_message_types::ENTRY_HEADER => {
+                        // SAFETY: The replay ingress protocol is owned by Agave, and
+                        // we trust Agave to set the ENTRY_HEADER tag only when the
+                        // entry_header payload field is active.
+                        let entry_header = unsafe { message.payload.entry_header };
+                        self.handle_entry_header(entry_header);
+                    }
+                    replay_to_pack_message_types::TRANSACTION => {
+                        panic!("transaction message without entry header");
+                    }
+                    tag => panic!("unknown replay ingress message tag: {tag}"),
                 }
-                replay_to_pack_message_types::ENTRY_HEADER => {
-                    // SAFETY: The replay ingress protocol is owned by Agave, and
-                    // we trust Agave to set the ENTRY_HEADER tag only when the
-                    // entry_header payload field is active.
-                    let entry_header = unsafe { message.payload.entry_header };
-                    consumed += self.handle_entry(entry_header);
-                }
-                replay_to_pack_message_types::TRANSACTION => {
-                    // Entry transactions are consumed by `handle_entry` in the
-                    // inner loop immediately following their entry header, so a
-                    // transaction here is a malformed naked transaction.
-                    panic!("transaction message without entry header");
-                }
-                tag => panic!("unknown replay ingress message tag: {tag}"),
             }
         }
 
@@ -1091,50 +1129,51 @@ impl BlockVerificationScheduler {
         self.mark_slot_terminal(slot, SlotTerminalStatus::Aborted);
     }
 
-    fn handle_entry(&mut self, entry_header: EntryHeader) -> usize {
+    fn handle_entry_header(&mut self, entry_header: EntryHeader) {
+        assert!(
+            self.pending_entry.is_none(),
+            "entry header received before previous entry completed",
+        );
         let slot = entry_header.slot;
         assert!(
             !self.is_slot_ingress_complete(slot),
             "entry received after complete for slot: {slot}",
         );
-        let retain_entry = self.is_slot_accepting_work(slot);
-        if retain_entry {
+
+        let pending_entry = PendingEntryIngress::new(entry_header);
+        if pending_entry.is_complete() {
+            self.finish_pending_entry(pending_entry);
+        } else {
+            self.pending_entry = Some(pending_entry);
+        }
+    }
+
+    fn handle_pending_entry_transaction(&mut self, transaction: SharableTransactionRegion) {
+        let mut pending_entry = self.pending_entry.take().unwrap();
+        let slot = pending_entry.header.slot;
+        if self.handle_transaction(slot, transaction) {
+            pending_entry.retained_transactions.push(transaction);
+        }
+        pending_entry.received_transactions += 1;
+
+        if pending_entry.is_complete() {
+            self.finish_pending_entry(pending_entry);
+        } else {
+            self.pending_entry = Some(pending_entry);
+        }
+    }
+
+    fn finish_pending_entry(&mut self, pending_entry: PendingEntryIngress) {
+        let slot = pending_entry.header.slot;
+        if self.is_slot_accepting_work(slot) {
             self.scheduling_state_mut(slot)
                 .entry_headers
-                .push(entry_header);
-        }
-
-        let mut consumed = 0;
-        let mut entry_transactions =
-            Vec::with_capacity(usize::try_from(entry_header.num_transactions).unwrap());
-        for _ in 0..entry_header.num_transactions {
-            let message = self
-                .session
-                .replay_to_pack
-                .try_read()
-                .copied()
-                .expect("entry header missing transaction message");
-            assert_eq!(
-                message.tag,
-                replay_to_pack_message_types::TRANSACTION,
-                "entry header followed by non-transaction message",
+                .push(pending_entry.header);
+            self.spawn_entry_hash_verification(
+                pending_entry.header,
+                &pending_entry.retained_transactions,
             );
-
-            // SAFETY: We asserted that this message is tagged as TRANSACTION,
-            // and we trust Agave to make the transaction payload active for
-            // that tag.
-            let transaction = unsafe { message.payload.transaction };
-            if self.handle_transaction(slot, transaction) {
-                entry_transactions.push(transaction);
-            }
-            consumed += 1;
         }
-
-        if retain_entry {
-            self.spawn_entry_hash_verification(entry_header, &entry_transactions);
-        }
-
-        consumed
     }
 
     fn handle_transaction(&mut self, slot: u64, transaction: SharableTransactionRegion) -> bool {
@@ -1751,6 +1790,13 @@ impl BlockVerificationScheduler {
     fn try_finish_terminal_slot(&mut self, slot: u64) -> Option<FinishedSlotStatus> {
         let state = self.scheduling_states.get(&slot)?;
         let terminal_status = state.terminal_status?;
+        if self
+            .pending_entry
+            .as_ref()
+            .is_some_and(|entry| entry.header.slot == slot)
+        {
+            return None;
+        }
         if !matches!(terminal_status, SlotTerminalStatus::Aborted) && !state.ingress_complete {
             return None;
         }
@@ -2512,7 +2558,7 @@ mod tests {
     }
 
     #[test]
-    fn service_ingress_queue_finishes_entry_over_message_limit() {
+    fn service_ingress_queue_continues_entry_over_message_limit() {
         let (mut scheduler, mut replay_stage) = setup_scheduler_and_replay_stage();
         let first_transaction = allocate_transaction(&replay_stage.allocator, &[1]);
         let second_transaction = allocate_transaction(&replay_stage.allocator, &[2]);
@@ -2527,7 +2573,25 @@ mod tests {
             ],
         );
 
-        assert_eq!(scheduler.service_ingress_queue(2), 4);
+        assert_eq!(scheduler.service_ingress_queue(2), 2);
+        assert!(scheduler.pending_entry.is_some());
+        let state = scheduler.scheduling_states.get(&42).unwrap();
+        assert!(state.entry_headers.is_empty());
+        assert!(state.transactions.is_empty());
+        assert!(!scheduler.scheduling_states.contains_key(&43));
+
+        assert_eq!(scheduler.service_ingress_queue(1), 1);
+        assert!(scheduler.pending_entry.is_some());
+        let state = scheduler.scheduling_states.get(&42).unwrap();
+        assert!(state.entry_headers.is_empty());
+        assert!(
+            transaction_state_regions(&scheduler.session.allocator, &state.transactions)
+                .eq([first_transaction])
+        );
+        assert!(!scheduler.scheduling_states.contains_key(&43));
+
+        assert_eq!(scheduler.service_ingress_queue(1), 1);
+        assert!(scheduler.pending_entry.is_none());
         let state = scheduler.scheduling_states.get(&42).unwrap();
         assert_eq!(state.entry_headers.len(), 1);
         assert!(
