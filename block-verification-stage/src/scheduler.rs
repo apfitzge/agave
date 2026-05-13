@@ -2930,6 +2930,109 @@ mod tests {
     }
 
     #[test]
+    fn execution_failure_waits_for_other_in_flight_execution_before_status() {
+        let (mut scheduler, mut replay_stage, mut workers) =
+            setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
+                allocator_size: 64 * 1024 * 1024,
+                replay_to_pack_capacity: 8,
+                replay_block_status_capacity: 8,
+                worker_count: 2,
+                pack_to_worker_capacity: 8,
+                worker_to_pack_capacity: 8,
+            });
+        let start_hash = Hash::new_from_array([9; 32]);
+        let first_transaction = minimal_transaction_with_account(
+            Signature::from([1; SIGNATURE_BYTES]),
+            Pubkey::new_unique(),
+        );
+        let second_transaction = minimal_transaction_with_account(
+            Signature::from([2; SIGNATURE_BYTES]),
+            Pubkey::new_unique(),
+        );
+        let entry = solana_entry::next_versioned_entry(
+            &start_hash,
+            1,
+            vec![first_transaction.clone(), second_transaction.clone()],
+        );
+        let first_transaction_region = allocate_transaction(
+            &replay_stage.allocator,
+            &wincode::serialize(&first_transaction).unwrap(),
+        );
+        let second_transaction_region = allocate_transaction(
+            &replay_stage.allocator,
+            &wincode::serialize(&second_transaction).unwrap(),
+        );
+        write_replay_messages(
+            &mut replay_stage,
+            [
+                begin_with_last_entry_hash(42, start_hash),
+                entry_with_hash(42, entry.num_hashes, entry.hash, 2),
+                transaction_message(first_transaction_region),
+                transaction_message(second_transaction_region),
+                complete(42),
+            ],
+        );
+        assert_eq!(scheduler.service_ingress_queue(5), 5);
+        wait_for_entry_verification(&mut scheduler, 42);
+        assert_eq!(scheduler.service_transaction_check_dispatches(1024), 2);
+        let first_check = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        let second_check = read_pack_to_worker_message(&mut workers[1]).unwrap();
+        queue_worker_check_response(
+            &mut workers[0],
+            first_check.batch,
+            successful_check_response(),
+        );
+        queue_worker_check_response(
+            &mut workers[1],
+            second_check.batch,
+            successful_check_response(),
+        );
+        assert_eq!(scheduler.service_worker_responses(2), 2);
+
+        assert_eq!(scheduler.service_transaction_execution_dispatches(2, 2), 2);
+        let first_execution = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        let second_execution = read_pack_to_worker_message(&mut workers[1]).unwrap();
+        queue_worker_execution_response(
+            &mut workers[0],
+            first_execution.batch,
+            ExecutionResponse {
+                not_included_reason: not_included_reasons::ACCOUNT_IN_USE,
+                ..successful_execution_response()
+            },
+        );
+        assert_eq!(scheduler.service_worker_responses(1), 1);
+
+        let state = scheduler.scheduling_states.get(&42).unwrap();
+        assert_eq!(
+            state.terminal_status,
+            Some(SlotTerminalStatus::Failed(
+                replay_block_status_reasons::INVALID_TRANSACTION,
+            )),
+        );
+        assert_eq!(state.in_flight_execution_messages, 1);
+        assert_eq!(scheduler.in_flight_execution_messages, 1);
+        assert_eq!(scheduler.service_terminal_slots(1), 0);
+        assert_eq!(read_replay_block_status(&mut replay_stage), None);
+
+        queue_worker_execution_response(
+            &mut workers[1],
+            second_execution.batch,
+            successful_execution_response(),
+        );
+        assert_eq!(scheduler.service_worker_responses(1), 1);
+        assert_eq!(scheduler.service_terminal_slots(1), 1);
+        assert!(!scheduler.scheduling_states.contains_key(&42));
+        assert_eq!(
+            read_replay_block_status(&mut replay_stage),
+            Some(ReplayBlockStatusMessage {
+                slot: 42,
+                status: replay_block_status_codes::FAILED,
+                reason: replay_block_status_reasons::INVALID_TRANSACTION,
+            }),
+        );
+    }
+
+    #[test]
     fn execution_dispatch_load_balances_non_conflicting_transactions() {
         let (mut scheduler, mut replay_stage, mut workers) =
             setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
