@@ -1749,9 +1749,7 @@ impl BlockVerificationScheduler {
     }
 
     fn try_finish_terminal_slot(&mut self, slot: u64) -> Option<FinishedSlotStatus> {
-        let Some(state) = self.scheduling_states.get(&slot) else {
-            return None;
-        };
+        let state = self.scheduling_states.get(&slot)?;
         let terminal_status = state.terminal_status?;
         if !matches!(terminal_status, SlotTerminalStatus::Aborted) && !state.ingress_complete {
             return None;
@@ -2090,10 +2088,10 @@ mod tests {
         message
     }
 
-    fn transaction_batch_regions<'a>(
-        allocator: &'a rts_alloc::Allocator,
+    fn transaction_batch_regions(
+        allocator: &rts_alloc::Allocator,
         batch: SharableTransactionBatchRegion,
-    ) -> &'a [SharableTransactionRegion] {
+    ) -> &[SharableTransactionRegion] {
         let ptr = unsafe {
             allocator
                 .ptr_from_offset(batch.transactions_offset)
@@ -2418,7 +2416,7 @@ mod tests {
             if scheduler
                 .scheduling_states
                 .get(&slot)
-                .map_or(true, |state| state.entry_verification.pending_jobs == 0)
+                .is_none_or(|state| state.entry_verification.pending_jobs == 0)
             {
                 return;
             }
@@ -2703,10 +2701,9 @@ mod tests {
             TRANSACTION_COUNT,
         );
 
-        for worker_index in 0..4 {
+        for (worker_index, worker) in workers.iter_mut().enumerate().take(4) {
             for transaction_index in [worker_index, worker_index + 4] {
-                let worker_message =
-                    read_pack_to_worker_message(&mut workers[worker_index]).unwrap();
+                let worker_message = read_pack_to_worker_message(worker).unwrap();
                 assert_eq!(worker_message.batch.num_transactions, 1);
                 assert_eq!(
                     transaction_batch_regions(&replay_stage.allocator, worker_message.batch),
