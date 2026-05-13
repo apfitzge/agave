@@ -109,6 +109,7 @@ pub struct BlockVerificationScheduler {
     entry_hash_verifier: EntryHashVerifier,
     in_flight_execution_messages: usize,
     in_flight_executions_per_thread: Vec<usize>,
+    in_flight_execution_cost_units_per_thread: Vec<u64>,
 }
 
 struct SchedulingState {
@@ -436,10 +437,17 @@ impl SchedulingState {
 fn select_execution_thread(
     thread_set: ThreadSet,
     in_flight_executions_per_thread: &[usize],
+    in_flight_execution_cost_units_per_thread: &[u64],
 ) -> ThreadId {
     thread_set
         .contained_threads_iter()
-        .min_by_key(|thread_id| (in_flight_executions_per_thread[*thread_id], *thread_id))
+        .min_by_key(|thread_id| {
+            (
+                in_flight_execution_cost_units_per_thread[*thread_id],
+                in_flight_executions_per_thread[*thread_id],
+                *thread_id,
+            )
+        })
         .expect("schedulable thread set must not be empty")
 }
 
@@ -448,6 +456,7 @@ struct ExecutionDispatchContext<'a> {
     workers: &'a mut [BlockVerificationStageWorkerSession],
     in_flight_execution_messages: &'a mut usize,
     in_flight_executions_per_thread: &'a mut [usize],
+    in_flight_execution_cost_units_per_thread: &'a mut [u64],
 }
 
 #[derive(Default)]
@@ -496,7 +505,13 @@ impl ExecutionDispatchContext<'_> {
             transaction.write_locks(),
             transaction.read_locks(),
             available_threads,
-            |thread_set| select_execution_thread(thread_set, self.in_flight_executions_per_thread),
+            |thread_set| {
+                select_execution_thread(
+                    thread_set,
+                    self.in_flight_executions_per_thread,
+                    self.in_flight_execution_cost_units_per_thread,
+                )
+            },
         ) else {
             return None;
         };
@@ -531,7 +546,7 @@ impl ExecutionDispatchContext<'_> {
         }
         self.workers[thread_id].pack_to_worker.commit();
 
-        self.increment_in_flight_execution_messages(thread_id);
+        self.increment_in_flight_execution_messages(thread_id, transaction.estimated_cost_units());
         Some(thread_id)
     }
 
@@ -551,9 +566,13 @@ impl ExecutionDispatchContext<'_> {
         available_threads
     }
 
-    fn increment_in_flight_execution_messages(&mut self, thread_id: ThreadId) {
+    fn increment_in_flight_execution_messages(&mut self, thread_id: ThreadId, cost_units: u64) {
         *self.in_flight_execution_messages += 1;
         self.in_flight_executions_per_thread[thread_id] += 1;
+        self.in_flight_execution_cost_units_per_thread[thread_id] = self
+            .in_flight_execution_cost_units_per_thread[thread_id]
+            .checked_add(cost_units)
+            .expect("in-flight execution cost overflow");
     }
 
     fn allocate_transaction_execution_batch(
@@ -792,6 +811,10 @@ impl TransactionState {
         }
     }
 
+    fn estimated_cost_units(&self) -> u64 {
+        self.scheduling_metadata().cost.estimated_cost_units
+    }
+
     fn account_keys(&self) -> impl Iterator<Item = &Pubkey> + Clone {
         self.transaction_view()
             .static_account_keys()
@@ -865,6 +888,7 @@ impl BlockVerificationScheduler {
             entry_hash_verifier: EntryHashVerifier::new(entry_verification_threads),
             in_flight_execution_messages: 0,
             in_flight_executions_per_thread: vec![0; worker_count],
+            in_flight_execution_cost_units_per_thread: vec![0; worker_count],
         }
     }
 
@@ -1317,6 +1341,8 @@ impl BlockVerificationScheduler {
             workers: &mut self.session.workers,
             in_flight_execution_messages: &mut self.in_flight_execution_messages,
             in_flight_executions_per_thread: &mut self.in_flight_executions_per_thread,
+            in_flight_execution_cost_units_per_thread: &mut self
+                .in_flight_execution_cost_units_per_thread,
         };
         if !dispatch_context.has_capacity() {
             return 0;
@@ -1443,8 +1469,9 @@ impl BlockVerificationScheduler {
         self.free_transaction_batch_allocation(message.batch);
 
         let previous_transaction_state = self.finish_worker_execution(worker_execution);
+        let cost_units = previous_transaction_state.estimated_cost_units();
         self.free_transaction_state_allocations(previous_transaction_state);
-        self.decrement_in_flight_execution_messages(worker_execution.thread_id);
+        self.decrement_in_flight_execution_messages(worker_execution.thread_id, cost_units);
 
         if execution_response_is_invalid(&execution_response) {
             self.mark_slot_failed(slot, replay_block_status_reasons::INVALID_TRANSACTION);
@@ -1621,7 +1648,7 @@ impl BlockVerificationScheduler {
         }
     }
 
-    fn decrement_in_flight_execution_messages(&mut self, thread_id: ThreadId) {
+    fn decrement_in_flight_execution_messages(&mut self, thread_id: ThreadId, cost_units: u64) {
         self.in_flight_execution_messages = self
             .in_flight_execution_messages
             .checked_sub(1)
@@ -1630,6 +1657,10 @@ impl BlockVerificationScheduler {
             [thread_id]
             .checked_sub(1)
             .expect("execution response without in-flight execution on thread");
+        self.in_flight_execution_cost_units_per_thread[thread_id] = self
+            .in_flight_execution_cost_units_per_thread[thread_id]
+            .checked_sub(cost_units)
+            .expect("execution response without in-flight execution cost on thread");
     }
 
     fn spawn_entry_hash_verification(
@@ -2215,6 +2246,14 @@ mod tests {
             estimated_cost_units: 0,
             allocated_accounts_data_size: 0,
             writable_account_bitfields: [1, 0, 0, 0],
+        }
+    }
+
+    fn successful_check_response_with_cost(cost_units: u64) -> CheckResponse {
+        CheckResponse {
+            cost_model_flags: cost_model_flags::REQUESTED | cost_model_flags::PERFORMED,
+            estimated_cost_units: cost_units,
+            ..successful_check_response()
         }
     }
 
@@ -2997,6 +3036,7 @@ mod tests {
         assert_eq!(state.in_flight_execution_messages, 1);
         assert_eq!(scheduler.in_flight_execution_messages, 1);
         assert_eq!(scheduler.in_flight_executions_per_thread, vec![1]);
+        assert_eq!(scheduler.in_flight_execution_cost_units_per_thread, vec![0]);
         assert_eq!(in_flight_transaction_thread_id(state, 0), 0);
     }
 
@@ -3039,6 +3079,7 @@ mod tests {
         assert_eq!(state.in_flight_execution_messages, 0);
         assert_eq!(scheduler.in_flight_execution_messages, 0);
         assert_eq!(scheduler.in_flight_executions_per_thread, vec![0]);
+        assert_eq!(scheduler.in_flight_execution_cost_units_per_thread, vec![0]);
         assert!(state.ready_transactions.is_empty());
         assert!(matches!(
             state.transactions.get(0).unwrap(),
@@ -3279,6 +3320,111 @@ mod tests {
     }
 
     #[test]
+    fn execution_dispatch_load_balances_by_estimated_cost_then_transaction_count() {
+        let (mut scheduler, mut replay_stage, mut workers) =
+            setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
+                allocator_size: 64 * 1024 * 1024,
+                replay_to_pack_capacity: 8,
+                replay_block_status_capacity: 8,
+                worker_count: 2,
+                pack_to_worker_capacity: 8,
+                worker_to_pack_capacity: 8,
+            });
+        let transactions: [SharableTransactionRegion; 3] = core::array::from_fn(|index| {
+            allocate_minimal_transaction_region_with_account(
+                &replay_stage.allocator,
+                index as u8,
+                Pubkey::new_unique(),
+            )
+        });
+        write_replay_messages(
+            &mut replay_stage,
+            [
+                begin(42),
+                entry(42, 3),
+                transaction_message(transactions[0]),
+                transaction_message(transactions[1]),
+                transaction_message(transactions[2]),
+            ],
+        );
+        assert_eq!(scheduler.service_ingress_queue(5), 5);
+        assert_eq!(scheduler.service_transaction_check_dispatches(1024), 3);
+
+        for worker in &mut workers {
+            while let Some(message) = read_pack_to_worker_message(worker) {
+                let metadata = transaction_check_metadata(&replay_stage.allocator, message.batch);
+                let cost_units = match metadata.transaction_index {
+                    0 => 100,
+                    1 | 2 => 1,
+                    transaction_index => panic!("unexpected transaction index {transaction_index}"),
+                };
+                queue_worker_check_response(
+                    worker,
+                    message.batch,
+                    successful_check_response_with_cost(cost_units),
+                );
+            }
+        }
+        assert_eq!(scheduler.service_worker_responses(3), 3);
+
+        assert_eq!(scheduler.service_transaction_execution_dispatches(3, 3), 3);
+
+        let first_worker_execution = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        assert!(read_pack_to_worker_message(&mut workers[0]).is_none());
+        assert_eq!(
+            transaction_execution_metadata(&replay_stage.allocator, first_worker_execution.batch),
+            PendingWorkerExecution {
+                slot: 42,
+                transaction_index: 0,
+                thread_id: 0,
+            },
+        );
+
+        let second_worker_first_execution = read_pack_to_worker_message(&mut workers[1]).unwrap();
+        let second_worker_second_execution = read_pack_to_worker_message(&mut workers[1]).unwrap();
+        assert!(read_pack_to_worker_message(&mut workers[1]).is_none());
+        assert_eq!(
+            transaction_execution_metadata(
+                &replay_stage.allocator,
+                second_worker_first_execution.batch,
+            ),
+            PendingWorkerExecution {
+                slot: 42,
+                transaction_index: 1,
+                thread_id: 1,
+            },
+        );
+        assert_eq!(
+            transaction_execution_metadata(
+                &replay_stage.allocator,
+                second_worker_second_execution.batch,
+            ),
+            PendingWorkerExecution {
+                slot: 42,
+                transaction_index: 2,
+                thread_id: 1,
+            },
+        );
+        assert_eq!(scheduler.in_flight_executions_per_thread, vec![1, 2]);
+        assert_eq!(
+            scheduler.in_flight_execution_cost_units_per_thread,
+            vec![100, 2],
+        );
+
+        queue_worker_execution_response(
+            &mut workers[0],
+            first_worker_execution.batch,
+            successful_execution_response(),
+        );
+        assert_eq!(scheduler.service_worker_responses(1), 1);
+        assert_eq!(scheduler.in_flight_executions_per_thread, vec![0, 2]);
+        assert_eq!(
+            scheduler.in_flight_execution_cost_units_per_thread,
+            vec![0, 2],
+        );
+    }
+
+    #[test]
     fn execution_dispatch_load_balances_across_slots() {
         let (mut scheduler, mut replay_stage, mut workers) =
             setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
@@ -3337,6 +3483,10 @@ mod tests {
         execution_slots.sort_unstable();
         assert_eq!(execution_slots, [41, 42]);
         assert_eq!(scheduler.in_flight_executions_per_thread, vec![1, 1]);
+        assert_eq!(
+            scheduler.in_flight_execution_cost_units_per_thread,
+            vec![0, 0],
+        );
     }
 
     #[test]
@@ -3405,6 +3555,10 @@ mod tests {
                 MAX_OUTSTANDING_EXECUTIONS_PER_WORKER,
                 MAX_OUTSTANDING_EXECUTIONS_PER_WORKER,
             ],
+        );
+        assert_eq!(
+            scheduler.in_flight_execution_cost_units_per_thread,
+            vec![0, 0],
         );
         let state = scheduler.scheduling_states.get(&42).unwrap();
         assert_eq!(state.ready_transactions.len(), 8);
