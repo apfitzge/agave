@@ -64,6 +64,7 @@ const EXECUTION_TRANSACTION_BATCH_ALLOCATION_SIZE: u32 =
 const REPLAY_TRANSACTION_CHECK_FLAGS: u16 = pack_message_flags::CHECK
     | check_flags::VERIFY_SIGNATURES
     | check_flags::LOAD_ADDRESS_LOOKUP_TABLES
+    | check_flags::ESTIMATE_COST
     | check_flags::REPLAY;
 const REPLAY_TRANSACTION_EXECUTION_FLAGS: u16 =
     pack_message_flags::EXECUTE | execution_flags::REPLAY;
@@ -381,6 +382,7 @@ impl SchedulingState {
         let TransactionState::Checked {
             transaction,
             resolved_pubkeys,
+            scheduling_metadata,
             check_response,
         } = previous_transaction_state
         else {
@@ -389,6 +391,7 @@ impl SchedulingState {
         *transaction_state = TransactionState::InFlight {
             transaction,
             resolved_pubkeys,
+            scheduling_metadata,
             check_response,
             thread_id,
         };
@@ -673,6 +676,40 @@ struct PendingWorkerExecution {
     thread_id: ThreadId,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TransactionCostMetadata {
+    cost_model_flags: u8,
+    estimated_cost_units: u64,
+    allocated_accounts_data_size: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TransactionSchedulingMetadata {
+    cost: TransactionCostMetadata,
+    writable_account_bitfields: [u64; 4],
+}
+
+impl TransactionSchedulingMetadata {
+    fn from_check_response(response: &CheckResponse) -> Self {
+        Self {
+            cost: TransactionCostMetadata {
+                cost_model_flags: response.cost_model_flags,
+                estimated_cost_units: response.estimated_cost_units,
+                allocated_accounts_data_size: response.allocated_accounts_data_size,
+            },
+            writable_account_bitfields: response.writable_account_bitfields,
+        }
+    }
+
+    fn is_writable(&self, index: usize) -> bool {
+        let bitfield = self
+            .writable_account_bitfields
+            .get(index / 64)
+            .expect("account index must fit in CHECK writable account bitfields");
+        bitfield & (1u64 << (index % 64)) != 0
+    }
+}
+
 enum TransactionState {
     Pending {
         transaction: TransactionPtr,
@@ -680,11 +717,13 @@ enum TransactionState {
     Checked {
         transaction: SanitizedTransactionView<TransactionPtr>,
         resolved_pubkeys: Option<PubkeysPtr>,
+        scheduling_metadata: TransactionSchedulingMetadata,
         check_response: CheckResponse,
     },
     InFlight {
         transaction: SanitizedTransactionView<TransactionPtr>,
         resolved_pubkeys: Option<PubkeysPtr>,
+        scheduling_metadata: TransactionSchedulingMetadata,
         check_response: CheckResponse,
         thread_id: ThreadId,
     },
@@ -737,6 +776,22 @@ impl TransactionState {
         }
     }
 
+    fn scheduling_metadata(&self) -> &TransactionSchedulingMetadata {
+        match self {
+            Self::Checked {
+                scheduling_metadata,
+                ..
+            }
+            | Self::InFlight {
+                scheduling_metadata,
+                ..
+            } => scheduling_metadata,
+            Self::Pending { .. } => panic!("transaction state is pending"),
+            Self::Executed => panic!("transaction state is executed"),
+            Self::Transitioning => panic!("transaction state is transitioning"),
+        }
+    }
+
     fn account_keys(&self) -> impl Iterator<Item = &Pubkey> + Clone {
         self.transaction_view()
             .static_account_keys()
@@ -747,14 +802,14 @@ impl TransactionState {
     fn write_locks(&self) -> impl Iterator<Item = &Pubkey> + Clone {
         self.account_keys()
             .enumerate()
-            .filter(|(index, _)| self.is_writable(*index as u8))
+            .filter(|(index, _)| self.is_writable(*index))
             .map(|(_, key)| key)
     }
 
     fn read_locks(&self) -> impl Iterator<Item = &Pubkey> + Clone {
         self.account_keys()
             .enumerate()
-            .filter(|(index, _)| !self.is_writable(*index as u8))
+            .filter(|(index, _)| !self.is_writable(*index))
             .map(|(_, key)| key)
     }
 
@@ -780,21 +835,8 @@ impl TransactionState {
         unschedulable_read_locks.extend(self.read_locks().copied());
     }
 
-    fn is_writable(&self, index: u8) -> bool {
-        let transaction = self.transaction_view();
-        if index >= transaction.num_static_account_keys() {
-            let loaded_address_index = index.wrapping_sub(transaction.num_static_account_keys());
-            loaded_address_index < transaction.total_writable_lookup_accounts() as u8
-        } else {
-            index
-                < transaction
-                    .num_required_signatures()
-                    .wrapping_sub(transaction.num_readonly_signed_static_accounts())
-                || (index >= transaction.num_required_signatures()
-                    && index
-                        < (transaction.static_account_keys().len() as u8)
-                            .wrapping_sub(transaction.num_readonly_unsigned_static_accounts()))
-        }
+    fn is_writable(&self, index: usize) -> bool {
+        self.scheduling_metadata().is_writable(index)
     }
 }
 
@@ -1525,6 +1567,8 @@ impl BlockVerificationScheduler {
             return;
         }
 
+        let scheduling_metadata =
+            TransactionSchedulingMetadata::from_check_response(&check_response);
         let resolved_pubkeys = self.take_resolved_pubkeys(&mut check_response);
         let state = self.scheduling_state_mut(worker_check.slot);
         let transaction_state = state
@@ -1544,6 +1588,7 @@ impl BlockVerificationScheduler {
         *transaction_state = TransactionState::Checked {
             transaction,
             resolved_pubkeys,
+            scheduling_metadata,
             check_response,
         };
 
@@ -1728,6 +1773,7 @@ impl BlockVerificationScheduler {
                 transaction,
                 resolved_pubkeys,
                 check_response,
+                ..
             }
             | TransactionState::InFlight {
                 transaction,
@@ -1845,7 +1891,9 @@ mod tests {
             BlockVerificationStageSessions, BlockVerificationStageSetupConfig,
             BlockVerificationWorkerSession, ReplayStageSession,
         },
-        agave_scheduler_bindings::{ReplayToPackMessage, ReplayToPackMessagePayload},
+        agave_scheduler_bindings::{
+            ReplayToPackMessage, ReplayToPackMessagePayload, worker_message_types::cost_model_flags,
+        },
         agave_scheduling_utils::responses_region::{
             execution_responses_from_iter, resolve_responses_from_iter,
         },
@@ -2050,6 +2098,7 @@ mod tests {
             transaction,
             resolved_pubkeys,
             check_response,
+            ..
         } = state
             .transactions
             .get(transaction_index)
@@ -2059,6 +2108,24 @@ mod tests {
         };
 
         (transaction, resolved_pubkeys.as_ref(), check_response)
+    }
+
+    fn checked_transaction_scheduling_metadata(
+        state: &SchedulingState,
+        transaction_index: usize,
+    ) -> &TransactionSchedulingMetadata {
+        let TransactionState::Checked {
+            scheduling_metadata,
+            ..
+        } = state
+            .transactions
+            .get(transaction_index)
+            .expect("transaction state should exist")
+        else {
+            panic!("transaction state should be checked");
+        };
+
+        scheduling_metadata
     }
 
     fn in_flight_transaction_thread_id(
@@ -2147,7 +2214,7 @@ mod tests {
             },
             estimated_cost_units: 0,
             allocated_accounts_data_size: 0,
-            writable_account_bitfields: [0; 4],
+            writable_account_bitfields: [1, 0, 0, 0],
         }
     }
 
@@ -2532,6 +2599,7 @@ mod tests {
                 pack_message_flags::CHECK
                     | check_flags::VERIFY_SIGNATURES
                     | check_flags::LOAD_ADDRESS_LOOKUP_TABLES
+                    | check_flags::ESTIMATE_COST
                     | check_flags::REPLAY,
             );
             assert_eq!(worker_message.max_working_slot, 42);
@@ -2662,6 +2730,61 @@ mod tests {
     }
 
     #[test]
+    fn replay_check_requests_estimated_cost_metadata_and_retains_response() {
+        let (mut scheduler, mut replay_stage, mut workers) =
+            setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
+                allocator_size: 64 * 1024 * 1024,
+                replay_to_pack_capacity: 8,
+                replay_block_status_capacity: 8,
+                worker_count: 1,
+                pack_to_worker_capacity: 8,
+                worker_to_pack_capacity: 8,
+            });
+        let transaction = allocate_minimal_transaction_region(&replay_stage.allocator, 1);
+        write_replay_messages(
+            &mut replay_stage,
+            [begin(42), entry(42, 1), transaction_message(transaction)],
+        );
+        assert_eq!(scheduler.service_ingress_queue(3), 3);
+        assert_eq!(scheduler.service_transaction_check_dispatches(1024), 1);
+
+        let worker_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        assert_eq!(worker_message.flags, REPLAY_TRANSACTION_CHECK_FLAGS);
+
+        let mut response = successful_check_response();
+        response.cost_model_flags = cost_model_flags::REQUESTED
+            | cost_model_flags::PERFORMED
+            | cost_model_flags::TRACK_AS_SIMPLE_VOTE;
+        response.estimated_cost_units = 12_345;
+        response.allocated_accounts_data_size = 67_890;
+        response.writable_account_bitfields = [0b11, 1 << 5, 0, u64::MAX];
+        response.resolution_slot = 42;
+        let expected_response = response;
+        queue_worker_check_response(&mut workers[0], worker_message.batch, response);
+
+        assert_eq!(scheduler.service_worker_responses(1), 1);
+
+        let state = scheduler.scheduling_states.get(&42).unwrap();
+        let (_, resolved_pubkeys, check_response) = checked_transaction_state(state, 0);
+        let scheduling_metadata = checked_transaction_scheduling_metadata(state, 0);
+        assert!(resolved_pubkeys.is_none());
+        assert_eq!(*check_response, expected_response);
+        assert_eq!(
+            scheduling_metadata.cost,
+            TransactionCostMetadata {
+                cost_model_flags: expected_response.cost_model_flags,
+                estimated_cost_units: expected_response.estimated_cost_units,
+                allocated_accounts_data_size: expected_response.allocated_accounts_data_size,
+            },
+        );
+        assert_eq!(
+            scheduling_metadata.writable_account_bitfields,
+            expected_response.writable_account_bitfields,
+        );
+        assert_eq!(read_replay_block_status(&mut replay_stage), None);
+    }
+
+    #[test]
     fn checked_transaction_moves_to_in_flight_and_executed() {
         let (mut scheduler, mut replay_stage, mut workers) =
             setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
@@ -2768,6 +2891,57 @@ mod tests {
             })
             .unwrap();
         assert_eq!(second_thread_id, first_thread_id);
+
+        state.unlock_transaction_accounts(1, second_thread_id);
+        state.unlock_transaction_accounts(0, first_thread_id);
+    }
+
+    #[test]
+    fn account_locks_use_check_demoted_writable_bitfields() {
+        let (mut scheduler, mut replay_stage, mut workers) =
+            setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
+                allocator_size: 64 * 1024 * 1024,
+                replay_to_pack_capacity: 8,
+                replay_block_status_capacity: 8,
+                worker_count: 2,
+                pack_to_worker_capacity: 8,
+                worker_to_pack_capacity: 8,
+            });
+        let account = Pubkey::new_unique();
+        let first_transaction =
+            allocate_minimal_transaction_region_with_account(&replay_stage.allocator, 1, account);
+        let second_transaction =
+            allocate_minimal_transaction_region_with_account(&replay_stage.allocator, 2, account);
+        write_replay_messages(
+            &mut replay_stage,
+            [
+                begin(42),
+                entry(42, 2),
+                transaction_message(first_transaction),
+                transaction_message(second_transaction),
+            ],
+        );
+        assert_eq!(scheduler.service_ingress_queue(4), 4);
+        assert_eq!(scheduler.service_transaction_check_dispatches(1024), 2);
+        let first_check = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        let second_check = read_pack_to_worker_message(&mut workers[1]).unwrap();
+        let mut first_response = successful_check_response();
+        let mut second_response = successful_check_response();
+        first_response.writable_account_bitfields = [0; 4];
+        second_response.writable_account_bitfields = [0; 4];
+        queue_worker_check_response(&mut workers[0], first_check.batch, first_response);
+        queue_worker_check_response(&mut workers[1], second_check.batch, second_response);
+        assert_eq!(scheduler.service_worker_responses(2), 2);
+
+        let state = scheduler.scheduling_state_mut(42);
+        let first_thread_id = state
+            .try_lock_ready_transaction(0, ThreadSet::any(2), first_thread)
+            .unwrap();
+        assert_eq!(first_thread_id, 0);
+        let second_thread_id = state
+            .try_lock_ready_transaction(1, ThreadSet::only(1), first_thread)
+            .unwrap();
+        assert_eq!(second_thread_id, 1);
 
         state.unlock_transaction_accounts(1, second_thread_id);
         state.unlock_transaction_accounts(0, first_thread_id);
