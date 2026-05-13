@@ -281,6 +281,7 @@ where
                 | fee_payer_balance_flags::PERFORMED,
             resolve_flags: resolve_flags::REQUESTED | resolve_flags::PERFORMED,
             signature_verification_flags: 0,
+            cost_model_flags: 0,
             included_slot: progress.current_slot,
             balance_slot: progress.current_slot,
             fee_payer_balance: u64::from(u32::MAX),
@@ -290,6 +291,9 @@ where
                 offset: 0,
                 num_pubkeys: 0,
             },
+            estimated_cost_units: 0,
+            allocated_accounts_data_size: 0,
+            writable_account_bitfields: [0; 4],
         }
     }
 

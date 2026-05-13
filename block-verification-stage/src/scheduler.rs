@@ -2135,6 +2135,7 @@ mod tests {
             resolve_flags: resolve_flags::REQUESTED | resolve_flags::PERFORMED,
             signature_verification_flags: signature_verification_flags::REQUESTED
                 | signature_verification_flags::PERFORMED,
+            cost_model_flags: 0,
             included_slot: 0,
             balance_slot: 0,
             fee_payer_balance: 0,
@@ -2144,6 +2145,9 @@ mod tests {
                 offset: 0,
                 num_pubkeys: 0,
             },
+            estimated_cost_units: 0,
+            allocated_accounts_data_size: 0,
+            writable_account_bitfields: [0; 4],
         }
     }
 

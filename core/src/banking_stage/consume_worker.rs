@@ -195,9 +195,9 @@ pub(crate) mod external {
             pack_message_flags::{self, check_flags, execution_flags},
             processed_codes,
             worker_message_types::{
-                CheckResponse, ExecutionResponse, fee_payer_balance_flags, not_included_reasons,
-                parsing_and_sanitization_flags, resolve_flags, signature_verification_flags,
-                status_check_flags,
+                CheckResponse, ExecutionResponse, cost_model_flags, fee_payer_balance_flags,
+                not_included_reasons, parsing_and_sanitization_flags, resolve_flags,
+                signature_verification_flags, status_check_flags,
             },
         },
         agave_scheduling_utils::{
@@ -219,6 +219,7 @@ pub(crate) mod external {
             bank_forks::{BankForks, BankPair, SharableBanks},
         },
         solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
+        solana_svm_transaction::svm_message::SVMMessage,
         solana_transaction::TransactionError,
         std::{ptr::NonNull, sync::RwLock},
     };
@@ -591,6 +592,14 @@ pub(crate) mod external {
             let (parsing_and_resolve_results, txs, max_ages) =
                 Self::translate_transaction_batch(&batch, &parse_and_resolve_bank);
 
+            Self::check_populate_resolved_metadata(
+                &parsing_and_resolve_results,
+                &txs,
+                response_slice,
+                &parse_and_resolve_bank,
+                message.flags & check_flags::ESTIMATE_COST != 0,
+            );
+
             if message.flags & check_flags::LOAD_ADDRESS_LOOKUP_TABLES != 0 {
                 self.check_resolve_pubkeys(
                     &parsing_results,
@@ -598,7 +607,6 @@ pub(crate) mod external {
                     &txs,
                     &max_ages,
                     response_slice,
-                    parse_and_resolve_bank.slot(),
                 )?;
             }
 
@@ -764,7 +772,6 @@ pub(crate) mod external {
             txs: &[Tx],
             max_ages: &[MaxAge],
             responses: &mut [CheckResponse],
-            resolution_slot: Slot,
         ) -> Result<(), ExternalConsumeWorkerError> {
             assert_eq!(parsing_results.len(), parsing_and_resolve_results.len());
             assert_eq!(parsing_results.len(), responses.len());
@@ -834,7 +841,6 @@ pub(crate) mod external {
                     ),
                 };
 
-                response.resolution_slot = resolution_slot;
                 response.resolved_pubkeys = sharable_keys;
                 response.min_alt_deactivation_slot = alt_invalidation_slot;
             }
@@ -902,7 +908,12 @@ pub(crate) mod external {
 
             // SAFETY: `response_ptr` is valid and of length message.batch.num_transactions
             unsafe {
-                Self::check_populate_initial_messages(message, &parsing_results, responses_ptr)
+                Self::check_populate_initial_messages(
+                    message,
+                    &parsing_results,
+                    responses_ptr,
+                    bank.slot(),
+                )
             };
             // SAFETY: `response_ptr` is valid and of length message.batch.num_transactions
             //         initial messages populated immediately above, so not possible to have
@@ -926,6 +937,7 @@ pub(crate) mod external {
             message: &PackToWorkerMessage,
             parsing_results: &[Result<(), TransactionViewError>],
             responses_ptr: NonNull<CheckResponse>,
+            resolution_slot: Slot,
         ) {
             // Populate initial responses with the result of parsing/sanitization.
             assert_eq!(
@@ -955,6 +967,11 @@ pub(crate) mod external {
                 } else {
                     0
                 };
+            let initial_cost_model_flags = if message.flags & check_flags::ESTIMATE_COST != 0 {
+                cost_model_flags::REQUESTED
+            } else {
+                0
+            };
             // Setup initial responses with requested checks.
             // Values only filled in when check is performed.
             for (transaction_index, parsing_result) in parsing_results.iter().enumerate() {
@@ -973,15 +990,19 @@ pub(crate) mod external {
                         fee_payer_balance_flags: initial_fee_payer_balance_flags,
                         resolve_flags: initial_resolve_flags,
                         signature_verification_flags: initial_signature_verification_flags,
+                        cost_model_flags: initial_cost_model_flags,
                         included_slot: 0,
                         balance_slot: 0,
                         fee_payer_balance: 0,
-                        resolution_slot: 0,
+                        resolution_slot,
                         min_alt_deactivation_slot: 0,
                         resolved_pubkeys: SharablePubkeys {
                             offset: 0,
                             num_pubkeys: 0,
                         },
+                        estimated_cost_units: 0,
+                        allocated_accounts_data_size: 0,
+                        writable_account_bitfields: [0; 4],
                     })
                 };
             }
@@ -1100,6 +1121,54 @@ pub(crate) mod external {
             }
         }
 
+        fn check_populate_resolved_metadata<D: TransactionData>(
+            parsing_and_resolve_results: &[Result<(), PacketHandlingError>],
+            txs: &[RuntimeTransaction<ResolvedTransactionView<D>>],
+            responses: &mut [CheckResponse],
+            bank: &Bank,
+            estimate_cost: bool,
+        ) {
+            assert_eq!(parsing_and_resolve_results.len(), responses.len());
+
+            let mut tx_iter = txs.iter();
+            for (transaction_index, parsing_and_resolve_result) in
+                parsing_and_resolve_results.iter().enumerate()
+            {
+                if parsing_and_resolve_result.is_err() {
+                    continue;
+                }
+
+                let tx = tx_iter
+                    .next()
+                    .expect("txs must contain element for each successfully resolved result");
+                let response = &mut responses[transaction_index];
+                response.writable_account_bitfields = Self::writable_account_bitfields(tx);
+
+                if estimate_cost {
+                    let estimated_cost = CostModel::calculate_cost(tx, &bank.feature_set);
+                    response.estimated_cost_units = estimated_cost.sum();
+                    response.allocated_accounts_data_size =
+                        estimated_cost.allocated_accounts_data_size();
+                    response.cost_model_flags |= cost_model_flags::PERFORMED;
+                    if estimated_cost.should_track_as_simple_vote() {
+                        response.cost_model_flags |= cost_model_flags::TRACK_AS_SIMPLE_VOTE;
+                    }
+                }
+            }
+        }
+
+        fn writable_account_bitfields<D: TransactionData>(
+            tx: &RuntimeTransaction<ResolvedTransactionView<D>>,
+        ) -> [u64; 4] {
+            let mut bitfields = [0; 4];
+            for index in 0..tx.account_keys().len().min(256) {
+                if tx.is_writable(index) {
+                    bitfields[index / 64] |= 1u64 << (index % 64);
+                }
+            }
+            bitfields
+        }
+
         /// Translate batch of transactions into usable
         fn translate_transaction_batch(
             batch: &TransactionPtrBatch,
@@ -1196,7 +1265,8 @@ pub(crate) mod external {
                 const CHECK_WORK_FLAGS: u16 = check_flags::STATUS_CHECKS
                     | check_flags::LOAD_FEE_PAYER_BALANCE
                     | check_flags::LOAD_ADDRESS_LOOKUP_TABLES
-                    | check_flags::VERIFY_SIGNATURES;
+                    | check_flags::VERIFY_SIGNATURES
+                    | check_flags::ESTIMATE_COST;
                 const ALLOWED_CHECK_BITS: u16 =
                     pack_message_flags::CHECK | CHECK_WORK_FLAGS | check_flags::REPLAY;
 
@@ -1323,6 +1393,8 @@ pub(crate) mod external {
             solana_system_interface::instruction as system_instruction,
             solana_system_transaction::transfer,
             solana_transaction::{TransactionError, versioned::VersionedTransaction},
+            solana_vote::vote_transaction,
+            solana_vote_program::vote_state::TowerSync,
             std::{
                 borrow::Cow,
                 collections::HashSet,
@@ -1667,6 +1739,9 @@ pub(crate) mod external {
                 pack_message_flags::CHECK | check_flags::VERIFY_SIGNATURES
             ));
             assert!(ExternalWorker::validate_message_flags(
+                pack_message_flags::CHECK | check_flags::ESTIMATE_COST
+            ));
+            assert!(ExternalWorker::validate_message_flags(
                 pack_message_flags::CHECK
                     | agave_scheduler_bindings::pack_message_flags::check_flags::LOAD_ADDRESS_LOOKUP_TABLES
                     | check_flags::REPLAY
@@ -1837,6 +1912,7 @@ pub(crate) mod external {
                     fee_payer_balance_flags: 0,
                     resolve_flags: 0,
                     signature_verification_flags: 0,
+                    cost_model_flags: 0,
                     included_slot: 0,
                     balance_slot: 0,
                     fee_payer_balance: 0,
@@ -1846,6 +1922,9 @@ pub(crate) mod external {
                         offset: 0,
                         num_pubkeys: 0,
                     },
+                    estimated_cost_units: 0,
+                    allocated_accounts_data_size: 0,
+                    writable_account_bitfields: [0; 4],
                 })
                 .collect()
         }
@@ -1853,7 +1932,9 @@ pub(crate) mod external {
         #[test]
         fn test_check_populate_initial_messages() {
             let message = PackToWorkerMessage {
-                flags: pack_message_flags::CHECK | check_flags::LOAD_FEE_PAYER_BALANCE,
+                flags: pack_message_flags::CHECK
+                    | check_flags::LOAD_FEE_PAYER_BALANCE
+                    | check_flags::ESTIMATE_COST,
                 max_working_slot: 1,
                 batch: SharableTransactionBatchRegion {
                     num_transactions: 3,
@@ -1873,6 +1954,7 @@ pub(crate) mod external {
                         Err(TransactionViewError::SanitizeError),
                     ],
                     responses_ptr,
+                    42,
                 )
             };
 
@@ -1890,6 +1972,8 @@ pub(crate) mod external {
                     response.fee_payer_balance_flags,
                     fee_payer_balance_flags::REQUESTED
                 );
+                assert_eq!(response.cost_model_flags, cost_model_flags::REQUESTED);
+                assert_eq!(response.resolution_slot, 42);
             }
         }
 
@@ -1910,6 +1994,21 @@ pub(crate) mod external {
             // transaction parseable while making verification fail.
             transaction[1] ^= 1;
             transaction
+        }
+
+        fn test_resolved_transaction<'a>(
+            tx: &'a [u8],
+            bank: &Bank,
+        ) -> RuntimeTransaction<ResolvedTransactionView<&'a [u8]>> {
+            translate_to_runtime_view(
+                tx,
+                bank,
+                bank.get_transaction_account_lock_limit(),
+                bank.feature_set.snapshot().limit_instruction_accounts,
+            )
+            .ok()
+            .unwrap()
+            .0
         }
 
         #[test]
@@ -2031,6 +2130,70 @@ pub(crate) mod external {
                 status_check_flags::PERFORMED | status_check_flags::ALREADY_PROCESSED
             );
             assert_eq!(responses[3].included_slot, bank.slot());
+        }
+
+        #[test]
+        fn test_check_populate_resolved_metadata_without_estimate_cost() {
+            let genesis = genesis_utils::create_genesis_config(1_000_000_000);
+            let bank = Bank::new_for_tests(&genesis.genesis_config);
+            let tx = test_serialized_transaction(bank.confirmed_last_blockhash());
+            let txs = [test_resolved_transaction(&tx, &bank)];
+            let mut responses = empty_check_responses(1);
+            responses[0].resolution_slot = bank.slot();
+
+            ExternalWorker::check_populate_resolved_metadata(
+                &[Ok(())],
+                &txs,
+                &mut responses,
+                &bank,
+                false,
+            );
+
+            assert_eq!(responses[0].writable_account_bitfields[0] & 0b11, 0b11);
+            assert_eq!(responses[0].writable_account_bitfields[0] & (1 << 2), 0);
+            assert_eq!(responses[0].writable_account_bitfields[1..], [0; 3]);
+            assert_eq!(responses[0].resolution_slot, bank.slot());
+            assert_eq!(responses[0].cost_model_flags, 0);
+            assert_eq!(responses[0].estimated_cost_units, 0);
+            assert_eq!(responses[0].allocated_accounts_data_size, 0);
+        }
+
+        #[test]
+        fn test_check_populate_resolved_metadata_sets_simple_vote_flag() {
+            let genesis = genesis_utils::create_genesis_config(1_000_000_000);
+            let mut bank = Bank::new_for_tests(&genesis.genesis_config);
+            bank.deactivate_feature(&agave_feature_set::remove_simple_vote_from_cost_model::id());
+            let node_keypair = Keypair::new();
+            let vote_keypair = Keypair::new();
+            let auth_keypair = Keypair::new();
+            let vote = vote_transaction::new_tower_sync_transaction(
+                TowerSync::default(),
+                bank.confirmed_last_blockhash(),
+                &node_keypair,
+                &vote_keypair,
+                &auth_keypair,
+                None,
+            );
+            let serialized_vote = wincode::serialize(&vote).unwrap();
+            let txs = [test_resolved_transaction(&serialized_vote, &bank)];
+            let mut responses = empty_check_responses(1);
+            responses[0].cost_model_flags = cost_model_flags::REQUESTED;
+
+            ExternalWorker::check_populate_resolved_metadata(
+                &[Ok(())],
+                &txs,
+                &mut responses,
+                &bank,
+                true,
+            );
+
+            assert_eq!(
+                responses[0].cost_model_flags,
+                cost_model_flags::REQUESTED
+                    | cost_model_flags::PERFORMED
+                    | cost_model_flags::TRACK_AS_SIMPLE_VOTE
+            );
+            assert!(responses[0].estimated_cost_units > 0);
         }
 
         #[test]
@@ -2249,6 +2412,44 @@ pub(crate) mod external {
             );
             assert_eq!(responses[0].balance_slot, test_frame.bank.slot());
             assert_eq!(responses[0].fee_payer_balance, fee_payer_balance);
+
+            test_frame.free_batch(batch);
+        }
+
+        #[test]
+        fn test_run_check_estimate_cost() {
+            let mut test_frame = setup_external_test_frame();
+            let transaction =
+                test_serialized_transaction(test_frame.bank.confirmed_last_blockhash());
+            let expected_tx = test_resolved_transaction(&transaction, &test_frame.bank);
+            let expected_cost =
+                CostModel::calculate_cost(&expected_tx, &test_frame.bank.feature_set);
+            let expected_cost_units = expected_cost.sum();
+            let expected_allocated_accounts_data_size =
+                expected_cost.allocated_accounts_data_size();
+
+            let batch = test_frame.allocate_batch(&[transaction]);
+            test_frame.send_message(PackToWorkerMessage {
+                flags: pack_message_flags::CHECK | check_flags::ESTIMATE_COST,
+                max_working_slot: test_frame.bank.slot(),
+                batch: batch.region,
+            });
+            test_frame.iterate().unwrap();
+            let response = test_frame.recv_response();
+            assert_eq!(response.processed_code, processed_codes::PROCESSED);
+            let responses = test_frame.check_responses(&response.responses);
+            assert_eq!(responses.len(), 1);
+            assert_eq!(
+                responses[0].cost_model_flags,
+                cost_model_flags::REQUESTED | cost_model_flags::PERFORMED
+            );
+            assert_eq!(responses[0].estimated_cost_units, expected_cost_units);
+            assert_eq!(
+                responses[0].allocated_accounts_data_size,
+                expected_allocated_accounts_data_size
+            );
+            assert_eq!(responses[0].resolution_slot, test_frame.bank.slot());
+            assert_eq!(responses[0].writable_account_bitfields[0] & 0b11, 0b11);
 
             test_frame.free_batch(batch);
         }

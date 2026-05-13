@@ -389,7 +389,7 @@ pub struct ProgressMessage {
 // supports up to 4096 byte allocations. We must ensure that the
 // `TransactionResponseRegion` is able to contain responses for all
 // transactions sent. This is a conservative bound.
-pub const MAX_TRANSACTIONS_PER_MESSAGE: usize = 64;
+pub const MAX_TRANSACTIONS_PER_MESSAGE: usize = 32;
 
 /// Sentinel used when a worker message is not a replay execution or check message.
 pub const NO_REPLAY_BANK_SLOT: u64 = u64::MAX;
@@ -478,6 +478,10 @@ pub mod pack_message_flags {
 
         /// Transaction signatures should be verified.
         pub const VERIFY_SIGNATURES: u16 = 1 << 5;
+
+        /// Estimated cost metadata should be returned for transactions that
+        /// successfully parse and resolve.
+        pub const ESTIMATE_COST: u16 = 1 << 6;
     }
 }
 
@@ -699,6 +703,15 @@ pub mod worker_message_types {
         pub const FAILED: u8 = 1 << 2;
     }
 
+    pub mod cost_model_flags {
+        /// Flag set if estimated cost metadata was requested.
+        pub const REQUESTED: u8 = 1 << 0;
+        /// Flag set if estimated cost calculation was performed.
+        pub const PERFORMED: u8 = 1 << 1;
+        /// Flag set if the estimated cost should be tracked as a simple vote.
+        pub const TRACK_AS_SIMPLE_VOTE: u8 = 1 << 2;
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     #[repr(C)]
     pub struct CheckResponse {
@@ -712,6 +725,8 @@ pub mod worker_message_types {
         pub resolve_flags: u8,
         /// See [`signature_verification_flags`] for details.
         pub signature_verification_flags: u8,
+        /// See [`cost_model_flags`] for details.
+        pub cost_model_flags: u8,
 
         /// If [`status_check_flags::ALREADY_PROCESSED`] is set,
         /// this is the slot the transaction was previously included in.
@@ -727,9 +742,8 @@ pub mod worker_message_types {
         /// The balance of the fee-payer.
         pub fee_payer_balance: u64,
 
-        /// Set only if [`resolve_flags::PERFORMED`] is set,
-        /// otherwise the value is undefined.
-        /// The slot of the bank used to resolve the pubkeys.
+        /// The slot of the bank used for transaction resolution, cost model
+        /// metadata, and writable account bitfields.
         pub resolution_slot: u64,
         /// Set only if [`resolve_flags::PERFORMED`] is set,
         /// otherwise the value is undefined.
@@ -742,5 +756,29 @@ pub mod worker_message_types {
         /// Freeing this memory is the responsibility of the external
         /// pack process.
         pub resolved_pubkeys: SharablePubkeys,
+
+        /// Set only if [`cost_model_flags::PERFORMED`] is set,
+        /// otherwise the value is undefined.
+        /// Calculated using the bank identified by `resolution_slot`.
+        pub estimated_cost_units: u64,
+        /// Set only if [`cost_model_flags::PERFORMED`] is set,
+        /// otherwise the value is undefined.
+        /// Calculated using the bank identified by `resolution_slot`.
+        pub allocated_accounts_data_size: u64,
+        /// Set only if transaction parsing and resolution succeeded,
+        /// otherwise the value is undefined.
+        /// Derived from the transaction resolved against the bank identified
+        /// by `resolution_slot`.
+        /// Bit N in element M corresponds to account key index M * 64 + N.
+        pub writable_account_bitfields: [u64; 4],
     }
 }
+
+const _: () = assert!(
+    MAX_TRANSACTIONS_PER_MESSAGE * core::mem::size_of::<worker_message_types::CheckResponse>()
+        <= 4096
+);
+const _: () = assert!(
+    MAX_TRANSACTIONS_PER_MESSAGE * core::mem::size_of::<worker_message_types::ExecutionResponse>()
+        <= 4096
+);
