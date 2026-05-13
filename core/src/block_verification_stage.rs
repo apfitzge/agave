@@ -190,8 +190,30 @@ impl BlockVerificationSession {
                 },
             },
         };
-        self.slot_statuses.remove(&slot);
         self.send_message(message, exit)
+    }
+
+    pub(crate) fn finish_slot_before_bank_forks_removal(&mut self, slot: Slot, exit: &AtomicBool) {
+        if self.poll_status(slot).is_some() {
+            return;
+        }
+        if !self
+            .slot_statuses
+            .get(&slot)
+            .is_some_and(BlockVerificationSlotStatus::is_in_progress)
+        {
+            return;
+        }
+
+        if !self.abort_slot(slot, exit) {
+            return;
+        }
+        while !exit.load(std::sync::atomic::Ordering::Relaxed) {
+            if self.poll_status(slot).is_some() {
+                return;
+            }
+            thread::sleep(QUEUE_RETRY_SLEEP);
+        }
     }
 
     pub(crate) fn poll_status(&mut self, slot: Slot) -> Option<BlockVerificationSlotStatus> {

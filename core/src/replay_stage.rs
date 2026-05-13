@@ -931,6 +931,7 @@ impl ReplayStage {
                         &mut ancestors,
                         &mut descendants,
                         &mut progress,
+                        Some(&process_active_banks_context),
                     );
                 }
 
@@ -1193,6 +1194,7 @@ impl ReplayStage {
                             wait_to_vote_slot,
                             migration_status.as_ref(),
                             &mut tbft_structs,
+                            &process_active_banks_context,
                         );
                     }
                     voting_time.stop();
@@ -1311,7 +1313,7 @@ impl ReplayStage {
                     //
                     // Has to be before `maybe_start_leader()`. Otherwise, `ancestors` and `descendants`
                     // will be outdated, and we cannot assume `poh_bank` will be in either of these maps.
-                    Self::dump_then_repair_correct_slots(
+                    Self::dump_then_repair_correct_slots_with_block_verification(
                         &mut duplicate_slots_to_repair,
                         &mut ancestors,
                         &mut descendants,
@@ -1323,6 +1325,7 @@ impl ReplayStage {
                         &dumped_slots_sender,
                         &my_pubkey,
                         &leader_schedule_cache,
+                        Some(&process_active_banks_context),
                     );
                     dump_then_repair_correct_slots_time.stop();
 
@@ -1437,6 +1440,7 @@ impl ReplayStage {
         ancestors: &mut HashMap<Slot, HashSet<Slot>>,
         descendants: &mut HashMap<Slot, HashSet<Slot>>,
         progress: &mut ProgressMap,
+        process_active_banks_context: Option<&ProcessActiveBanksContext>,
     ) {
         let root_bank = bank_forks.read().unwrap().root_bank();
 
@@ -1495,6 +1499,7 @@ impl ReplayStage {
                 root_bank.as_ref(),
                 bank_forks,
                 blockstore,
+                process_active_banks_context,
             );
         }
 
@@ -1813,6 +1818,37 @@ impl ReplayStage {
         my_pubkey: &Pubkey,
         leader_schedule_cache: &LeaderScheduleCache,
     ) {
+        Self::dump_then_repair_correct_slots_with_block_verification(
+            duplicate_slots_to_repair,
+            ancestors,
+            descendants,
+            progress,
+            bank_forks,
+            blockstore,
+            poh_bank_slot,
+            purge_repair_slot_counter,
+            dumped_slots_sender,
+            my_pubkey,
+            leader_schedule_cache,
+            None,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dump_then_repair_correct_slots_with_block_verification(
+        duplicate_slots_to_repair: &mut DuplicateSlotsToRepair,
+        ancestors: &mut HashMap<Slot, HashSet<Slot>>,
+        descendants: &mut HashMap<Slot, HashSet<Slot>>,
+        progress: &mut ProgressMap,
+        bank_forks: &RwLock<BankForks>,
+        blockstore: &Blockstore,
+        poh_bank_slot: Option<Slot>,
+        purge_repair_slot_counter: &mut PurgeRepairSlotCounter,
+        dumped_slots_sender: &DumpedSlotsSender,
+        my_pubkey: &Pubkey,
+        leader_schedule_cache: &LeaderScheduleCache,
+        process_active_banks_context: Option<&ProcessActiveBanksContext>,
+    ) {
         if duplicate_slots_to_repair.is_empty() {
             return;
         }
@@ -1920,6 +1956,7 @@ impl ReplayStage {
                         &root_bank,
                         bank_forks,
                         blockstore,
+                        process_active_banks_context,
                     );
 
                     dumped.push((*duplicate_slot, *correct_hash));
@@ -2018,6 +2055,7 @@ impl ReplayStage {
         root_bank: &Bank,
         bank_forks: &RwLock<BankForks>,
         blockstore: &Blockstore,
+        process_active_banks_context: Option<&ProcessActiveBanksContext>,
     ) {
         warn!("purging slot {slot_to_purge}");
 
@@ -2049,6 +2087,16 @@ impl ReplayStage {
         for bank in banks_to_remove {
             let _ = bank.wait_for_completed_scheduler();
         }
+
+        let slots_to_remove = slot_descendants
+            .iter()
+            .chain(std::iter::once(&slot_to_purge))
+            .copied()
+            .collect::<Vec<_>>();
+        Self::finish_block_verification_before_bank_forks_removal(
+            process_active_banks_context,
+            slots_to_remove,
+        );
 
         // Grab the Slot and BankId's of the banks we need to purge, then clear the banks
         // from BankForks
@@ -2971,6 +3019,7 @@ impl ReplayStage {
         wait_to_vote_slot: Option<Slot>,
         migration_status: &MigrationStatus,
         tbft_structs: &mut TowerBFTStructures,
+        process_active_banks_context: &ProcessActiveBanksContext,
     ) {
         assert!(!migration_status.is_alpenglow_enabled());
         if bank.is_empty() {
@@ -3005,6 +3054,7 @@ impl ReplayStage {
                 tracked_vote_transactions,
                 drop_bank_sender,
                 tbft_structs,
+                Some(process_active_banks_context),
             );
 
             // Check if we've rooted a bank that will tell us the migration slot
@@ -4115,6 +4165,45 @@ impl ReplayStage {
         new_frozen_slots
     }
 
+    fn clean_block_verification_remote_frees(
+        process_active_banks_context: &ProcessActiveBanksContext,
+    ) {
+        process_active_banks_context
+            .block_verification_session
+            .lock()
+            .unwrap()
+            .clean_remote_free_lists();
+    }
+
+    fn finish_block_verification_before_bank_forks_removal(
+        process_active_banks_context: Option<&ProcessActiveBanksContext>,
+        slots: impl IntoIterator<Item = Slot>,
+    ) {
+        let Some(process_active_banks_context) = process_active_banks_context else {
+            return;
+        };
+
+        let slots = slots.into_iter().collect::<Vec<_>>();
+        let mut block_verification_session = process_active_banks_context
+            .block_verification_session
+            .lock()
+            .unwrap();
+        block_verification_session.clean_remote_free_lists();
+        for slot in &slots {
+            block_verification_session
+                .finish_slot_before_bank_forks_removal(*slot, &process_active_banks_context.exit);
+        }
+        drop(block_verification_session);
+
+        let mut pending_replay_tick_registrations = process_active_banks_context
+            .pending_replay_tick_registrations
+            .lock()
+            .unwrap();
+        for slot in slots {
+            pending_replay_tick_registrations.remove(&slot);
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn process_active_banks(
         process_active_banks_context: &ProcessActiveBanksContext,
@@ -4128,6 +4217,8 @@ impl ReplayStage {
         vote_account: &Pubkey,
         replay_timing: &mut ReplayLoopTiming,
     ) -> Vec<Slot> /* completed slots */ {
+        Self::clean_block_verification_remote_frees(process_active_banks_context);
+
         let bank_replay_result_trackers = Self::prepare_active_banks_for_replay(
             process_active_banks_context,
             progress,
@@ -4749,7 +4840,19 @@ impl ReplayStage {
         tracked_vote_transactions: &mut Vec<TrackedVoteTransaction>,
         drop_bank_sender: &Sender<Vec<BankWithScheduler>>,
         tbft_structs: &mut TowerBFTStructures,
+        process_active_banks_context: Option<&ProcessActiveBanksContext>,
     ) {
+        let slots_to_remove = {
+            let bank_forks = bank_forks.read().unwrap();
+            bank_forks
+                .get_non_rooted(new_root, highest_super_majority_root)
+                .collect::<Vec<_>>()
+        };
+        Self::finish_block_verification_before_bank_forks_removal(
+            process_active_banks_context,
+            slots_to_remove,
+        );
+
         root_utils::check_and_handle_new_root(
             parent_slot,
             new_root,
@@ -4840,6 +4943,44 @@ impl ReplayStage {
         drop_bank_sender: &Sender<Vec<BankWithScheduler>>,
         tbft_structs: &mut TowerBFTStructures,
     ) {
+        Self::handle_new_root_with_block_verification(
+            new_root,
+            bank_forks,
+            progress,
+            snapshot_controller,
+            highest_super_majority_root,
+            has_new_vote_been_rooted,
+            tracked_vote_transactions,
+            drop_bank_sender,
+            tbft_structs,
+            None,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_new_root_with_block_verification(
+        new_root: Slot,
+        bank_forks: &RwLock<BankForks>,
+        progress: &mut ProgressMap,
+        snapshot_controller: Option<&SnapshotController>,
+        highest_super_majority_root: Option<Slot>,
+        has_new_vote_been_rooted: &mut bool,
+        tracked_vote_transactions: &mut Vec<TrackedVoteTransaction>,
+        drop_bank_sender: &Sender<Vec<BankWithScheduler>>,
+        tbft_structs: &mut TowerBFTStructures,
+        process_active_banks_context: Option<&ProcessActiveBanksContext>,
+    ) {
+        let slots_to_remove = {
+            let bank_forks = bank_forks.read().unwrap();
+            bank_forks
+                .get_non_rooted(new_root, highest_super_majority_root)
+                .collect::<Vec<_>>()
+        };
+        Self::finish_block_verification_before_bank_forks_removal(
+            process_active_banks_context,
+            slots_to_remove,
+        );
+
         root_utils::set_bank_forks_root(
             new_root,
             bank_forks,
@@ -6150,6 +6291,103 @@ pub(crate) mod tests {
             )
         };
         assert_eq!(progress_after_duplicate_complete, progress_after_complete);
+    }
+
+    #[test]
+    fn test_purge_unconfirmed_slot_finishes_pending_block_verification() {
+        let ReplayBlockstoreComponents {
+            blockstore,
+            vote_simulator,
+            ..
+        } = replay_blockstore_components(Some(tr(0)), 1, None);
+        let funded_keypair = vote_simulator
+            .validator_keypairs
+            .values()
+            .next()
+            .unwrap()
+            .node_keypair
+            .insecure_clone();
+        let bank_forks = vote_simulator.bank_forks;
+        let mut progress = ProgressMap::default();
+
+        let bank0 = bank_forks.read().unwrap().get(0).unwrap();
+        let bank = Bank::new_from_parent(bank0, SlotLeader::default(), 1);
+        let bank = bank_forks.write().unwrap().insert(bank);
+        let slot = bank.slot();
+        let bank_progress = progress
+            .entry(slot)
+            .or_insert_with(|| ForkProgress::new(bank.last_blockhash(), None, None, 0, 0, None));
+        let tx = system_transaction::transfer(
+            &funded_keypair,
+            &Keypair::new().pubkey(),
+            1,
+            bank.last_blockhash(),
+        );
+        let entries = make_complete_slot_entries(&bank, vec![tx]);
+        let shreds = entries_to_test_shreds(&entries, slot, bank.parent_slot(), true, 0);
+        blockstore.insert_shreds(shreds, None, false).unwrap();
+
+        let (replay_vote_sender, _replay_vote_receiver) = unbounded();
+        let process_active_banks_context =
+            ProcessActiveBanksContextForTest::new(bank_forks, blockstore, replay_vote_sender);
+
+        let replay_result = ReplayStage::replay_blockstore_into_bank(
+            &process_active_banks_context,
+            &bank,
+            &bank_progress.replay_stats,
+            &bank_progress.replay_progress,
+        );
+        assert_matches!(replay_result, Ok(1));
+        assert!(
+            process_active_banks_context
+                .pending_replay_tick_registrations
+                .lock()
+                .unwrap()
+                .contains_key(&slot)
+        );
+
+        let root_bank = process_active_banks_context
+            .bank_forks
+            .read()
+            .unwrap()
+            .root_bank();
+        let mut descendants = process_active_banks_context
+            .bank_forks
+            .read()
+            .unwrap()
+            .descendants();
+        let mut ancestors = process_active_banks_context
+            .bank_forks
+            .read()
+            .unwrap()
+            .ancestors();
+        ReplayStage::purge_unconfirmed_slot(
+            slot,
+            &mut ancestors,
+            &mut descendants,
+            &mut progress,
+            root_bank.as_ref(),
+            &process_active_banks_context.bank_forks,
+            &process_active_banks_context.blockstore,
+            Some(&process_active_banks_context),
+        );
+
+        assert!(
+            process_active_banks_context
+                .bank_forks
+                .read()
+                .unwrap()
+                .get(slot)
+                .is_none()
+        );
+        assert!(progress.get(&slot).is_none());
+        assert!(
+            !process_active_banks_context
+                .pending_replay_tick_registrations
+                .lock()
+                .unwrap()
+                .contains_key(&slot)
+        );
     }
 
     #[test]
@@ -7597,6 +7835,7 @@ pub(crate) mod tests {
             &root_bank,
             &bank_forks,
             &blockstore,
+            None,
         );
         for i in 5..=7 {
             assert!(bank_forks.read().unwrap().get(i).is_none());
@@ -7637,6 +7876,7 @@ pub(crate) mod tests {
             &root_bank,
             &bank_forks,
             &blockstore,
+            None,
         );
         for i in 4..=6 {
             assert!(bank_forks.read().unwrap().get(i).is_none());
@@ -7660,6 +7900,7 @@ pub(crate) mod tests {
             &root_bank,
             &bank_forks,
             &blockstore,
+            None,
         );
         for i in 1..=6 {
             assert!(bank_forks.read().unwrap().get(i).is_none());
@@ -7727,6 +7968,7 @@ pub(crate) mod tests {
             &root_bank,
             &bank_forks,
             &blockstore,
+            None,
         );
         for slot in &[3, 5, 6, 7] {
             assert!(bank_forks.read().unwrap().get(*slot).is_none());
