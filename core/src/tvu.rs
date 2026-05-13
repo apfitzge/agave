@@ -6,6 +6,7 @@ use {
         admin_rpc_post_init::{KeyUpdaterType, KeyUpdaters},
         banking_trace::BankingTracer,
         block_creation_loop::ReplayHighestFrozen,
+        block_verification_stage::BlockVerificationStage,
         bls_sigverify::bls_sigverifier::{self, SigVerifierChannels, SigVerifierContext},
         cluster_info_vote_listener::{
             DuplicateConfirmedSlotsReceiver, GossipVerifiedVoteHashReceiver,
@@ -100,6 +101,7 @@ pub struct Tvu {
     retransmit_stage: RetransmitStage,
     window_service: WindowService,
     cluster_slots_service: ClusterSlotsService,
+    block_verification_stage: BlockVerificationStage,
     replay_stage: ReplayStage,
     blockstore_cleanup_service: BlockstoreCleanupService,
     cost_update_service: CostUpdateService,
@@ -490,6 +492,18 @@ impl Tvu {
         };
         let votor = Votor::new(votor_config);
 
+        let (block_verification_stage, block_verification_session) = BlockVerificationStage::new(
+            exit.clone(),
+            tvu_config.replay_transactions_threads,
+            tvu_config.replay_transactions_threads,
+            transaction_status_sender.clone(),
+            replay_vote_sender.clone(),
+            prioritization_fee_cache.clone(),
+            log_messages_bytes_limit,
+            poh_recorder.read().unwrap().shared_leader_state(),
+            bank_forks.clone(),
+        )?;
+
         let replay_senders = ReplaySenders {
             rpc_subscriptions,
             slot_status_notifier,
@@ -545,6 +559,7 @@ impl Tvu {
             snapshot_controller,
             replay_highest_frozen,
             migration_status,
+            block_verification_session,
         };
 
         let voting_service = VotingService::new(
@@ -605,6 +620,7 @@ impl Tvu {
             retransmit_stage,
             window_service,
             cluster_slots_service,
+            block_verification_stage,
             replay_stage,
             blockstore_cleanup_service,
             cost_update_service,
@@ -627,6 +643,7 @@ impl Tvu {
         self.shred_sigverify.join()?;
         self.blockstore_cleanup_service.join()?;
         self.replay_stage.join()?;
+        self.block_verification_stage.join()?;
         self.cost_update_service.join()?;
         self.voting_service.join()?;
         self.bls_voting_service.join()?;

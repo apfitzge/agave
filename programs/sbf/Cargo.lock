@@ -63,6 +63,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "agave-block-verification-stage"
+version = "4.1.0-alpha.0"
+dependencies = [
+ "agave-scheduler-bindings",
+ "agave-scheduling-utils",
+ "agave-transaction-view",
+ "crossbeam-channel",
+ "rts-alloc",
+ "shaq",
+ "slab",
+ "solana-entry",
+ "solana-hash 4.3.0",
+ "solana-pubkey 4.2.0",
+ "solana-signature",
+]
+
+[[package]]
 name = "agave-bls-cert-verify"
 version = "4.1.0-alpha.0"
 dependencies = [
@@ -6526,6 +6543,7 @@ name = "solana-core"
 version = "4.1.0-alpha.0"
 dependencies = [
  "agave-banking-stage-ingress-types",
+ "agave-block-verification-stage",
  "agave-bls-cert-verify",
  "agave-feature-set",
  "agave-logger",

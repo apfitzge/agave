@@ -42,6 +42,7 @@ frozen-abi = [
 [dependencies]
 agave-banking-stage-ingress-types = { workspace = true }
 agave-bls-cert-verify = { workspace = true }
+agave-block-verification-stage = { workspace = true }
 agave-feature-set = { workspace = true }
 agave-logger = { workspace = true }
 agave-math-utils = { workspace = true }

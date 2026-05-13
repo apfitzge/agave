@@ -26,7 +26,8 @@ use {
     solana_ledger::blockstore_processor::TransactionStatusSender,
     solana_perf::packet::PACKETS_PER_BATCH,
     solana_poh::{
-        poh_controller::PohController, poh_recorder::PohRecorder,
+        poh_controller::PohController,
+        poh_recorder::{PohRecorder, SharedLeaderState},
         transaction_recorder::TransactionRecorder,
     },
     solana_pubkey::Pubkey,
@@ -772,6 +773,55 @@ pub(crate) fn update_bank_forks_and_poh_recorder_for_new_tpu_bank(
     if set_bank_res.is_err() {
         warn!("Failed to set poh bank, poh service is disconnected");
     }
+}
+
+#[cfg(unix)]
+pub(crate) fn spawn_replay_block_verification_workers(
+    exit: Arc<AtomicBool>,
+    workers: Vec<agave_block_verification_stage::setup::BlockVerificationWorkerSession>,
+    transaction_status_sender: Option<TransactionStatusSender>,
+    replay_vote_sender: ReplayVoteSender,
+    prioritization_fee_cache: Option<Arc<PrioritizationFeeCache>>,
+    log_messages_bytes_limit: Option<usize>,
+    shared_leader_state: SharedLeaderState,
+    bank_forks: Arc<RwLock<BankForks>>,
+) -> Vec<JoinHandle<()>> {
+    workers
+        .into_iter()
+        .enumerate()
+        .map(|(index, worker)| {
+            let id = index as u32;
+            let (record_sender, record_receiver) =
+                solana_poh::record_channels::record_channels(transaction_status_sender.is_some());
+            let consume_worker = consume_worker::external::ExternalWorker::new(
+                id,
+                exit.clone(),
+                Consumer::new(
+                    Committer::new(
+                        transaction_status_sender.clone(),
+                        replay_vote_sender.clone(),
+                        prioritization_fee_cache.clone(),
+                    ),
+                    TransactionRecorder::new(record_sender),
+                    log_messages_bytes_limit,
+                ),
+                worker.worker_to_pack,
+                worker.allocator,
+                shared_leader_state.clone(),
+                bank_forks.clone(),
+            );
+
+            Builder::new()
+                .name(format!("solBvCoWorker{id:02}"))
+                .spawn(move || {
+                    let _record_receiver = record_receiver;
+                    if let Err(err) = consume_worker.run(worker.pack_to_worker) {
+                        error!("Replay block verification consume worker error; err={err}");
+                    }
+                })
+                .unwrap()
+        })
+        .collect()
 }
 
 #[derive(Debug)]

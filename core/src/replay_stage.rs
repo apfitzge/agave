@@ -33,6 +33,7 @@ use {
         voting_service::VoteOp,
         window_service::DuplicateSlotReceiver,
     },
+    agave_block_verification_stage::setup::ReplayStageSession,
     agave_votor::{
         event::{CompletedBlock, VotorEvent, VotorEventSender},
         root_utils,
@@ -376,6 +377,7 @@ pub struct ReplayStageConfig {
     pub snapshot_controller: Option<Arc<SnapshotController>>,
     pub replay_highest_frozen: Arc<ReplayHighestFrozen>,
     pub migration_status: Arc<MigrationStatus>,
+    pub block_verification_session: ReplayStageSession,
 }
 
 pub struct ReplaySenders {
@@ -687,6 +689,7 @@ impl ReplayStage {
             snapshot_controller,
             replay_highest_frozen,
             migration_status,
+            block_verification_session,
         } = config;
 
         let ReplaySenders {
@@ -735,6 +738,7 @@ impl ReplayStage {
 
         // Start the replay stage loop
         let run_replay = move || {
+            let _block_verification_session = block_verification_session;
             let _exit = Finalizer::new(exit.clone());
 
             if my_pubkey != tower.node_pubkey {
