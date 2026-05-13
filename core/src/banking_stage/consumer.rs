@@ -6,7 +6,7 @@ use {
         scheduler_messages::MaxAge,
     },
     itertools::Itertools,
-    solana_cost_model::transaction_cost::TransactionCost,
+    solana_cost_model::{cost_model::CostModel, transaction_cost::TransactionCost},
     solana_fee::FeeFeatures,
     solana_measure::measure_us,
     solana_poh::{
@@ -15,7 +15,8 @@ use {
     },
     solana_runtime::{
         bank::{
-            Bank, LoadAndExecuteTransactionsOutput, entry_bytes_budget::EntryBytesReserveError,
+            Bank, LoadAndExecuteTransactionsOutput, ProcessedTransactionCounts,
+            entry_bytes_budget::EntryBytesReserveError,
         },
         transaction_batch::TransactionBatch,
     },
@@ -23,7 +24,9 @@ use {
     solana_svm::{
         account_loader::validate_fee_payer,
         transaction_error_metrics::TransactionErrorMetrics,
-        transaction_processing_result::TransactionProcessingResultExtensions,
+        transaction_processing_result::{
+            TransactionProcessingResult, TransactionProcessingResultExtensions,
+        },
         transaction_processor::{ExecutionRecordingConfig, TransactionProcessingConfig},
     },
     solana_transaction_error::TransactionError,
@@ -58,10 +61,13 @@ pub struct ExecutionFlags {
     /// scheduled transactions with no overlapping accounts.
     pub skip_account_locks: bool,
 
-    /// Used to skip cost-tracking - i.e. rely on the scheduler to have
-    /// scheduled transactions with total cost within the block limits,
-    /// or verifying it after execution.
+    /// Used to skip bank cost tracking entirely.
     pub skip_cost_tracking: bool,
+
+    /// Used to add actual cost after execution but before recording. This is
+    /// currently replay-only, where pre-execution reservation is intentionally
+    /// skipped but bank cost tracking should remain owned by Agave.
+    pub add_only_cost_tracking: bool,
 
     /// Used to skip recording transactions into PoH.
     /// This is useful for replay where we simply commit the transactions.
@@ -173,6 +179,7 @@ impl Consumer {
                 all_or_nothing: false,
                 skip_account_locks: false,
                 skip_cost_tracking: false,
+                add_only_cost_tracking: false,
                 skip_poh_recording: false,
             },
         );
@@ -212,6 +219,12 @@ impl Consumer {
         pre_results: impl Iterator<Item = Result<(), TransactionError>>,
         flags: ExecutionFlags,
     ) -> ProcessTransactionBatchOutput {
+        assert!(!(flags.skip_cost_tracking && flags.add_only_cost_tracking));
+        assert!(
+            !flags.add_only_cost_tracking || flags.skip_poh_recording,
+            "add-only cost tracking is currently replay-only"
+        );
+
         let (
             (transaction_qos_cost_results, cost_model_throttled_transactions_count),
             cost_model_us,
@@ -219,7 +232,8 @@ impl Consumer {
             bank,
             txs,
             pre_results,
-            flags.skip_cost_tracking
+            flags.skip_cost_tracking,
+            flags.add_only_cost_tracking,
         ));
 
         // Only lock accounts for those transactions are selected for the block;
@@ -248,7 +262,7 @@ impl Consumer {
             ..
         } = execute_and_commit_transactions_output;
 
-        if !flags.skip_cost_tracking {
+        if !flags.skip_cost_tracking && !flags.add_only_cost_tracking {
             // Costs of all transactions are added to the cost_tracker before processing.
             // To ensure accurate tracking of compute units, transactions that ultimately
             // were not included in the block should have their cost removed, the rest
@@ -358,10 +372,18 @@ impl Consumer {
         execute_and_commit_timings.load_execute_us = load_execute_us;
 
         let LoadAndExecuteTransactionsOutput {
-            processing_results,
-            processed_counts,
+            mut processing_results,
+            mut processed_counts,
             balance_collector,
         } = load_and_execute_transactions_output;
+
+        if flags.add_only_cost_tracking {
+            Self::add_only_cost_tracking(bank, batch, &mut processing_results);
+            processed_counts = Self::processed_transaction_counts(
+                batch.sanitized_transactions(),
+                &processing_results,
+            );
+        }
 
         let transaction_counts = LeaderProcessedTransactionCounts {
             processed_count: processed_counts.processed_transactions_count,
@@ -521,20 +543,93 @@ impl Consumer {
         transactions: &'a [Tx],
         pre_results: impl Iterator<Item = Result<(), TransactionError>>,
         skip_cost_tracking: bool,
+        add_only_cost_tracking: bool,
     ) -> (Vec<Result<TransactionCost<'a, Tx>, TransactionError>>, u64) {
-        if skip_cost_tracking {
-            // Skip tracking and only calculate the costs.
+        if skip_cost_tracking || add_only_cost_tracking {
+            // Skip pre-execution tracking and only calculate the costs.
             (
                 QosService::compute_transaction_costs(
                     &bank.feature_set,
                     transactions.iter(),
                     pre_results,
                 ),
-                0, // no transactions throttled since we're skipping cost tracking
+                0, // no transactions throttled before execution
             )
         } else {
             QosService::select_and_accumulate_transaction_costs(bank, transactions, pre_results)
         }
+    }
+
+    fn add_only_cost_tracking<Tx: TransactionWithMeta>(
+        bank: &Bank,
+        batch: &TransactionBatch<Tx>,
+        processing_results: &mut [TransactionProcessingResult],
+    ) {
+        let mut added_costs = Vec::with_capacity(processing_results.len());
+        let mut cost_tracker = bank.write_cost_tracker().unwrap();
+        let mut cost_tracking_error = None;
+
+        for (tx, processing_result) in batch
+            .sanitized_transactions()
+            .iter()
+            .zip(processing_results.iter())
+        {
+            let actual_cost = match processing_result {
+                Ok(processed_tx) => CostModel::calculate_cost_for_executed_transaction(
+                    tx,
+                    processed_tx.executed_units(),
+                    processed_tx.loaded_accounts_data_size(),
+                    &bank.feature_set,
+                ),
+                Err(_) => continue,
+            };
+
+            match cost_tracker.try_add(&actual_cost) {
+                Ok(_) => added_costs.push(actual_cost),
+                Err(err) => {
+                    // Add-only tracking is replay-only today. If the replayed
+                    // batch exceeds cost limits, the block will fail
+                    // verification anyway. Dropping the whole batch keeps this
+                    // post-execution admission atomic and avoids mixing
+                    // partially admitted costs with recording/commit counts.
+                    for added_cost in &added_costs {
+                        cost_tracker.remove(added_cost);
+                    }
+                    cost_tracking_error = Some(TransactionError::from(err));
+                    break;
+                }
+            }
+        }
+        drop(cost_tracker);
+
+        if let Some(transaction_error) = cost_tracking_error {
+            processing_results
+                .iter_mut()
+                .for_each(|result| *result = Err(transaction_error.clone()));
+        }
+    }
+
+    fn processed_transaction_counts<Tx: TransactionWithMeta>(
+        transactions: &[Tx],
+        processing_results: &[TransactionProcessingResult],
+    ) -> ProcessedTransactionCounts {
+        let mut processed_counts = ProcessedTransactionCounts::default();
+        for (tx, processing_result) in transactions.iter().zip(processing_results) {
+            if processing_result.was_processed() {
+                processed_counts.signature_count +=
+                    tx.signature_details().num_transaction_signatures();
+                processed_counts.processed_transactions_count += 1;
+
+                if !tx.is_simple_vote_transaction() {
+                    processed_counts.processed_non_vote_transactions_count += 1;
+                }
+            }
+
+            if processing_result.flattened_result().is_ok() {
+                processed_counts.processed_with_successful_result_count += 1;
+            }
+        }
+        processed_counts
     }
 }
 
@@ -623,6 +718,17 @@ mod tests {
             bank_forks,
             record_receiver,
             consumer,
+        }
+    }
+
+    fn replay_add_only_execution_flags() -> ExecutionFlags {
+        ExecutionFlags {
+            drop_on_failure: false,
+            all_or_nothing: true,
+            skip_account_locks: true,
+            skip_cost_tracking: false,
+            add_only_cost_tracking: true,
+            skip_poh_recording: true,
         }
     }
 
@@ -920,6 +1026,7 @@ mod tests {
                 all_or_nothing: false,
                 skip_account_locks: true,
                 skip_cost_tracking: false,
+                add_only_cost_tracking: false,
                 skip_poh_recording: false,
             },
         );
@@ -979,6 +1086,7 @@ mod tests {
                 all_or_nothing: false,
                 skip_account_locks: false,
                 skip_cost_tracking: false,
+                add_only_cost_tracking: false,
                 skip_poh_recording: true,
             },
         );
@@ -1027,6 +1135,7 @@ mod tests {
                 all_or_nothing: false,
                 skip_account_locks: false,
                 skip_cost_tracking: false,
+                add_only_cost_tracking: false,
                 skip_poh_recording: true,
             },
         );
@@ -1213,6 +1322,7 @@ mod tests {
                     all_or_nothing: false,
                     skip_account_locks: false,
                     skip_cost_tracking: false, // track costs
+                    add_only_cost_tracking: false,
                     skip_poh_recording: false,
                 },
             );
@@ -1246,6 +1356,7 @@ mod tests {
                 all_or_nothing: false,
                 skip_account_locks: false,
                 skip_cost_tracking: true,
+                add_only_cost_tracking: false,
                 skip_poh_recording: false,
             },
         );
@@ -1274,6 +1385,169 @@ mod tests {
         assert!(commit_transactions_result.is_ok());
         assert_eq!(get_block_cost(), tracked_block_cost); // no change
         assert_eq!(get_tx_count(), tracked_tx_count);
+    }
+
+    #[test]
+    fn test_bank_process_and_record_transactions_add_only_cost_tracking() {
+        let TestFrame {
+            mint_keypair,
+            bank,
+            bank_forks: _bank_forks,
+            record_receiver: _record_receiver,
+            consumer,
+        } = setup_test(None);
+
+        let recipient = Pubkey::new_unique();
+        let transactions = sanitize_transactions(vec![system_transaction::transfer(
+            &mint_keypair,
+            &recipient,
+            1,
+            bank.last_blockhash(),
+        )]);
+        let max_ages = vec![MaxAge {
+            sanitized_epoch: bank.epoch(),
+            alt_invalidation_slot: bank.slot(),
+        }];
+
+        let output = consumer.process_and_record_aged_transactions(
+            &bank,
+            &transactions,
+            &max_ages,
+            replay_add_only_execution_flags(),
+        );
+
+        assert_eq!(output.cost_model_throttled_transactions_count, 0);
+        let ExecuteAndCommitTransactionsOutput {
+            transaction_counts,
+            commit_transactions_result,
+            retryable_transaction_indexes,
+            ..
+        } = output.execute_and_commit_transactions_output;
+        assert_eq!(
+            transaction_counts,
+            LeaderProcessedTransactionCounts {
+                attempted_processing_count: 1,
+                processed_count: 1,
+                processed_with_successful_result_count: 1,
+            }
+        );
+        assert!(retryable_transaction_indexes.is_empty());
+        assert!(commit_transactions_result.is_ok());
+        assert_eq!(bank.get_balance(&recipient), 1);
+        assert!(bank.read_cost_tracker().unwrap().block_cost() > 0);
+        assert_eq!(bank.read_cost_tracker().unwrap().transaction_count(), 1);
+    }
+
+    #[test]
+    fn test_bank_process_and_record_transactions_add_only_failure_drops_batch() {
+        let one_transaction_cost = {
+            let TestFrame {
+                mint_keypair,
+                bank,
+                bank_forks: _bank_forks,
+                record_receiver: _record_receiver,
+                consumer,
+            } = setup_test(None);
+
+            let transactions = sanitize_transactions(vec![system_transaction::transfer(
+                &mint_keypair,
+                &Pubkey::new_unique(),
+                1,
+                bank.last_blockhash(),
+            )]);
+            let max_ages = vec![MaxAge {
+                sanitized_epoch: bank.epoch(),
+                alt_invalidation_slot: bank.slot(),
+            }];
+            let output = consumer.process_and_record_aged_transactions(
+                &bank,
+                &transactions,
+                &max_ages,
+                replay_add_only_execution_flags(),
+            );
+            assert!(
+                output
+                    .execute_and_commit_transactions_output
+                    .commit_transactions_result
+                    .is_ok()
+            );
+            let block_cost = bank.read_cost_tracker().unwrap().block_cost();
+            block_cost
+        };
+        assert!(one_transaction_cost > 1);
+
+        let TestFrame {
+            mint_keypair,
+            bank,
+            bank_forks: _bank_forks,
+            record_receiver: _record_receiver,
+            consumer,
+        } = setup_test(None);
+
+        let second_payer = Keypair::new();
+        bank.store_account(
+            &second_payer.pubkey(),
+            &AccountSharedData::new(1_000_000, 0, &system_program::id()),
+        );
+        bank.write_cost_tracker().unwrap().set_limits(
+            u64::MAX,
+            one_transaction_cost + 1,
+            u64::MAX,
+            u64::MAX,
+        );
+
+        let first_recipient = Pubkey::new_unique();
+        let second_recipient = Pubkey::new_unique();
+        let transactions = sanitize_transactions(vec![
+            system_transaction::transfer(&mint_keypair, &first_recipient, 1, bank.last_blockhash()),
+            system_transaction::transfer(
+                &second_payer,
+                &second_recipient,
+                1,
+                bank.last_blockhash(),
+            ),
+        ]);
+        let max_age = MaxAge {
+            sanitized_epoch: bank.epoch(),
+            alt_invalidation_slot: bank.slot(),
+        };
+        let output = consumer.process_and_record_aged_transactions(
+            &bank,
+            &transactions,
+            &[max_age; 2],
+            replay_add_only_execution_flags(),
+        );
+
+        assert_eq!(output.cost_model_throttled_transactions_count, 0);
+        let ExecuteAndCommitTransactionsOutput {
+            transaction_counts,
+            commit_transactions_result,
+            ..
+        } = output.execute_and_commit_transactions_output;
+        assert_eq!(
+            transaction_counts,
+            LeaderProcessedTransactionCounts {
+                attempted_processing_count: 2,
+                processed_count: 0,
+                processed_with_successful_result_count: 0,
+            }
+        );
+        let commit_transaction_details = commit_transactions_result.unwrap();
+        assert_eq!(commit_transaction_details.len(), 2);
+        assert!(
+            commit_transaction_details
+                .iter()
+                .all(|commit_details| matches!(
+                    commit_details,
+                    CommitTransactionDetails::NotCommitted(
+                        TransactionError::WouldExceedMaxBlockCostLimit
+                    )
+                ))
+        );
+        assert_eq!(bank.get_balance(&first_recipient), 0);
+        assert_eq!(bank.get_balance(&second_recipient), 0);
+        assert_eq!(bank.read_cost_tracker().unwrap().block_cost(), 0);
+        assert_eq!(bank.read_cost_tracker().unwrap().transaction_count(), 0);
     }
 
     #[test_case(false; "old::locked")]

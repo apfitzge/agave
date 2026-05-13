@@ -126,6 +126,7 @@ impl<Tx: TransactionWithMeta> ConsumeWorker<Tx> {
                 all_or_nothing: false,
                 skip_account_locks: false,
                 skip_cost_tracking: false,
+                add_only_cost_tracking: false,
                 skip_poh_recording: false,
             },
         );
@@ -1297,9 +1298,12 @@ pub(crate) mod external {
                     // Replay does not need backup account locks because no
                     // other worker threads are locking the replay bank.
                     skip_account_locks: true,
-                    // The scheduler is responsible for cost tracking during
-                    // replay.
-                    skip_cost_tracking: true,
+                    // Replay adds actual costs after execution but before
+                    // committing. This keeps bank cost tracking in Agave while
+                    // avoiding pre-execution reservation against a block that
+                    // is already determined by replay.
+                    skip_cost_tracking: false,
+                    add_only_cost_tracking: true,
                     // PoH recording is leader-only, so replay execution skips
                     // it.
                     skip_poh_recording: true,
@@ -1311,6 +1315,7 @@ pub(crate) mod external {
                 all_or_nothing: flags & execution_flags::ALL_OR_NOTHING != 0,
                 skip_account_locks: false,
                 skip_cost_tracking: false,
+                add_only_cost_tracking: false,
                 skip_poh_recording: false,
             }
         }
@@ -1771,6 +1776,7 @@ pub(crate) mod external {
             assert!(!flags.all_or_nothing);
             assert!(!flags.skip_account_locks);
             assert!(!flags.skip_cost_tracking);
+            assert!(!flags.add_only_cost_tracking);
             assert!(!flags.skip_poh_recording);
 
             let flags = ExternalWorker::execution_flags_from_message_flags(
@@ -1779,7 +1785,8 @@ pub(crate) mod external {
             assert!(!flags.drop_on_failure);
             assert!(flags.all_or_nothing);
             assert!(flags.skip_account_locks);
-            assert!(flags.skip_cost_tracking);
+            assert!(!flags.skip_cost_tracking);
+            assert!(flags.add_only_cost_tracking);
             assert!(flags.skip_poh_recording);
         }
 
@@ -2852,7 +2859,7 @@ pub(crate) mod external {
         }
 
         #[test]
-        fn test_run_execute_replay_skips_poh_and_cost_tracking() {
+        fn test_run_execute_replay_skips_poh_and_tracks_cost() {
             let mut test_frame = setup_external_test_frame();
 
             let recipient = Pubkey::new_unique();
@@ -2883,8 +2890,9 @@ pub(crate) mod external {
                     .read_cost_tracker()
                     .unwrap()
                     .transaction_count(),
-                0
+                1
             );
+            assert!(test_frame.bank.read_cost_tracker().unwrap().block_cost() > 0);
 
             test_frame.free_batch(batch);
         }
