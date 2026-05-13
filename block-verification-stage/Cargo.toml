@@ -22,11 +22,11 @@ shaq = { workspace = true }
 slab = { workspace = true }
 solana-entry = { workspace = true }
 solana-hash = { workspace = true }
+solana-pubkey = { workspace = true }
 solana-signature = { workspace = true }
 
 [dev-dependencies]
 solana-message = { workspace = true, features = ["serde"] }
-solana-pubkey = { workspace = true }
 solana-transaction = { workspace = true, features = ["serde", "wincode"] }
 wincode = { workspace = true }
 

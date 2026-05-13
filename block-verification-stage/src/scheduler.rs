@@ -20,6 +20,7 @@ use {
     agave_scheduling_utils::{
         pubkeys_ptr::PubkeysPtr,
         responses_region::CheckResponsesPtr,
+        thread_aware_account_locks::{ThreadAwareAccountLocks, ThreadId, ThreadSet},
         transaction_ptr::{TransactionPtr, TransactionPtrBatch},
     },
     agave_transaction_view::transaction_view::{
@@ -28,6 +29,7 @@ use {
     slab::Slab,
     solana_entry::entry::EntryVerificationData,
     solana_hash::Hash,
+    solana_pubkey::Pubkey,
     std::{
         collections::{HashMap, VecDeque},
         num::NonZeroUsize,
@@ -89,6 +91,7 @@ struct SchedulingState {
     last_entry_hash: Hash,
     entry_headers: Vec<EntryHeader>,
     transactions: Slab<TransactionState>,
+    account_locks: ThreadAwareAccountLocks,
     pending_transaction_checks: VecDeque<PendingTransactionCheck>,
     next_ready_transaction_index: usize,
     ready_transactions: VecDeque<usize>,
@@ -99,12 +102,13 @@ struct SchedulingState {
 }
 
 impl SchedulingState {
-    fn new(slot: u64, last_entry_hash: Hash) -> Self {
+    fn new(slot: u64, last_entry_hash: Hash, worker_count: usize) -> Self {
         Self {
             slot,
             last_entry_hash,
             entry_headers: Vec::new(),
             transactions: Slab::new(),
+            account_locks: ThreadAwareAccountLocks::new(worker_count),
             pending_transaction_checks: VecDeque::new(),
             next_ready_transaction_index: 0,
             ready_transactions: VecDeque::new(),
@@ -115,11 +119,12 @@ impl SchedulingState {
         }
     }
 
-    fn reset_for_slot(&mut self, slot: u64, last_entry_hash: Hash) {
+    fn reset_for_slot(&mut self, slot: u64, last_entry_hash: Hash, worker_count: usize) {
         self.slot = slot;
         self.last_entry_hash = last_entry_hash;
         self.entry_headers.clear();
         self.transactions.clear();
+        self.account_locks = ThreadAwareAccountLocks::new(worker_count);
         self.pending_transaction_checks.clear();
         self.next_ready_transaction_index = 0;
         self.ready_transactions.clear();
@@ -134,6 +139,7 @@ impl SchedulingState {
         self.last_entry_hash = Hash::default();
         self.entry_headers = Vec::with_capacity(POOLED_ENTRY_HEADERS_CAPACITY);
         self.transactions = Slab::with_capacity(POOLED_TRANSACTIONS_CAPACITY);
+        self.account_locks = ThreadAwareAccountLocks::new(1);
         self.pending_transaction_checks =
             VecDeque::with_capacity(POOLED_PENDING_TRANSACTION_CHECKS_CAPACITY);
         self.next_ready_transaction_index = 0;
@@ -169,6 +175,102 @@ impl SchedulingState {
                 .push_back(self.next_ready_transaction_index);
             self.next_ready_transaction_index += 1;
         }
+    }
+
+    #[allow(dead_code)]
+    fn try_lock_ready_transaction(
+        &mut self,
+        transaction_index: usize,
+        available_threads: ThreadSet,
+        thread_selector: impl FnOnce(ThreadSet) -> ThreadId,
+    ) -> Option<ThreadId> {
+        let Self {
+            transactions,
+            account_locks,
+            ..
+        } = self;
+        let transaction = transactions
+            .get(transaction_index)
+            .expect("ready transaction must exist");
+        account_locks
+            .try_lock_accounts(
+                transaction.write_locks(),
+                transaction.read_locks(),
+                available_threads,
+                thread_selector,
+            )
+            .ok()
+    }
+
+    #[allow(dead_code)]
+    fn unlock_transaction_accounts(&mut self, transaction_index: usize, thread_id: ThreadId) {
+        let Self {
+            transactions,
+            account_locks,
+            ..
+        } = self;
+        let transaction = transactions
+            .get(transaction_index)
+            .expect("locked transaction must exist");
+        account_locks.unlock_accounts(
+            transaction.write_locks(),
+            transaction.read_locks(),
+            thread_id,
+        );
+    }
+
+    #[allow(dead_code)]
+    fn move_checked_transaction_to_in_flight(
+        &mut self,
+        transaction_index: usize,
+        thread_id: ThreadId,
+    ) {
+        let transaction_state = self
+            .transactions
+            .get_mut(transaction_index)
+            .expect("scheduled transaction must exist");
+        let previous_transaction_state =
+            core::mem::replace(transaction_state, TransactionState::Transitioning);
+        let TransactionState::Checked {
+            transaction,
+            resolved_pubkeys,
+            check_response,
+        } = previous_transaction_state
+        else {
+            panic!("scheduled transaction was not checked: {transaction_index}");
+        };
+        *transaction_state = TransactionState::InFlight {
+            transaction,
+            resolved_pubkeys,
+            check_response,
+            thread_id,
+        };
+    }
+
+    #[allow(dead_code)]
+    fn finish_in_flight_transaction(
+        &mut self,
+        transaction_index: usize,
+        thread_id: ThreadId,
+    ) -> TransactionState {
+        self.unlock_transaction_accounts(transaction_index, thread_id);
+
+        let transaction_state = self
+            .transactions
+            .get_mut(transaction_index)
+            .expect("executed transaction must exist");
+        let previous_transaction_state =
+            core::mem::replace(transaction_state, TransactionState::Executed);
+        let state_thread_id = match &previous_transaction_state {
+            TransactionState::InFlight { thread_id, .. } => *thread_id,
+            _ => panic!("execution response for transaction that was not in-flight"),
+        };
+        assert_eq!(
+            state_thread_id, thread_id,
+            "execution response thread id mismatch",
+        );
+
+        previous_transaction_state
     }
 }
 
@@ -217,6 +319,7 @@ struct PendingWorkerCheck {
     transaction_index: usize,
 }
 
+#[allow(dead_code)]
 enum TransactionState {
     Pending {
         transaction: TransactionPtr,
@@ -226,6 +329,13 @@ enum TransactionState {
         resolved_pubkeys: Option<PubkeysPtr>,
         check_response: CheckResponse,
     },
+    InFlight {
+        transaction: SanitizedTransactionView<TransactionPtr>,
+        resolved_pubkeys: Option<PubkeysPtr>,
+        check_response: CheckResponse,
+        thread_id: ThreadId,
+    },
+    Executed,
     Transitioning,
 }
 
@@ -238,7 +348,74 @@ impl TransactionState {
         match self {
             Self::Pending { transaction } => transaction,
             Self::Checked { transaction, .. } => transaction.inner_data(),
+            Self::InFlight { transaction, .. } => transaction.inner_data(),
+            Self::Executed => panic!("transaction state is executed"),
             Self::Transitioning => panic!("transaction state is transitioning"),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn transaction_view(&self) -> &SanitizedTransactionView<TransactionPtr> {
+        match self {
+            Self::Checked { transaction, .. } | Self::InFlight { transaction, .. } => transaction,
+            Self::Pending { .. } => panic!("transaction state is pending"),
+            Self::Executed => panic!("transaction state is executed"),
+            Self::Transitioning => panic!("transaction state is transitioning"),
+        }
+    }
+
+    fn resolved_pubkeys_slice(&self) -> &[Pubkey] {
+        match self {
+            Self::Checked {
+                resolved_pubkeys, ..
+            }
+            | Self::InFlight {
+                resolved_pubkeys, ..
+            } => resolved_pubkeys
+                .as_ref()
+                .map(PubkeysPtr::as_slice)
+                .unwrap_or_default(),
+            Self::Pending { .. } => panic!("transaction state is pending"),
+            Self::Executed => panic!("transaction state is executed"),
+            Self::Transitioning => panic!("transaction state is transitioning"),
+        }
+    }
+
+    fn account_keys(&self) -> impl Iterator<Item = &Pubkey> + Clone {
+        self.transaction_view()
+            .static_account_keys()
+            .iter()
+            .chain(self.resolved_pubkeys_slice().iter())
+    }
+
+    fn write_locks(&self) -> impl Iterator<Item = &Pubkey> + Clone {
+        self.account_keys()
+            .enumerate()
+            .filter(|(index, _)| self.is_writable(*index as u8))
+            .map(|(_, key)| key)
+    }
+
+    fn read_locks(&self) -> impl Iterator<Item = &Pubkey> + Clone {
+        self.account_keys()
+            .enumerate()
+            .filter(|(index, _)| !self.is_writable(*index as u8))
+            .map(|(_, key)| key)
+    }
+
+    fn is_writable(&self, index: u8) -> bool {
+        let transaction = self.transaction_view();
+        if index >= transaction.num_static_account_keys() {
+            let loaded_address_index = index.wrapping_sub(transaction.num_static_account_keys());
+            loaded_address_index < transaction.total_writable_lookup_accounts() as u8
+        } else {
+            index
+                < transaction
+                    .num_required_signatures()
+                    .wrapping_sub(transaction.num_readonly_signed_static_accounts())
+                || (index >= transaction.num_required_signatures()
+                    && index
+                        < (transaction.static_account_keys().len() as u8)
+                            .wrapping_sub(transaction.num_readonly_unsigned_static_accounts()))
         }
     }
 }
@@ -254,6 +431,10 @@ impl BlockVerificationScheduler {
         session: BlockVerificationStageSession,
         entry_verification_threads: NonZeroUsize,
     ) -> Self {
+        assert!(
+            !session.workers.is_empty(),
+            "block verification scheduler requires at least one worker",
+        );
         Self {
             exit,
             session,
@@ -423,11 +604,12 @@ impl BlockVerificationScheduler {
             "slot already has scheduling state: {slot}",
         );
 
+        let worker_count = self.worker_count();
         let mut state = self
             .scheduling_state_pool
             .pop()
-            .unwrap_or_else(|| SchedulingState::new(slot, last_entry_hash));
-        state.reset_for_slot(slot, last_entry_hash);
+            .unwrap_or_else(|| SchedulingState::new(slot, last_entry_hash, worker_count));
+        state.reset_for_slot(slot, last_entry_hash, worker_count);
 
         let previous = self.scheduling_states.insert(slot, state);
         assert!(
@@ -941,6 +1123,10 @@ impl BlockVerificationScheduler {
             .expect("replay ingress received for unknown slot")
     }
 
+    fn worker_count(&self) -> usize {
+        self.session.workers.len()
+    }
+
     fn try_finish_terminal_slot(&mut self, slot: u64) -> Option<FinishedSlotStatus> {
         let Some(state) = self.scheduling_states.get(&slot) else {
             return None;
@@ -993,6 +1179,12 @@ impl BlockVerificationScheduler {
                 transaction,
                 resolved_pubkeys,
                 check_response,
+            }
+            | TransactionState::InFlight {
+                transaction,
+                resolved_pubkeys,
+                check_response,
+                ..
             } => {
                 self.free_transaction_allocation(transaction.into_inner_data());
                 if let Some(resolved_pubkeys) = resolved_pubkeys {
@@ -1000,6 +1192,7 @@ impl BlockVerificationScheduler {
                 }
                 self.free_check_response_allocations(check_response);
             }
+            TransactionState::Executed => {}
             TransactionState::Transitioning => {}
         }
     }
@@ -1318,6 +1511,28 @@ mod tests {
         (transaction, resolved_pubkeys.as_ref(), check_response)
     }
 
+    fn in_flight_transaction_thread_id(
+        state: &SchedulingState,
+        transaction_index: usize,
+    ) -> ThreadId {
+        let TransactionState::InFlight { thread_id, .. } = state
+            .transactions
+            .get(transaction_index)
+            .expect("transaction state should exist")
+        else {
+            panic!("transaction state should be in-flight");
+        };
+
+        *thread_id
+    }
+
+    fn first_thread(thread_set: ThreadSet) -> ThreadId {
+        thread_set
+            .contained_threads_iter()
+            .next()
+            .expect("thread set should not be empty")
+    }
+
     fn transaction_check_metadata(
         allocator: &rts_alloc::Allocator,
         batch: SharableTransactionBatchRegion,
@@ -1500,6 +1715,13 @@ mod tests {
     }
 
     fn minimal_transaction(signature: Signature) -> VersionedTransaction {
+        minimal_transaction_with_account(signature, Pubkey::default())
+    }
+
+    fn minimal_transaction_with_account(
+        signature: Signature,
+        account_key: Pubkey,
+    ) -> VersionedTransaction {
         VersionedTransaction {
             signatures: vec![signature],
             message: VersionedMessage::Legacy(Message {
@@ -1508,7 +1730,7 @@ mod tests {
                     num_readonly_signed_accounts: 0,
                     num_readonly_unsigned_accounts: 0,
                 },
-                account_keys: vec![Pubkey::default()],
+                account_keys: vec![account_key],
                 recent_blockhash: Hash::default(),
                 instructions: vec![],
             }),
@@ -1523,9 +1745,25 @@ mod tests {
         allocator: &rts_alloc::Allocator,
         signature_byte: u8,
     ) -> SharableTransactionRegion {
+        allocate_minimal_transaction_region_with_account(
+            allocator,
+            signature_byte,
+            Pubkey::default(),
+        )
+    }
+
+    fn allocate_minimal_transaction_region_with_account(
+        allocator: &rts_alloc::Allocator,
+        signature_byte: u8,
+        account_key: Pubkey,
+    ) -> SharableTransactionRegion {
         allocate_transaction(
             allocator,
-            &serialized_minimal_transaction(Signature::from([signature_byte; SIGNATURE_BYTES])),
+            &wincode::serialize(&minimal_transaction_with_account(
+                Signature::from([signature_byte; SIGNATURE_BYTES]),
+                account_key,
+            ))
+            .unwrap(),
         )
     }
 
@@ -1801,6 +2039,118 @@ mod tests {
         assert_eq!(resolved_pubkeys.unwrap().as_slice().len(), 1);
         assert_eq!(check_response.resolved_pubkeys.num_pubkeys, 0);
         assert_eq!(read_replay_block_status(&mut replay_stage), None);
+    }
+
+    #[test]
+    fn checked_transaction_moves_to_in_flight_and_executed() {
+        let (mut scheduler, mut replay_stage, mut workers) =
+            setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
+                allocator_size: 64 * 1024 * 1024,
+                replay_to_pack_capacity: 8,
+                replay_block_status_capacity: 8,
+                worker_count: 1,
+                pack_to_worker_capacity: 8,
+                worker_to_pack_capacity: 8,
+            });
+        let transaction = allocate_minimal_transaction_region(&replay_stage.allocator, 1);
+        write_replay_messages(
+            &mut replay_stage,
+            [begin(42), entry(42, 1), transaction_message(transaction)],
+        );
+        assert_eq!(scheduler.service_ingress_queue(3), 3);
+        assert_eq!(scheduler.service_transaction_check_dispatches(1024), 1);
+        let worker_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        queue_worker_check_response(
+            &mut workers[0],
+            worker_message.batch,
+            successful_check_response(),
+        );
+        assert_eq!(scheduler.service_worker_responses(1), 1);
+
+        let previous_transaction_state = {
+            let state = scheduler.scheduling_state_mut(42);
+            let thread_id = state
+                .try_lock_ready_transaction(0, ThreadSet::any(1), first_thread)
+                .unwrap();
+            state.move_checked_transaction_to_in_flight(0, thread_id);
+            assert_eq!(in_flight_transaction_thread_id(state, 0), thread_id);
+            state.finish_in_flight_transaction(0, thread_id)
+        };
+        assert!(matches!(
+            previous_transaction_state,
+            TransactionState::InFlight { .. },
+        ));
+        scheduler.free_transaction_state_allocations(previous_transaction_state);
+
+        let state = scheduler.scheduling_states.get(&42).unwrap();
+        assert!(matches!(
+            state.transactions.get(0).unwrap(),
+            TransactionState::Executed,
+        ));
+    }
+
+    #[test]
+    fn account_locks_force_conflicting_ready_transactions_to_same_thread() {
+        let (mut scheduler, mut replay_stage, mut workers) =
+            setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
+                allocator_size: 64 * 1024 * 1024,
+                replay_to_pack_capacity: 8,
+                replay_block_status_capacity: 8,
+                worker_count: 2,
+                pack_to_worker_capacity: 8,
+                worker_to_pack_capacity: 8,
+            });
+        let account = Pubkey::new_unique();
+        let first_transaction =
+            allocate_minimal_transaction_region_with_account(&replay_stage.allocator, 1, account);
+        let second_transaction =
+            allocate_minimal_transaction_region_with_account(&replay_stage.allocator, 2, account);
+        write_replay_messages(
+            &mut replay_stage,
+            [
+                begin(42),
+                entry(42, 2),
+                transaction_message(first_transaction),
+                transaction_message(second_transaction),
+            ],
+        );
+        assert_eq!(scheduler.service_ingress_queue(4), 4);
+        assert_eq!(scheduler.service_transaction_check_dispatches(1024), 2);
+        let first_check = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        let second_check = read_pack_to_worker_message(&mut workers[1]).unwrap();
+        queue_worker_check_response(
+            &mut workers[0],
+            first_check.batch,
+            successful_check_response(),
+        );
+        queue_worker_check_response(
+            &mut workers[1],
+            second_check.batch,
+            successful_check_response(),
+        );
+        assert_eq!(scheduler.service_worker_responses(2), 2);
+
+        let state = scheduler.scheduling_state_mut(42);
+        let first_thread_id = state
+            .try_lock_ready_transaction(0, ThreadSet::any(2), first_thread)
+            .unwrap();
+        assert_eq!(first_thread_id, 0);
+        assert!(
+            state
+                .try_lock_ready_transaction(1, ThreadSet::only(1), first_thread)
+                .is_none()
+        );
+
+        let second_thread_id = state
+            .try_lock_ready_transaction(1, ThreadSet::any(2), |thread_set| {
+                assert_eq!(thread_set.only_one_contained(), Some(first_thread_id));
+                first_thread_id
+            })
+            .unwrap();
+        assert_eq!(second_thread_id, first_thread_id);
+
+        state.unlock_transaction_accounts(1, second_thread_id);
+        state.unlock_transaction_accounts(0, first_thread_id);
     }
 
     #[test]
