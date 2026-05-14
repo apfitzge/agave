@@ -31,7 +31,7 @@ use {
     solana_entry::entry::EntryVerificationData,
     solana_hash::Hash,
     solana_metrics::datapoint_info,
-    solana_pubkey::Pubkey,
+    solana_pubkey::{Pubkey, PubkeyHasherBuilder},
     std::{
         collections::{HashMap, HashSet, VecDeque},
         num::NonZeroUsize,
@@ -68,6 +68,8 @@ const REPLAY_TRANSACTION_CHECK_FLAGS: u16 = pack_message_flags::CHECK
     | check_flags::REPLAY;
 const REPLAY_TRANSACTION_EXECUTION_FLAGS: u16 =
     pack_message_flags::EXECUTE | execution_flags::REPLAY;
+
+type PubkeyHashSet = HashSet<Pubkey, PubkeyHasherBuilder>;
 
 fn is_check_response_region(
     batch: SharableTransactionBatchRegion,
@@ -122,8 +124,8 @@ struct SchedulingState {
     pending_transaction_checks: VecDeque<PendingTransactionCheck>,
     next_ready_transaction_index: usize,
     ready_transactions: VecDeque<usize>,
-    unschedulable_read_locks: HashSet<Pubkey>,
-    unschedulable_write_locks: HashSet<Pubkey>,
+    unschedulable_read_locks: PubkeyHashSet,
+    unschedulable_write_locks: PubkeyHashSet,
     ingress_complete: bool,
     entry_verification: EntryVerificationProgress,
     in_flight_worker_messages: usize,
@@ -143,8 +145,8 @@ impl SchedulingState {
             pending_transaction_checks: VecDeque::new(),
             next_ready_transaction_index: 0,
             ready_transactions: VecDeque::new(),
-            unschedulable_read_locks: HashSet::new(),
-            unschedulable_write_locks: HashSet::new(),
+            unschedulable_read_locks: PubkeyHashSet::with_hasher(PubkeyHasherBuilder::default()),
+            unschedulable_write_locks: PubkeyHashSet::with_hasher(PubkeyHasherBuilder::default()),
             ingress_complete: false,
             entry_verification: EntryVerificationProgress::default(),
             in_flight_worker_messages: 0,
@@ -182,8 +184,14 @@ impl SchedulingState {
         self.pending_transaction_checks = VecDeque::with_capacity(POOLED_SLOT_WORK_CAPACITY);
         self.next_ready_transaction_index = 0;
         self.ready_transactions = VecDeque::with_capacity(POOLED_SLOT_WORK_CAPACITY);
-        self.unschedulable_read_locks = HashSet::with_capacity(POOLED_SLOT_WORK_CAPACITY);
-        self.unschedulable_write_locks = HashSet::with_capacity(POOLED_SLOT_WORK_CAPACITY);
+        self.unschedulable_read_locks = PubkeyHashSet::with_capacity_and_hasher(
+            POOLED_SLOT_WORK_CAPACITY,
+            PubkeyHasherBuilder::default(),
+        );
+        self.unschedulable_write_locks = PubkeyHashSet::with_capacity_and_hasher(
+            POOLED_SLOT_WORK_CAPACITY,
+            PubkeyHasherBuilder::default(),
+        );
         self.ingress_complete = false;
         self.entry_verification = EntryVerificationProgress::default();
         self.in_flight_worker_messages = 0;
@@ -954,8 +962,8 @@ impl TransactionState {
 
     fn conflicts_with_unschedulable_locks(
         &self,
-        unschedulable_read_locks: &HashSet<Pubkey>,
-        unschedulable_write_locks: &HashSet<Pubkey>,
+        unschedulable_read_locks: &PubkeyHashSet,
+        unschedulable_write_locks: &PubkeyHashSet,
     ) -> bool {
         self.write_locks().any(|write_lock| {
             unschedulable_write_locks.contains(write_lock)
@@ -967,8 +975,8 @@ impl TransactionState {
 
     fn record_unschedulable_locks(
         &self,
-        unschedulable_read_locks: &mut HashSet<Pubkey>,
-        unschedulable_write_locks: &mut HashSet<Pubkey>,
+        unschedulable_read_locks: &mut PubkeyHashSet,
+        unschedulable_write_locks: &mut PubkeyHashSet,
     ) {
         unschedulable_write_locks.extend(self.write_locks().copied());
         unschedulable_read_locks.extend(self.read_locks().copied());
