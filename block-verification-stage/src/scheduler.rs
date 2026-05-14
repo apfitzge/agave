@@ -106,6 +106,7 @@ pub struct BlockVerificationScheduler {
     exit: Arc<AtomicBool>,
     session: BlockVerificationStageSession,
     scheduling_states: HashMap<u64, SchedulingState>,
+    slot_order: Vec<u64>,
     scheduling_state_pool: Vec<SchedulingState>,
     terminal_slot_queue: VecDeque<u64>,
     pending_entry: Option<PendingEntryIngress>,
@@ -1038,6 +1039,7 @@ impl BlockVerificationScheduler {
             exit,
             session,
             scheduling_states: HashMap::new(),
+            slot_order: Vec::new(),
             scheduling_state_pool: Vec::new(),
             terminal_slot_queue: VecDeque::new(),
             pending_entry: None,
@@ -1247,6 +1249,7 @@ impl BlockVerificationScheduler {
             previous.is_none(),
             "slot already has scheduling state: {slot}"
         );
+        self.insert_slot_order(slot);
     }
 
     fn handle_bank_complete(&mut self, slot: u64) {
@@ -1351,12 +1354,8 @@ impl BlockVerificationScheduler {
         }
 
         let mut dispatched = 0;
-        let mut last_slot = None;
-        while dispatched < max_checks {
-            let Some(slot) = self.next_pending_check_slot_after(last_slot) else {
-                break;
-            };
-            last_slot = Some(slot);
+        for slot_index in 0..self.slot_order.len() {
+            let slot = self.slot_order[slot_index];
             while dispatched < max_checks && self.has_pending_transaction_checks(slot) {
                 let mut made_progress = false;
                 for worker_index in 0..self.session.workers.len() {
@@ -1400,21 +1399,12 @@ impl BlockVerificationScheduler {
                     return dispatched;
                 }
             }
+            if dispatched == max_checks {
+                break;
+            }
         }
 
         dispatched
-    }
-
-    fn next_pending_check_slot_after(&self, last_slot: Option<u64>) -> Option<u64> {
-        self.scheduling_states
-            .iter()
-            .filter(|(slot, state)| {
-                last_slot.is_none_or(|last_slot| **slot > last_slot)
-                    && state.allows_transaction_processing()
-                    && !state.pending_transaction_checks.is_empty()
-            })
-            .map(|(slot, _)| *slot)
-            .min()
     }
 
     fn has_pending_transaction_checks(&self, slot: u64) -> bool {
@@ -1431,6 +1421,28 @@ impl BlockVerificationScheduler {
         }
 
         state.pending_transaction_checks.front().copied()
+    }
+
+    fn insert_slot_order(&mut self, slot: u64) {
+        assert!(
+            !self.slot_order.contains(&slot),
+            "slot already present in block verification slot order",
+        );
+        let slot_index = self
+            .slot_order
+            .iter()
+            .position(|ordered_slot| *ordered_slot > slot)
+            .unwrap_or(self.slot_order.len());
+        self.slot_order.insert(slot_index, slot);
+    }
+
+    fn remove_slot_order(&mut self, slot: u64) {
+        let slot_index = self
+            .slot_order
+            .iter()
+            .position(|ordered_slot| *ordered_slot == slot)
+            .expect("slot missing from block verification slot order");
+        self.slot_order.remove(slot_index);
     }
 
     fn worker_queue_has_capacity(&mut self, worker_index: usize) -> bool {
@@ -1951,6 +1963,7 @@ impl BlockVerificationScheduler {
         }
 
         let mut state = self.scheduling_states.remove(&slot).unwrap();
+        self.remove_slot_order(slot);
         state.update_work_timing(Instant::now());
         self.report_slot_work_timing(&state, terminal_status);
         self.free_scheduling_state_allocations(&mut state);
@@ -3052,6 +3065,57 @@ mod tests {
         let state = scheduler.scheduling_states.get(&42).unwrap();
         assert!(state.pending_transaction_checks.is_empty());
         assert_eq!(state.in_flight_worker_messages, TRANSACTION_COUNT);
+    }
+
+    #[test]
+    fn transaction_checks_iterate_ordered_slot_list() {
+        let (mut scheduler, mut replay_stage, mut workers) =
+            setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
+                allocator_size: 64 * 1024 * 1024,
+                replay_to_pack_capacity: 16,
+                replay_block_status_capacity: 8,
+                worker_count: 1,
+                pack_to_worker_capacity: 8,
+                worker_to_pack_capacity: 8,
+            });
+        let slots = [43, 41, 42];
+        let transactions = slots.map(|slot| allocate_transaction(&replay_stage.allocator, &[slot]));
+        write_replay_messages(
+            &mut replay_stage,
+            slots
+                .into_iter()
+                .zip(transactions)
+                .flat_map(|(slot, transaction)| {
+                    [
+                        begin(slot.into()),
+                        entry(slot.into(), 1),
+                        transaction_message(transaction),
+                    ]
+                }),
+        );
+
+        assert_eq!(scheduler.service_ingress_queue(9), 9);
+        assert_eq!(scheduler.slot_order, vec![41, 42, 43]);
+        assert_eq!(scheduler.service_transaction_check_dispatches(2), 2);
+
+        let first_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        let second_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        assert_eq!(
+            transaction_check_metadata(&replay_stage.allocator, first_message.batch).slot,
+            41,
+        );
+        assert_eq!(
+            transaction_check_metadata(&replay_stage.allocator, second_message.batch).slot,
+            42,
+        );
+        assert!(read_pack_to_worker_message(&mut workers[0]).is_none());
+
+        assert_eq!(scheduler.service_transaction_check_dispatches(1024), 1);
+        let third_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        assert_eq!(
+            transaction_check_metadata(&replay_stage.allocator, third_message.batch).slot,
+            43,
+        );
     }
 
     #[test]
