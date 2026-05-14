@@ -49,7 +49,8 @@ const ENTRY_VERIFICATION_RESULT_LIMIT: usize = 1024;
 const SIGNATURE_CHECK_DISPATCH_LIMIT: usize = 1024;
 const TRANSACTION_EXECUTION_DISPATCH_LIMIT: usize = 1024;
 const TRANSACTION_EXECUTION_SCAN_LIMIT: usize = 1024;
-const MAX_OUTSTANDING_EXECUTIONS_PER_WORKER: usize = 16;
+const MAX_OUTSTANDING_EXECUTIONS_PER_WORKER: usize = 128;
+const MAX_OUTSTANDING_EXECUTION_COST_UNITS_PER_WORKER: u64 = 4_000_000;
 const WORKER_RESPONSE_LIMIT: usize = 1024;
 const TERMINAL_SLOT_CLEANUP_LIMIT: usize = 1024;
 const SCHEDULING_STATE_POOL_LIMIT: usize = 5;
@@ -497,7 +498,8 @@ impl ExecutionDispatchContext<'_> {
             return None;
         }
 
-        let available_threads = self.available_worker_threads();
+        let estimated_cost_units = transaction.estimated_cost_units();
+        let available_threads = self.available_worker_threads(estimated_cost_units);
         if available_threads.is_empty() {
             return None;
         }
@@ -547,24 +549,40 @@ impl ExecutionDispatchContext<'_> {
         }
         self.workers[thread_id].pack_to_worker.commit();
 
-        self.increment_in_flight_execution_messages(thread_id, transaction.estimated_cost_units());
+        self.increment_in_flight_execution_messages(thread_id, estimated_cost_units);
         Some(thread_id)
     }
 
-    fn available_worker_threads(&mut self) -> ThreadSet {
+    fn available_worker_threads(&mut self, estimated_cost_units: u64) -> ThreadSet {
         let mut available_threads = ThreadSet::none();
-        for (worker_index, worker) in self.workers.iter_mut().enumerate() {
-            let queue = &mut worker.pack_to_worker;
+        for worker_index in 0..self.workers.len() {
+            let in_flight_execution_count = self.in_flight_executions_per_thread[worker_index];
+            let has_cost_capacity = Self::worker_has_cost_capacity(
+                in_flight_execution_count,
+                self.in_flight_execution_cost_units_per_thread[worker_index],
+                estimated_cost_units,
+            );
+            let queue = &mut self.workers[worker_index].pack_to_worker;
             queue.sync();
             if queue.len() < queue.capacity()
-                && self.in_flight_executions_per_thread[worker_index]
-                    < MAX_OUTSTANDING_EXECUTIONS_PER_WORKER
+                && in_flight_execution_count < MAX_OUTSTANDING_EXECUTIONS_PER_WORKER
+                && has_cost_capacity
             {
                 available_threads.insert(worker_index);
             }
         }
 
         available_threads
+    }
+
+    fn worker_has_cost_capacity(
+        in_flight_execution_count: usize,
+        in_flight_cost_units: u64,
+        estimated_cost_units: u64,
+    ) -> bool {
+        in_flight_execution_count == 0
+            || in_flight_cost_units.saturating_add(estimated_cost_units)
+                <= MAX_OUTSTANDING_EXECUTION_COST_UNITS_PER_WORKER
     }
 
     fn increment_in_flight_execution_messages(&mut self, thread_id: ThreadId, cost_units: u64) {
@@ -3487,6 +3505,69 @@ mod tests {
     }
 
     #[test]
+    fn execution_dispatch_is_bounded_by_worker_cost() {
+        let (mut scheduler, mut replay_stage, mut workers) =
+            setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
+                allocator_size: 64 * 1024 * 1024,
+                replay_to_pack_capacity: 8,
+                replay_block_status_capacity: 8,
+                worker_count: 1,
+                pack_to_worker_capacity: 8,
+                worker_to_pack_capacity: 8,
+            });
+        let transactions: [SharableTransactionRegion; 3] = core::array::from_fn(|index| {
+            allocate_minimal_transaction_region_with_account(
+                &replay_stage.allocator,
+                index as u8,
+                Pubkey::new_unique(),
+            )
+        });
+        write_replay_messages(
+            &mut replay_stage,
+            [
+                begin(42),
+                entry(42, 3),
+                transaction_message(transactions[0]),
+                transaction_message(transactions[1]),
+                transaction_message(transactions[2]),
+            ],
+        );
+        assert_eq!(scheduler.service_ingress_queue(5), 5);
+        assert_eq!(scheduler.service_transaction_check_dispatches(1024), 3);
+        while let Some(message) = read_pack_to_worker_message(&mut workers[0]) {
+            queue_worker_check_response(
+                &mut workers[0],
+                message.batch,
+                successful_check_response_with_cost(2_000_000),
+            );
+        }
+        assert_eq!(scheduler.service_worker_responses(3), 3);
+
+        assert_eq!(scheduler.service_transaction_execution_dispatches(3, 3), 2);
+        let first_execution = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        let second_execution = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        assert!(read_pack_to_worker_message(&mut workers[0]).is_none());
+        assert_eq!(
+            transaction_execution_metadata(&replay_stage.allocator, first_execution.batch)
+                .transaction_index,
+            0,
+        );
+        assert_eq!(
+            transaction_execution_metadata(&replay_stage.allocator, second_execution.batch)
+                .transaction_index,
+            1,
+        );
+        assert_eq!(scheduler.in_flight_executions_per_thread, vec![2]);
+        assert_eq!(
+            scheduler.in_flight_execution_cost_units_per_thread,
+            vec![MAX_OUTSTANDING_EXECUTION_COST_UNITS_PER_WORKER],
+        );
+
+        let state = scheduler.scheduling_states.get(&42).unwrap();
+        assert!(state.ready_transactions.iter().copied().eq(2..3));
+    }
+
+    #[test]
     fn execution_dispatch_load_balances_across_slots() {
         let (mut scheduler, mut replay_stage, mut workers) =
             setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
@@ -3556,11 +3637,11 @@ mod tests {
         let (mut scheduler, mut replay_stage, mut workers) =
             setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
                 allocator_size: 64 * 1024 * 1024,
-                replay_to_pack_capacity: 64,
+                replay_to_pack_capacity: 512,
                 replay_block_status_capacity: 8,
                 worker_count: 2,
-                pack_to_worker_capacity: 64,
-                worker_to_pack_capacity: 64,
+                pack_to_worker_capacity: 512,
+                worker_to_pack_capacity: 512,
             });
         let transaction_count = MAX_OUTSTANDING_EXECUTIONS_PER_WORKER * 2 + 8;
         assert!(replay_stage.replay_to_pack.try_write(begin(42)).is_ok());
@@ -3633,11 +3714,11 @@ mod tests {
         let (mut scheduler, mut replay_stage, mut workers) =
             setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
                 allocator_size: 64 * 1024 * 1024,
-                replay_to_pack_capacity: 64,
+                replay_to_pack_capacity: 512,
                 replay_block_status_capacity: 8,
                 worker_count: 2,
-                pack_to_worker_capacity: 64,
-                worker_to_pack_capacity: 64,
+                pack_to_worker_capacity: 512,
+                worker_to_pack_capacity: 512,
             });
         let account = Pubkey::new_unique();
         assert!(replay_stage.replay_to_pack.try_write(begin(42)).is_ok());
