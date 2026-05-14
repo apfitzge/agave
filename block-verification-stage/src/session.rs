@@ -15,7 +15,7 @@ use {
             atomic::{AtomicBool, Ordering},
         },
         thread,
-        time::Duration,
+        time::{Duration, Instant},
     },
 };
 
@@ -207,6 +207,7 @@ impl BlockVerificationSession {
             payload: ReplayToPackMessagePayload {
                 entry_header: EntryHeader {
                     slot,
+                    replay_send_time: Instant::now(),
                     num_hashes: entry.num_hashes,
                     hash: entry.hash.to_bytes(),
                     num_transactions: entry.transactions.len().try_into().unwrap(),

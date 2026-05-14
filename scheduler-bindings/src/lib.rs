@@ -63,6 +63,8 @@
 //!   responsible for freeing it.
 //!
 
+extern crate std;
+
 /// Reference to a transaction that can shared safely across processes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
@@ -175,6 +177,8 @@ pub mod tpu_message_flags {
 pub struct EntryHeader {
     /// Bank slot for this entry.
     pub slot: u64,
+    /// Time when replay sent this entry header.
+    pub replay_send_time: std::time::Instant,
     /// The number of hashes since the previous entry ID.
     pub num_hashes: u64,
     /// The SHA-256 hash `num_hashes` after the previous entry ID.

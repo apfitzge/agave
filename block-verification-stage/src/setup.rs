@@ -165,6 +165,7 @@ mod tests {
             pack_message_flags, processed_codes, replay_bank_message_kinds,
             replay_block_status_codes, replay_block_status_reasons, replay_to_pack_message_types,
         },
+        std::time::Instant,
     };
 
     fn setup(worker_count: usize) -> Result<BlockVerificationStageSessions, SetupError> {
@@ -207,6 +208,7 @@ mod tests {
                     payload: ReplayToPackMessagePayload {
                         entry_header: EntryHeader {
                             slot: 42,
+                            replay_send_time: Instant::now(),
                             num_hashes: 1,
                             hash: [7; 32],
                             num_transactions: 0,

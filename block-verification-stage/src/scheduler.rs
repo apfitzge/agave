@@ -134,6 +134,9 @@ struct SchedulingState {
     in_flight_execution_messages: usize,
     terminal_status: Option<SlotTerminalStatus>,
     work_timing: SlotWorkTiming,
+    entry_ingest_latency: LatencyStats,
+    transaction_ingest_to_execution_latency: LatencyStats,
+    transaction_scheduling_time: LatencyStats,
 }
 
 impl SchedulingState {
@@ -156,6 +159,9 @@ impl SchedulingState {
             in_flight_execution_messages: 0,
             terminal_status: None,
             work_timing: SlotWorkTiming::default(),
+            entry_ingest_latency: LatencyStats::default(),
+            transaction_ingest_to_execution_latency: LatencyStats::default(),
+            transaction_scheduling_time: LatencyStats::default(),
         }
     }
 
@@ -175,6 +181,9 @@ impl SchedulingState {
         self.in_flight_execution_messages = 0;
         self.terminal_status = None;
         self.work_timing = SlotWorkTiming::default();
+        self.entry_ingest_latency = LatencyStats::default();
+        self.transaction_ingest_to_execution_latency = LatencyStats::default();
+        self.transaction_scheduling_time = LatencyStats::default();
     }
 
     fn clear_for_pool(&mut self) {
@@ -201,6 +210,9 @@ impl SchedulingState {
         self.in_flight_execution_messages = 0;
         self.terminal_status = None;
         self.work_timing = SlotWorkTiming::default();
+        self.entry_ingest_latency = LatencyStats::default();
+        self.transaction_ingest_to_execution_latency = LatencyStats::default();
+        self.transaction_scheduling_time = LatencyStats::default();
     }
 
     fn accepts_ingress(&self) -> bool {
@@ -230,6 +242,14 @@ impl SchedulingState {
         self.ready_scan_cursor = 0;
         self.unschedulable_read_locks.clear();
         self.unschedulable_write_locks.clear();
+    }
+
+    fn has_transaction_scheduling_work(&self) -> bool {
+        self.allows_transaction_processing() && !self.ready_transactions.is_empty()
+    }
+
+    fn record_transaction_scheduling_time(&mut self, elapsed: Duration) {
+        self.transaction_scheduling_time.record(elapsed);
     }
 
     fn service_transaction_execution_dispatches(
@@ -420,6 +440,7 @@ impl SchedulingState {
             resolved_pubkeys,
             scheduling_metadata,
             check_response,
+            ingest_time,
         } = previous_transaction_state
         else {
             panic!("scheduled transaction was not checked: {transaction_index}");
@@ -429,6 +450,7 @@ impl SchedulingState {
             resolved_pubkeys,
             scheduling_metadata,
             check_response,
+            ingest_time,
             thread_id,
         };
         self.in_flight_execution_messages += 1;
@@ -438,6 +460,7 @@ impl SchedulingState {
         &mut self,
         transaction_index: usize,
         thread_id: ThreadId,
+        execution_complete_time: Instant,
     ) -> TransactionState {
         self.unlock_transaction_accounts(transaction_index, thread_id);
 
@@ -465,6 +488,10 @@ impl SchedulingState {
             .expect("execution response without in-flight execution");
         self.prune_scheduled_ready_prefix();
         self.reset_ready_scan();
+        self.record_transaction_ingest_to_execution_latency(
+            previous_transaction_state.ingest_time(),
+            execution_complete_time,
+        );
 
         previous_transaction_state
     }
@@ -489,6 +516,25 @@ impl SchedulingState {
         } else {
             self.work_timing.stop(now);
         }
+    }
+
+    fn record_entry_ingest_latency(&mut self, replay_send_time: Instant, now: Instant) {
+        self.entry_ingest_latency.record(
+            now.checked_duration_since(replay_send_time)
+                .unwrap_or(Duration::ZERO),
+        );
+    }
+
+    fn record_transaction_ingest_to_execution_latency(
+        &mut self,
+        transaction_ingest_time: Instant,
+        execution_complete_time: Instant,
+    ) {
+        self.transaction_ingest_to_execution_latency.record(
+            execution_complete_time
+                .checked_duration_since(transaction_ingest_time)
+                .unwrap_or(Duration::ZERO),
+        );
     }
 }
 
@@ -553,6 +599,49 @@ impl SlotWorkTiming {
 
     fn accumulated_us(&self) -> u64 {
         self.accumulated.as_micros().try_into().unwrap_or(u64::MAX)
+    }
+}
+
+#[derive(Default)]
+struct LatencyStats {
+    count: u64,
+    min_ns: u64,
+    max_ns: u64,
+    total_ns: u128,
+}
+
+impl LatencyStats {
+    fn record(&mut self, latency: Duration) {
+        let latency_ns = latency.as_nanos().try_into().unwrap_or(u64::MAX);
+        self.count = self.count.saturating_add(1);
+        if self.count == 1 {
+            self.min_ns = latency_ns;
+            self.max_ns = latency_ns;
+        } else {
+            self.min_ns = self.min_ns.min(latency_ns);
+            self.max_ns = self.max_ns.max(latency_ns);
+        }
+        self.total_ns = self.total_ns.saturating_add(u128::from(latency_ns));
+    }
+
+    fn min_ns(&self) -> u64 {
+        if self.count == 0 { 0 } else { self.min_ns }
+    }
+
+    fn mean_ns(&self) -> u64 {
+        if self.count == 0 {
+            0
+        } else {
+            self.total_ns
+                .checked_div(u128::from(self.count))
+                .unwrap_or(u128::MAX)
+                .try_into()
+                .unwrap_or(u64::MAX)
+        }
+    }
+
+    fn total_ns(&self) -> u64 {
+        self.total_ns.try_into().unwrap_or(u64::MAX)
     }
 }
 
@@ -888,18 +977,21 @@ impl TransactionSchedulingMetadata {
 enum TransactionState {
     Pending {
         transaction: TransactionPtr,
+        ingest_time: Instant,
     },
     Checked {
         transaction: SanitizedTransactionView<TransactionPtr>,
         resolved_pubkeys: Option<PubkeysPtr>,
         scheduling_metadata: TransactionSchedulingMetadata,
         check_response: CheckResponse,
+        ingest_time: Instant,
     },
     InFlight {
         transaction: SanitizedTransactionView<TransactionPtr>,
         resolved_pubkeys: Option<PubkeysPtr>,
         scheduling_metadata: TransactionSchedulingMetadata,
         check_response: CheckResponse,
+        ingest_time: Instant,
         thread_id: ThreadId,
     },
     Executed,
@@ -917,7 +1009,7 @@ impl TransactionState {
 
     fn transaction_ptr(&self) -> &TransactionPtr {
         match self {
-            Self::Pending { transaction } => transaction,
+            Self::Pending { transaction, .. } => transaction,
             Self::Checked { transaction, .. } => transaction.inner_data(),
             Self::InFlight { transaction, .. } => transaction.inner_data(),
             Self::Executed => panic!("transaction state is executed"),
@@ -969,6 +1061,16 @@ impl TransactionState {
 
     fn estimated_cost_units(&self) -> u64 {
         self.scheduling_metadata().cost.estimated_cost_units
+    }
+
+    fn ingest_time(&self) -> Instant {
+        match self {
+            Self::Pending { ingest_time, .. }
+            | Self::Checked { ingest_time, .. }
+            | Self::InFlight { ingest_time, .. } => *ingest_time,
+            Self::Executed => panic!("transaction state is executed"),
+            Self::Transitioning => panic!("transaction state is transitioning"),
+        }
     }
 
     fn account_keys(&self) -> impl Iterator<Item = &Pubkey> + Clone {
@@ -1285,7 +1387,7 @@ impl BlockVerificationScheduler {
 
         let pending_entry = PendingEntryIngress::new(entry_header);
         if pending_entry.is_complete() {
-            self.finish_pending_entry(pending_entry);
+            self.finish_pending_entry(pending_entry, Instant::now());
         } else {
             self.pending_entry = Some(pending_entry);
         }
@@ -1300,16 +1402,17 @@ impl BlockVerificationScheduler {
         pending_entry.received_transactions += 1;
 
         if pending_entry.is_complete() {
-            self.finish_pending_entry(pending_entry);
+            self.finish_pending_entry(pending_entry, Instant::now());
         } else {
             self.pending_entry = Some(pending_entry);
         }
     }
 
-    fn finish_pending_entry(&mut self, pending_entry: PendingEntryIngress) {
+    fn finish_pending_entry(&mut self, pending_entry: PendingEntryIngress, now: Instant) {
         let slot = pending_entry.header.slot;
         if self.is_slot_accepting_work(slot) {
             let state = self.scheduling_state_mut(slot);
+            state.record_entry_ingest_latency(pending_entry.header.replay_send_time, now);
             state.start_work_timing();
             state.entry_headers.push(pending_entry.header);
             self.spawn_entry_hash_verification(
@@ -1335,9 +1438,10 @@ impl BlockVerificationScheduler {
         let state = self.scheduling_state_mut(slot);
         state.start_work_timing();
         let transaction_index = state.transactions.len();
-        let transaction_key = state
-            .transactions
-            .insert(TransactionState::Pending { transaction });
+        let transaction_key = state.transactions.insert(TransactionState::Pending {
+            transaction,
+            ingest_time: Instant::now(),
+        });
         assert_eq!(
             transaction_key, transaction_index,
             "slab key must match ingress transaction index",
@@ -1548,11 +1652,17 @@ impl BlockVerificationScheduler {
             {
                 break;
             }
+            let scheduling_start = state
+                .has_transaction_scheduling_work()
+                .then(Instant::now);
             let state_counts = state.service_transaction_execution_dispatches(
                 &mut dispatch_context,
                 max_executions - counts.scheduled,
                 max_scanned_transactions - counts.scanned,
             );
+            if let Some(scheduling_start) = scheduling_start {
+                state.record_transaction_scheduling_time(scheduling_start.elapsed());
+            }
             counts.scheduled += state_counts.scheduled;
             counts.scanned += state_counts.scanned;
         }
@@ -1660,7 +1770,8 @@ impl BlockVerificationScheduler {
         self.free_execution_response_region(execution_responses);
         self.free_transaction_batch_allocation(message.batch);
 
-        let previous_transaction_state = self.finish_worker_execution(worker_execution);
+        let previous_transaction_state =
+            self.finish_worker_execution(worker_execution, Instant::now());
         let cost_units = previous_transaction_state.estimated_cost_units();
         self.free_transaction_state_allocations(previous_transaction_state);
         self.decrement_in_flight_execution_messages(worker_execution.thread_id, cost_units);
@@ -1763,11 +1874,13 @@ impl BlockVerificationScheduler {
     fn finish_worker_execution(
         &mut self,
         worker_execution: PendingWorkerExecution,
+        execution_complete_time: Instant,
     ) -> TransactionState {
         self.scheduling_state_mut(worker_execution.slot)
             .finish_in_flight_transaction(
                 worker_execution.transaction_index,
                 worker_execution.thread_id,
+                execution_complete_time,
             )
     }
 
@@ -1796,7 +1909,11 @@ impl BlockVerificationScheduler {
             .expect("successful check for unknown transaction");
         let previous_transaction_state =
             core::mem::replace(transaction_state, TransactionState::Transitioning);
-        let TransactionState::Pending { transaction } = previous_transaction_state else {
+        let TransactionState::Pending {
+            transaction,
+            ingest_time,
+        } = previous_transaction_state
+        else {
             panic!(
                 "successful check for transaction that was not pending: {}",
                 worker_check.transaction_index,
@@ -1809,6 +1926,7 @@ impl BlockVerificationScheduler {
             resolved_pubkeys,
             scheduling_metadata,
             check_response,
+            ingest_time,
         };
 
         state.promote_ready_transactions();
@@ -1989,6 +2107,71 @@ impl BlockVerificationScheduler {
             ("reason", terminal_status.reason(), i64),
             ("active_us", state.work_timing.accumulated_us(), i64),
             ("active_periods", state.work_timing.active_periods, i64),
+            (
+                "entry_ingest_latency_count",
+                state.entry_ingest_latency.count,
+                i64
+            ),
+            (
+                "entry_ingest_latency_min_ns",
+                state.entry_ingest_latency.min_ns(),
+                i64
+            ),
+            (
+                "entry_ingest_latency_max_ns",
+                state.entry_ingest_latency.max_ns,
+                i64
+            ),
+            (
+                "entry_ingest_latency_mean_ns",
+                state.entry_ingest_latency.mean_ns(),
+                i64
+            ),
+            (
+                "transaction_ingest_to_execution_latency_count",
+                state.transaction_ingest_to_execution_latency.count,
+                i64
+            ),
+            (
+                "transaction_ingest_to_execution_latency_min_ns",
+                state.transaction_ingest_to_execution_latency.min_ns(),
+                i64
+            ),
+            (
+                "transaction_ingest_to_execution_latency_max_ns",
+                state.transaction_ingest_to_execution_latency.max_ns,
+                i64
+            ),
+            (
+                "transaction_ingest_to_execution_latency_mean_ns",
+                state.transaction_ingest_to_execution_latency.mean_ns(),
+                i64
+            ),
+            (
+                "transaction_scheduling_time_count",
+                state.transaction_scheduling_time.count,
+                i64
+            ),
+            (
+                "transaction_scheduling_time_total_ns",
+                state.transaction_scheduling_time.total_ns(),
+                i64
+            ),
+            (
+                "transaction_scheduling_time_min_ns",
+                state.transaction_scheduling_time.min_ns(),
+                i64
+            ),
+            (
+                "transaction_scheduling_time_max_ns",
+                state.transaction_scheduling_time.max_ns,
+                i64
+            ),
+            (
+                "transaction_scheduling_time_mean_ns",
+                state.transaction_scheduling_time.mean_ns(),
+                i64
+            ),
         );
     }
 
@@ -2011,7 +2194,7 @@ impl BlockVerificationScheduler {
 
     fn free_transaction_state_allocations(&mut self, transaction_state: TransactionState) {
         match transaction_state {
-            TransactionState::Pending { transaction } => {
+            TransactionState::Pending { transaction, .. } => {
                 self.free_transaction_allocation(transaction);
             }
             TransactionState::Checked {
@@ -2258,11 +2441,22 @@ mod tests {
         hash: Hash,
         num_transactions: u32,
     ) -> ReplayToPackMessage {
+        entry_with_hash_sent_at(slot, num_hashes, hash, num_transactions, Instant::now())
+    }
+
+    fn entry_with_hash_sent_at(
+        slot: u64,
+        num_hashes: u64,
+        hash: Hash,
+        num_transactions: u32,
+        replay_send_time: Instant,
+    ) -> ReplayToPackMessage {
         ReplayToPackMessage {
             tag: replay_to_pack_message_types::ENTRY_HEADER,
             payload: ReplayToPackMessagePayload {
                 entry_header: EntryHeader {
                     slot,
+                    replay_send_time,
                     num_hashes,
                     hash: hash.to_bytes(),
                     num_transactions,
@@ -2748,6 +2942,99 @@ mod tests {
     }
 
     #[test]
+    fn latency_stats_track_count_min_max_and_mean() {
+        let mut stats = LatencyStats::default();
+
+        stats.record(Duration::from_nanos(30));
+        stats.record(Duration::from_nanos(10));
+        stats.record(Duration::from_nanos(20));
+
+        assert_eq!(stats.count, 3);
+        assert_eq!(stats.total_ns(), 60);
+        assert_eq!(stats.min_ns(), 10);
+        assert_eq!(stats.max_ns, 30);
+        assert_eq!(stats.mean_ns(), 20);
+    }
+
+    #[test]
+    fn zero_transaction_entry_records_ingest_latency_at_header_receipt() {
+        let (mut scheduler, mut replay_stage) = setup_scheduler_and_replay_stage();
+        let replay_send_time = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+
+        write_replay_messages(
+            &mut replay_stage,
+            [
+                begin(42),
+                entry_with_hash_sent_at(42, 1, Hash::new_from_array([42; 32]), 0, replay_send_time),
+            ],
+        );
+
+        assert_eq!(scheduler.service_ingress_queue(2), 2);
+        let stats = &scheduler
+            .scheduling_states
+            .get(&42)
+            .unwrap()
+            .entry_ingest_latency;
+        assert_eq!(stats.count, 1);
+        assert!(stats.min_ns() >= 1_000_000_000);
+    }
+
+    #[test]
+    fn transaction_entry_records_ingest_latency_after_final_transaction() {
+        let (mut scheduler, mut replay_stage) = setup_scheduler_and_replay_stage();
+        let replay_send_time = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+        let transaction_0 = allocate_transaction(
+            &replay_stage.allocator,
+            &serialized_minimal_transaction(Signature::from([1; SIGNATURE_BYTES])),
+        );
+        let transaction_1 = allocate_transaction(
+            &replay_stage.allocator,
+            &serialized_minimal_transaction(Signature::from([2; SIGNATURE_BYTES])),
+        );
+
+        write_replay_messages(
+            &mut replay_stage,
+            [
+                begin(42),
+                entry_with_hash_sent_at(42, 1, Hash::new_from_array([42; 32]), 2, replay_send_time),
+                transaction_message(transaction_0),
+                transaction_message(transaction_1),
+            ],
+        );
+
+        assert_eq!(scheduler.service_ingress_queue(2), 2);
+        assert_eq!(
+            scheduler
+                .scheduling_states
+                .get(&42)
+                .unwrap()
+                .entry_ingest_latency
+                .count,
+            0
+        );
+
+        assert_eq!(scheduler.service_ingress_queue(1), 1);
+        assert_eq!(
+            scheduler
+                .scheduling_states
+                .get(&42)
+                .unwrap()
+                .entry_ingest_latency
+                .count,
+            0
+        );
+
+        assert_eq!(scheduler.service_ingress_queue(1), 1);
+        let stats = &scheduler
+            .scheduling_states
+            .get(&42)
+            .unwrap()
+            .entry_ingest_latency;
+        assert_eq!(stats.count, 1);
+        assert!(stats.min_ns() >= 1_000_000_000);
+    }
+
+    #[test]
     fn scheduler_has_in_flight_slots_until_terminal_cleanup() {
         let (mut scheduler, mut replay_stage) = setup_scheduler_and_replay_stage();
         assert!(!scheduler.has_in_flight_slots());
@@ -2929,6 +3216,7 @@ mod tests {
         );
         let entry_header = EntryHeader {
             slot: 42,
+            replay_send_time: Instant::now(),
             num_hashes: 1,
             hash: [1; 32],
             num_transactions: 1,
@@ -3247,7 +3535,7 @@ mod tests {
                 .unwrap();
             state.move_checked_transaction_to_in_flight(0, thread_id);
             assert_eq!(in_flight_transaction_thread_id(state, 0), thread_id);
-            state.finish_in_flight_transaction(0, thread_id)
+            state.finish_in_flight_transaction(0, thread_id, Instant::now())
         };
         assert!(matches!(
             previous_transaction_state,
@@ -3429,6 +3717,7 @@ mod tests {
         assert_eq!(scheduler.in_flight_executions_per_thread, vec![1]);
         assert_eq!(scheduler.in_flight_execution_cost_units_per_thread, vec![0]);
         assert_eq!(in_flight_transaction_thread_id(state, 0), 0);
+        assert_eq!(state.transaction_scheduling_time.count, 1);
     }
 
     #[test]
@@ -3457,6 +3746,15 @@ mod tests {
         );
         assert_eq!(scheduler.service_worker_responses(1), 1);
         assert_eq!(scheduler.service_transaction_execution_dispatches(1, 1), 1);
+        assert_eq!(
+            scheduler
+                .scheduling_states
+                .get(&42)
+                .unwrap()
+                .transaction_ingest_to_execution_latency
+                .count,
+            0
+        );
         let execution_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
 
         queue_worker_execution_response(
@@ -3476,6 +3774,8 @@ mod tests {
             state.transactions.get(0).unwrap(),
             TransactionState::Executed,
         ));
+        assert_eq!(state.transaction_ingest_to_execution_latency.count, 1);
+        assert!(state.transaction_ingest_to_execution_latency.min_ns() > 0);
     }
 
     #[test]
