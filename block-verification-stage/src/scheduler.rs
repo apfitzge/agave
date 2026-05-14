@@ -55,10 +55,8 @@ const MAX_OUTSTANDING_EXECUTION_COST_UNITS_PER_WORKER: u64 = 4_000_000;
 const WORKER_RESPONSE_LIMIT: usize = 1024;
 const TERMINAL_SLOT_CLEANUP_LIMIT: usize = 1024;
 const SCHEDULING_STATE_POOL_LIMIT: usize = 5;
-const POOLED_ENTRY_HEADERS_CAPACITY: usize = 0;
-const POOLED_TRANSACTIONS_CAPACITY: usize = 0;
-const POOLED_PENDING_TRANSACTION_CHECKS_CAPACITY: usize = 0;
-const POOLED_UNSCHEDULABLE_LOCKS_CAPACITY: usize = 0;
+const POOLED_ENTRY_HEADERS_CAPACITY: usize = 1024;
+const POOLED_SLOT_WORK_CAPACITY: usize = 50_000;
 const CHECK_TRANSACTION_BATCH_ALLOCATION_SIZE: u32 =
     TransactionPtrBatch::<PendingWorkerCheck>::TRANSACTION_META_END as u32;
 const EXECUTION_TRANSACTION_BATCH_ALLOCATION_SIZE: u32 =
@@ -179,15 +177,13 @@ impl SchedulingState {
         self.slot = 0;
         self.last_entry_hash = Hash::default();
         self.entry_headers = Vec::with_capacity(POOLED_ENTRY_HEADERS_CAPACITY);
-        self.transactions = Slab::with_capacity(POOLED_TRANSACTIONS_CAPACITY);
+        self.transactions = Slab::with_capacity(POOLED_SLOT_WORK_CAPACITY);
         self.account_locks = ThreadAwareAccountLocks::new(1);
-        self.pending_transaction_checks =
-            VecDeque::with_capacity(POOLED_PENDING_TRANSACTION_CHECKS_CAPACITY);
+        self.pending_transaction_checks = VecDeque::with_capacity(POOLED_SLOT_WORK_CAPACITY);
         self.next_ready_transaction_index = 0;
-        self.ready_transactions = VecDeque::new();
-        self.unschedulable_read_locks = HashSet::with_capacity(POOLED_UNSCHEDULABLE_LOCKS_CAPACITY);
-        self.unschedulable_write_locks =
-            HashSet::with_capacity(POOLED_UNSCHEDULABLE_LOCKS_CAPACITY);
+        self.ready_transactions = VecDeque::with_capacity(POOLED_SLOT_WORK_CAPACITY);
+        self.unschedulable_read_locks = HashSet::with_capacity(POOLED_SLOT_WORK_CAPACITY);
+        self.unschedulable_write_locks = HashSet::with_capacity(POOLED_SLOT_WORK_CAPACITY);
         self.ingress_complete = false;
         self.entry_verification = EntryVerificationProgress::default();
         self.in_flight_worker_messages = 0;
@@ -4923,13 +4919,19 @@ mod tests {
         );
         assert_eq!(
             scheduler.scheduling_state_pool[0].transactions.capacity(),
-            POOLED_TRANSACTIONS_CAPACITY,
+            POOLED_SLOT_WORK_CAPACITY,
         );
         assert_eq!(
             scheduler.scheduling_state_pool[0]
                 .pending_transaction_checks
                 .capacity(),
-            POOLED_PENDING_TRANSACTION_CHECKS_CAPACITY,
+            POOLED_SLOT_WORK_CAPACITY,
+        );
+        assert_eq!(
+            scheduler.scheduling_state_pool[0]
+                .ready_transactions
+                .capacity(),
+            POOLED_SLOT_WORK_CAPACITY,
         );
 
         write_replay_messages(&mut replay_stage, [begin(43)]);
@@ -4968,17 +4970,20 @@ mod tests {
     #[test]
     fn cleanup_shrinks_pooled_scheduling_state_allocations() {
         let (mut scheduler, mut replay_stage) = setup_scheduler_and_replay_stage();
+        let oversized_capacity = POOLED_SLOT_WORK_CAPACITY * 2;
 
         write_replay_messages(&mut replay_stage, [begin(42)]);
         assert_eq!(scheduler.service_ingress_queue(1), 1);
         {
             let state = scheduler.scheduling_states.get_mut(&42).unwrap();
-            state.entry_headers.reserve(128);
-            state.transactions.reserve(128);
-            state.pending_transaction_checks.reserve(128);
-            assert!(state.entry_headers.capacity() >= 128);
-            assert!(state.transactions.capacity() >= 128);
-            assert!(state.pending_transaction_checks.capacity() >= 128);
+            state.entry_headers.reserve(oversized_capacity);
+            state.transactions.reserve(oversized_capacity);
+            state.pending_transaction_checks.reserve(oversized_capacity);
+            state.ready_transactions.reserve(oversized_capacity);
+            assert!(state.entry_headers.capacity() >= oversized_capacity);
+            assert!(state.transactions.capacity() >= oversized_capacity);
+            assert!(state.pending_transaction_checks.capacity() >= oversized_capacity);
+            assert!(state.ready_transactions.capacity() >= oversized_capacity);
         }
 
         write_replay_messages(&mut replay_stage, [abort(42)]);
@@ -4992,11 +4997,15 @@ mod tests {
         );
         assert_eq!(
             pooled_state.transactions.capacity(),
-            POOLED_TRANSACTIONS_CAPACITY,
+            POOLED_SLOT_WORK_CAPACITY,
         );
         assert_eq!(
             pooled_state.pending_transaction_checks.capacity(),
-            POOLED_PENDING_TRANSACTION_CHECKS_CAPACITY,
+            POOLED_SLOT_WORK_CAPACITY,
+        );
+        assert_eq!(
+            pooled_state.ready_transactions.capacity(),
+            POOLED_SLOT_WORK_CAPACITY,
         );
     }
 }
