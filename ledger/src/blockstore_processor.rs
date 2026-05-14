@@ -891,9 +891,9 @@ pub fn block_verification_status_result(
     }
 }
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct ProcessOptions {
-    /// Run PoH, transaction signature and other transaction verification on the entries.
+    /// Deprecated and ignored; ledger verification is always run.
     pub run_verification: bool,
     pub halt_at_slot: Option<Slot>,
     pub slot_callback: Option<ProcessSlotCallback>,
@@ -914,6 +914,31 @@ pub struct ProcessOptions {
     pub hash_overrides: Option<HashOverrides>,
     pub abort_on_invalid_block: bool,
     pub no_block_cost_limits: bool,
+}
+
+impl Default for ProcessOptions {
+    fn default() -> Self {
+        Self {
+            run_verification: true,
+            halt_at_slot: None,
+            slot_callback: None,
+            new_hard_forks: None,
+            debug_keys: None,
+            limit_load_slot_count_from_snapshot: None,
+            allow_dead_slots: false,
+            accounts_db_skip_shrink: false,
+            accounts_db_force_initial_clean: false,
+            accounts_db_config: AccountsDbConfig::default(),
+            verify_index: false,
+            runtime_config: RuntimeConfig::default(),
+            run_final_accounts_hash_calc: false,
+            use_snapshot_archives_at_startup: UseSnapshotArchivesAtStartup::default(),
+            #[cfg(feature = "dev-context-only-utils")]
+            hash_overrides: None,
+            abort_on_invalid_block: false,
+            no_block_cost_limits: false,
+        }
+    }
 }
 
 pub(crate) fn process_blockstore_for_bank_0(
@@ -1189,7 +1214,7 @@ fn confirm_full_slot(
     migration_status: &MigrationStatus,
 ) -> result::Result<(), BlockstoreProcessorError> {
     let mut confirmation_timing = ConfirmationTiming::default();
-    let skip_verification = !opts.run_verification;
+    let skip_verification = false;
     let slot = bank.slot();
     let bank_id = bank.bank_id();
     defer! {
