@@ -6,7 +6,7 @@ use {
         admin_rpc_post_init::{KeyUpdaterType, KeyUpdaters},
         banking_trace::BankingTracer,
         block_creation_loop::ReplayHighestFrozen,
-        block_verification_stage::BlockVerificationStage,
+        block_verification_stage::{BlockVerificationStage, ReplayBlockVerification},
         bls_sigverify::bls_sigverifier::{self, SigVerifierChannels, SigVerifierContext},
         cluster_info_vote_listener::{
             DuplicateConfirmedSlotsReceiver, GossipVerifiedVoteHashReceiver,
@@ -556,7 +556,10 @@ impl Tvu {
             snapshot_controller,
             replay_highest_frozen,
             migration_status,
-            block_verification_session,
+            block_verification: ReplayBlockVerification::new(
+                block_verification_session,
+                exit.clone(),
+            ),
         };
 
         let voting_service = VotingService::new(

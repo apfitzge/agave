@@ -73,6 +73,7 @@ dependencies = [
  "rts-alloc",
  "shaq",
  "slab",
+ "solana-clock",
  "solana-entry",
  "solana-hash 4.3.0",
  "solana-message",
@@ -8830,6 +8831,7 @@ dependencies = [
 name = "solana-ledger"
 version = "4.1.0-alpha.0"
 dependencies = [
+ "agave-block-verification-stage",
  "agave-feature-set",
  "agave-logger",
  "agave-reserved-account-keys",

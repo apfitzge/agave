@@ -1132,16 +1132,13 @@ fn main() {
                     Arg::with_name("skip_poh_verify")
                         .long("skip-poh-verify")
                         .takes_value(false)
-                        .help(
-                            "Deprecated, please use --skip-verification. Skip ledger PoH and \
-                             transaction verification.",
-                        ),
+                        .help("Deprecated and ignored. Ledger verification cannot be skipped."),
                 )
                 .arg(
                     Arg::with_name("skip_verification")
                         .long("skip-verification")
                         .takes_value(false)
-                        .help("Skip ledger PoH and transaction verification."),
+                        .help("Ignored. Ledger verification cannot be skipped."),
                 )
                 .arg(
                     Arg::with_name("enable_rpc_transaction_history")

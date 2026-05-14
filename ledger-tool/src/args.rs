@@ -228,10 +228,13 @@ pub fn parse_process_options(ledger_path: &Path, arg_matches: &ArgMatches<'_>) -
     };
 
     if arg_matches.is_present("skip_poh_verify") {
-        eprintln!("--skip-poh-verify is deprecated.  Replace with --skip-verification.");
+        eprintln!(
+            "--skip-poh-verify is deprecated and ignored. Ledger verification cannot be skipped."
+        );
     }
-    let run_verification =
-        !(arg_matches.is_present("skip_poh_verify") || arg_matches.is_present("skip_verification"));
+    if arg_matches.is_present("skip_verification") {
+        eprintln!("--skip-verification is ignored. Ledger verification cannot be skipped.");
+    }
     let halt_at_slot = value_t!(arg_matches, "halt_at_slot", Slot).ok();
     let use_snapshot_archives_at_startup = value_t_or_exit!(
         arg_matches,
@@ -258,7 +261,7 @@ pub fn parse_process_options(ledger_path: &Path, arg_matches: &ArgMatches<'_>) -
         limit_load_slot_count_from_snapshot,
         run_final_accounts_hash_calc,
         debug_keys,
-        run_verification,
+        run_verification: true,
         allow_dead_slots,
         halt_at_slot,
         use_snapshot_archives_at_startup,

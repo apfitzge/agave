@@ -9,6 +9,7 @@ use {
         },
         banking_trace::{self, BankingTracer, TraceError},
         block_creation_loop::{BlockCreationLoop, BlockCreationLoopConfig, ReplayHighestFrozen},
+        block_verification_stage::BlockVerificationRuntime,
         cluster_info_vote_listener::VoteTracker,
         completed_data_sets_service::CompletedDataSetsService,
         consensus::{
@@ -328,8 +329,7 @@ pub struct ValidatorConfig {
     pub repair_whitelist: Arc<RwLock<HashSet<Pubkey>>>, // Empty = repair with all
     pub gossip_validators: Option<HashSet<Pubkey>>, // None = gossip with all
     pub max_genesis_archive_unpacked_size: u64,
-    /// Run PoH, transaction signature and other transaction verification during blockstore
-    /// processing.
+    /// Deprecated and ignored; startup ledger verification is always run.
     pub run_verification: bool,
     pub require_tower: bool,
     pub tower_storage: Arc<dyn TowerStorage>,
@@ -1083,6 +1083,19 @@ impl Validator {
         let entry_notification_sender = entry_notifier_service
             .as_ref()
             .map(|service| service.sender());
+        let block_verification_exit = Arc::new(AtomicBool::new(false));
+        let block_verification_runtime = BlockVerificationRuntime::new(
+            block_verification_exit,
+            config.replay_transactions_threads,
+            config.replay_transactions_threads,
+            transaction_status_sender.clone(),
+            replay_vote_sender.clone(),
+            prioritization_fee_cache.clone(),
+            config.runtime_config.log_messages_bytes_limit,
+            poh_recorder.read().unwrap().shared_leader_state(),
+            bank_forks.clone(),
+        )
+        .map_err(ValidatorError::Other)?;
         let mut process_blockstore = ProcessBlockStore::new(
             &id,
             vote_account,
@@ -1096,6 +1109,7 @@ impl Validator {
             entry_notification_sender,
             blockstore_root_scan,
             &snapshot_controller,
+            block_verification_runtime,
             config,
         );
 
@@ -2133,7 +2147,7 @@ fn load_blockstore(
     *start_progress.write().unwrap() = ValidatorStartProgress::LoadingLedger;
 
     let mut process_options = blockstore_processor::ProcessOptions {
-        run_verification: config.run_verification,
+        run_verification: true,
         halt_at_slot: None,
         new_hard_forks: config.new_hard_forks.clone(),
         debug_keys: config.debug_keys.clone(),
@@ -2255,6 +2269,7 @@ pub struct ProcessBlockStore<'a> {
     entry_notification_sender: Option<&'a EntryNotifierSender>,
     blockstore_root_scan: Option<BlockstoreRootScan>,
     snapshot_controller: &'a SnapshotController,
+    block_verification_runtime: BlockVerificationRuntime,
     config: &'a ValidatorConfig,
     tower: Option<Tower>,
 }
@@ -2274,6 +2289,7 @@ impl<'a> ProcessBlockStore<'a> {
         entry_notification_sender: Option<&'a EntryNotifierSender>,
         blockstore_root_scan: BlockstoreRootScan,
         snapshot_controller: &'a SnapshotController,
+        block_verification_runtime: BlockVerificationRuntime,
         config: &'a ValidatorConfig,
     ) -> Self {
         Self {
@@ -2289,6 +2305,7 @@ impl<'a> ProcessBlockStore<'a> {
             entry_notification_sender,
             blockstore_root_scan: Some(blockstore_root_scan),
             snapshot_controller,
+            block_verification_runtime,
             config,
             tower: None,
         }
@@ -2317,16 +2334,19 @@ impl<'a> ProcessBlockStore<'a> {
                     })
                     .unwrap();
             }
-            blockstore_processor::process_blockstore_from_root(
-                self.blockstore,
-                self.bank_forks,
-                self.leader_schedule_cache,
-                self.process_options,
-                self.transaction_status_sender,
-                self.entry_notification_sender,
-                Some(self.snapshot_controller),
-            )
-            .map_err(|err| {
+            let process_result =
+                blockstore_processor::process_blockstore_from_root_with_block_verification(
+                    self.blockstore,
+                    self.bank_forks,
+                    self.leader_schedule_cache,
+                    self.process_options,
+                    self.transaction_status_sender,
+                    self.entry_notification_sender,
+                    Some(self.snapshot_controller),
+                    self.block_verification_runtime.block_verification(),
+                );
+
+            process_result.map_err(|err| {
                 exit.store(true, Ordering::Relaxed);
                 format!("Failed to load ledger: {err:?}")
             })?;

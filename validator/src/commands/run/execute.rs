@@ -816,7 +816,7 @@ pub fn execute(
         gossip_validators,
         max_ledger_shreds,
         blockstore_options: run_args.blockstore_options,
-        run_verification: !matches.is_present("skip_startup_ledger_verification"),
+        run_verification: true,
         debug_keys,
         warp_slot: None,
         generator_config: None,

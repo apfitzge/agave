@@ -530,7 +530,7 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
         Arg::with_name("skip_startup_ledger_verification")
             .long("skip-startup-ledger-verification")
             .takes_value(false)
-            .help("Skip ledger verification at validator bootup."),
+            .help("Ignored. Startup ledger verification cannot be skipped."),
     )
     .arg(
         clap::Arg::with_name("require_tower")

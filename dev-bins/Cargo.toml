@@ -127,6 +127,7 @@ solana-native-token = "3.0.0"
 solana-net-utils = { path = "../net-utils", version = "=4.1.0-alpha.0", features = ["agave-unstable-api"] }
 solana-nonce = "3.2.0"
 solana-precompile-error = "3.0.0"
+solana-poh = { path = "../poh", version = "=4.1.0-alpha.0", features = ["agave-unstable-api"] }
 solana-program-runtime = { path = "../program-runtime", version = "=4.1.0-alpha.0", features = ["agave-unstable-api"] }
 solana-pubkey = { version = "4.2.0", default-features = false }
 solana-quic-client = { path = "../quic-client", version = "=4.1.0-alpha.0", features = ["agave-unstable-api"] }

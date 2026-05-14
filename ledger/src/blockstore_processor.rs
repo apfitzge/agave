@@ -9,6 +9,9 @@ use {
         use_snapshot_archives_at_startup::UseSnapshotArchivesAtStartup,
     },
     ExecuteTimingType::{NumExecuteBatches, TotalBatchesLen},
+    agave_block_verification_stage::session::{
+        BlockVerificationSlotStatus, ReplayBlockVerification,
+    },
     agave_votor_messages::migration::MigrationStatus,
     chrono_humanize::{Accuracy, HumanTime, Tense},
     crossbeam_channel::{Receiver, Sender},
@@ -868,6 +871,26 @@ pub enum BlockstoreProcessorError {
 /// processing the blockstore
 pub type ProcessSlotCallback = Arc<dyn Fn(&Bank) + Sync + Send>;
 
+pub fn block_verification_status_result(
+    status: BlockVerificationSlotStatus,
+) -> result::Result<(), BlockstoreProcessorError> {
+    match status {
+        BlockVerificationSlotStatus::Success => Ok(()),
+        BlockVerificationSlotStatus::Failed(_) if status.is_invalid_entry_hash_failure() => Err(
+            BlockstoreProcessorError::InvalidBlock(BlockError::InvalidEntryHash),
+        ),
+        BlockVerificationSlotStatus::Failed(_) if status.is_invalid_transaction_failure() => Err(
+            BlockstoreProcessorError::InvalidTransaction(TransactionError::SanitizeFailure),
+        ),
+        BlockVerificationSlotStatus::Failed(_)
+        | BlockVerificationSlotStatus::Aborted
+        | BlockVerificationSlotStatus::InProgress
+        | BlockVerificationSlotStatus::Unknown => Err(BlockstoreProcessorError::InvalidBlock(
+            BlockError::Incomplete,
+        )),
+    }
+}
+
 #[derive(Default, Clone)]
 pub struct ProcessOptions {
     /// Run PoH, transaction signature and other transaction verification on the entries.
@@ -949,6 +972,52 @@ pub fn process_blockstore_from_root(
     entry_notification_sender: Option<&EntryNotifierSender>,
     snapshot_controller: Option<&SnapshotController>,
 ) -> result::Result<(), BlockstoreProcessorError> {
+    do_process_blockstore_from_root(
+        blockstore,
+        bank_forks,
+        leader_schedule_cache,
+        opts,
+        transaction_status_sender,
+        entry_notification_sender,
+        snapshot_controller,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn process_blockstore_from_root_with_block_verification(
+    blockstore: &Blockstore,
+    bank_forks: &RwLock<BankForks>,
+    leader_schedule_cache: &LeaderScheduleCache,
+    opts: &ProcessOptions,
+    transaction_status_sender: Option<&TransactionStatusSender>,
+    entry_notification_sender: Option<&EntryNotifierSender>,
+    snapshot_controller: Option<&SnapshotController>,
+    block_verification: &mut ReplayBlockVerification,
+) -> result::Result<(), BlockstoreProcessorError> {
+    do_process_blockstore_from_root(
+        blockstore,
+        bank_forks,
+        leader_schedule_cache,
+        opts,
+        transaction_status_sender,
+        entry_notification_sender,
+        snapshot_controller,
+        Some(block_verification),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn do_process_blockstore_from_root(
+    blockstore: &Blockstore,
+    bank_forks: &RwLock<BankForks>,
+    leader_schedule_cache: &LeaderScheduleCache,
+    opts: &ProcessOptions,
+    transaction_status_sender: Option<&TransactionStatusSender>,
+    entry_notification_sender: Option<&EntryNotifierSender>,
+    snapshot_controller: Option<&SnapshotController>,
+    block_verification: Option<&mut ReplayBlockVerification>,
+) -> result::Result<(), BlockstoreProcessorError> {
     let (start_slot, start_slot_hash) = {
         // Starting slot must be a root, and thus has no parents
         assert_eq!(bank_forks.read().unwrap().banks().len(), 1);
@@ -1009,6 +1078,7 @@ pub fn process_blockstore_from_root(
             entry_notification_sender,
             &mut timing,
             snapshot_controller,
+            block_verification,
         )?
     } else {
         // If there's no meta in the blockstore for the input `start_slot`,
@@ -1114,6 +1184,7 @@ fn confirm_full_slot(
     transaction_status_sender: Option<&TransactionStatusSender>,
     entry_notification_sender: Option<&EntryNotifierSender>,
     replay_vote_sender: Option<&ReplayVoteSender>,
+    block_verification: Option<&mut ReplayBlockVerification>,
     timing: &mut ExecuteTimings,
     migration_status: &MigrationStatus,
 ) -> result::Result<(), BlockstoreProcessorError> {
@@ -1140,6 +1211,7 @@ fn confirm_full_slot(
         transaction_status_sender,
         entry_notification_sender,
         replay_vote_sender,
+        block_verification,
         opts.allow_dead_slots,
         opts.runtime_config.log_messages_bytes_limit,
         None,
@@ -1661,6 +1733,7 @@ pub fn confirm_slot(
     transaction_status_sender: Option<&TransactionStatusSender>,
     entry_notification_sender: Option<&EntryNotifierSender>,
     replay_vote_sender: Option<&ReplayVoteSender>,
+    block_verification: Option<&mut ReplayBlockVerification>,
     allow_dead_slots: bool,
     log_messages_bytes_limit: Option<usize>,
     prioritization_fee_cache: Option<&PrioritizationFeeCache>,
@@ -1695,6 +1768,7 @@ pub fn confirm_slot(
             transaction_status_sender,
             entry_notification_sender,
             replay_vote_sender,
+            block_verification,
             allow_dead_slots,
             log_messages_bytes_limit,
             prioritization_fee_cache,
@@ -1714,6 +1788,7 @@ fn confirm_slot_with_entries(
     transaction_status_sender: Option<&TransactionStatusSender>,
     entry_notification_sender: Option<&EntryNotifierSender>,
     replay_vote_sender: Option<&ReplayVoteSender>,
+    block_verification: Option<&mut ReplayBlockVerification>,
     allow_dead_slots: bool,
     log_messages_bytes_limit: Option<usize>,
     prioritization_fee_cache: Option<&PrioritizationFeeCache>,
@@ -1745,6 +1820,7 @@ fn confirm_slot_with_entries(
         transaction_status_sender,
         entry_notification_sender,
         replay_vote_sender,
+        block_verification,
         log_messages_bytes_limit,
         prioritization_fee_cache,
         migration_status,
@@ -1811,6 +1887,7 @@ fn confirm_slot_with_components(
                     transaction_status_sender,
                     entry_notification_sender,
                     replay_vote_sender,
+                    None,
                     log_messages_bytes_limit,
                     prioritization_fee_cache,
                     migration_status,
@@ -1852,6 +1929,7 @@ fn confirm_slot_entries(
     transaction_status_sender: Option<&TransactionStatusSender>,
     entry_notification_sender: Option<&EntryNotifierSender>,
     replay_vote_sender: Option<&ReplayVoteSender>,
+    block_verification: Option<&mut ReplayBlockVerification>,
     log_messages_bytes_limit: Option<usize>,
     prioritization_fee_cache: Option<&PrioritizationFeeCache>,
     migration_status: &MigrationStatus,
@@ -1929,6 +2007,33 @@ fn confirm_slot_entries(
     }
 
     let last_entry_hash = entries.last().map(|e| e.hash);
+    if !skip_verification {
+        if let Some(block_verification) = block_verification {
+            let mut replay_timer = Measure::start("replay_elapsed");
+            let status = block_verification
+                .submit_entries_and_wait(bank.slot(), progress.last_entry, &entries)
+                .unwrap_or(BlockVerificationSlotStatus::Unknown);
+            block_verification_status_result(status)?;
+            replay_timer.stop();
+            *replay_elapsed += replay_timer.as_us();
+
+            if let Some(last_entry_hash) = last_entry_hash {
+                bank.register_ticks_for_replay(&last_entry_hash, tick_count);
+            }
+
+            progress.num_shreds += num_shreds;
+            progress.num_entries += num_entries;
+            progress.num_txs += num_txs;
+            progress.num_ticks += tick_count;
+            if let Some(last_entry_hash) = last_entry_hash {
+                progress.last_entry = last_entry_hash;
+                progress.last_entry_was_tick = last_entry_was_tick;
+            }
+
+            return Ok(());
+        }
+    }
+
     if !skip_verification {
         let start_hash = progress.last_entry;
         let verify_entries = entry::entries_to_verification_data(&entries);
@@ -2123,6 +2228,7 @@ fn process_bank_0(
         None,
         entry_notification_sender,
         None,
+        None,
         &mut ExecuteTimings::default(),
         migration_status,
     )
@@ -2302,6 +2408,7 @@ fn load_frozen_forks(
     entry_notification_sender: Option<&EntryNotifierSender>,
     timing: &mut ExecuteTimings,
     snapshot_controller: Option<&SnapshotController>,
+    mut block_verification: Option<&mut ReplayBlockVerification>,
 ) -> result::Result<(u64, usize), BlockstoreProcessorError> {
     let migration_status = bank_forks.read().unwrap().migration_status();
     let blockstore_max_root = blockstore.max_root();
@@ -2387,6 +2494,10 @@ fn load_frozen_forks(
                 transaction_status_sender,
                 entry_notification_sender,
                 None,
+                match &mut block_verification {
+                    Some(block_verification) => Some(&mut **block_verification),
+                    None => None,
+                },
                 timing,
                 &migration_status,
             ) {
@@ -2665,6 +2776,7 @@ pub fn process_single_slot(
     transaction_status_sender: Option<&TransactionStatusSender>,
     entry_notification_sender: Option<&EntryNotifierSender>,
     replay_vote_sender: Option<&ReplayVoteSender>,
+    block_verification: Option<&mut ReplayBlockVerification>,
     timing: &mut ExecuteTimings,
     migration_status: &MigrationStatus,
 ) -> result::Result<(), BlockstoreProcessorError> {
@@ -2705,6 +2817,7 @@ pub fn process_single_slot(
         transaction_status_sender,
         entry_notification_sender,
         replay_vote_sender,
+        block_verification,
         timing,
         migration_status,
     )
@@ -4808,6 +4921,7 @@ pub mod tests {
             None,
             None,
             None,
+            None,
             &mut ExecuteTimings::default(),
             &MigrationStatus::default(),
         )
@@ -5413,6 +5527,7 @@ pub mod tests {
             None,
             None,
             None,
+            None,
             &MigrationStatus::default(),
         )?;
         progress.wait_for_all_verification_results(&mut 0, &mut 0)
@@ -5508,6 +5623,7 @@ pub mod tests {
             None,
             None,
             None,
+            None,
             &MigrationStatus::default(),
         )
         .unwrap();
@@ -5552,6 +5668,7 @@ pub mod tests {
             &mut progress,
             false,
             Some(&transaction_status_sender),
+            None,
             None,
             None,
             None,
@@ -6101,6 +6218,7 @@ pub mod tests {
                 None,
                 None,
                 None,
+                None,
                 false,
                 None,
                 None,
@@ -6134,6 +6252,7 @@ pub mod tests {
                 &mut ConfirmationTiming::default(),
                 &mut ConfirmationProgress::new(bank0.last_blockhash()),
                 true,
+                None,
                 None,
                 None,
                 None,

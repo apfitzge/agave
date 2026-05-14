@@ -2217,7 +2217,7 @@ fn create_snapshot_to_hard_fork(
     let process_options = ProcessOptions {
         halt_at_slot: Some(snapshot_slot),
         new_hard_forks: Some(hard_forks),
-        run_verification: false,
+        run_verification: true,
         ..ProcessOptions::default()
     };
     let ledger_path = blockstore.ledger_path();

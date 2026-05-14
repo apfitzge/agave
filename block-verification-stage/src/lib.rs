@@ -6,4 +6,5 @@
 mod entry_hash_verifier;
 
 pub mod scheduler;
+pub mod session;
 pub mod setup;

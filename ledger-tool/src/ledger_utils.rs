@@ -17,8 +17,8 @@ use {
     },
     solana_clock::Slot,
     solana_core::{
-        resource_limits,
-        validator::{BlockProductionMethod, BlockVerificationMethod},
+        block_verification_stage::BlockVerificationRuntime, resource_limits,
+        validator::BlockProductionMethod,
     },
     solana_genesis_config::GenesisConfig,
     solana_genesis_utils::open_genesis_config,
@@ -36,6 +36,7 @@ use {
         use_snapshot_archives_at_startup::UseSnapshotArchivesAtStartup,
     },
     solana_measure::measure_time,
+    solana_poh::{poh_recorder::create_test_recorder, poh_service::PohService},
     solana_pubkey::Pubkey,
     solana_rpc::transaction_status_service::TransactionStatusService,
     solana_runtime::{
@@ -46,9 +47,11 @@ use {
         bank_forks::BankForks,
         snapshot_controller::SnapshotController,
         snapshot_utils::{self, clean_orphaned_account_snapshot_dirs},
+        vote_sender_types::ReplayVoteMessage,
     },
     solana_transaction::versioned::VersionedTransaction,
     std::{
+        num::NonZeroUsize,
         path::{Path, PathBuf},
         process::exit,
         sync::{
@@ -110,8 +113,61 @@ pub(crate) enum LoadAndProcessLedgerError {
     #[error("failed to process blockstore from root: {0}")]
     ProcessBlockstoreFromRoot(#[source] BlockstoreProcessorError),
 
+    #[error("failed to set up block verification stage: {0}")]
+    BlockVerificationStageSetup(String),
+
     #[error("failed to validate account paths: {0}")]
     ValidateAccountPaths(#[source] std::io::Error),
+}
+
+struct LedgerBlockVerification {
+    runtime: BlockVerificationRuntime,
+    poh_service: Option<PohService>,
+    _replay_vote_receiver: crossbeam_channel::Receiver<ReplayVoteMessage>,
+}
+
+impl LedgerBlockVerification {
+    fn new(
+        bank_forks: Arc<RwLock<BankForks>>,
+        blockstore: Arc<Blockstore>,
+        transaction_status_sender: Option<TransactionStatusSender>,
+        log_messages_bytes_limit: Option<usize>,
+    ) -> Result<Self, LoadAndProcessLedgerError> {
+        let root_bank = bank_forks.read().unwrap().root_bank();
+        let (exit, poh_recorder, _poh_controller, _transaction_recorder, poh_service, _) =
+            create_test_recorder(root_bank, blockstore, None, None);
+        let worker_count = NonZeroUsize::new(num_cpus::get().max(1)).unwrap();
+        let (replay_vote_sender, replay_vote_receiver) = unbounded();
+        let runtime = BlockVerificationRuntime::new(
+            exit.clone(),
+            worker_count,
+            worker_count,
+            transaction_status_sender,
+            replay_vote_sender,
+            None,
+            log_messages_bytes_limit,
+            poh_recorder.read().unwrap().shared_leader_state(),
+            bank_forks,
+        )
+        .map_err(LoadAndProcessLedgerError::BlockVerificationStageSetup)?;
+
+        Ok(Self {
+            runtime,
+            poh_service: Some(poh_service),
+            _replay_vote_receiver: replay_vote_receiver,
+        })
+    }
+}
+
+impl Drop for LedgerBlockVerification {
+    fn drop(&mut self) {
+        self.runtime.shutdown();
+        if let Some(poh_service) = self.poh_service.take() {
+            if let Err(err) = poh_service.join() {
+                warn!("poh service join failed: {err:?}");
+            }
+        }
+    }
 }
 
 pub fn load_and_process_ledger_or_exit(
@@ -138,9 +194,14 @@ pub fn load_and_process_ledger(
     arg_matches: &ArgMatches,
     genesis_config: &GenesisConfig,
     blockstore: Arc<Blockstore>,
-    process_options: ProcessOptions,
+    mut process_options: ProcessOptions,
     transaction_status_sender: Option<TransactionStatusSender>,
 ) -> Result<LoadAndProcessLedgerOutput, LoadAndProcessLedgerError> {
+    if !process_options.run_verification {
+        warn!("skip verification is no longer supported; running ledger verification");
+        process_options.run_verification = true;
+    }
+
     let mut starting_slot = 0; // default start check with genesis
     let snapshot_config = {
         let snapshots_dir = arg_matches
@@ -383,11 +444,6 @@ pub fn load_and_process_ledger(
     let leader_schedule_cache =
         LeaderScheduleCache::new_from_bank(&bank_forks.read().unwrap().root_bank());
 
-    let block_verification_method = value_t_or_exit!(
-        arg_matches,
-        "block_verification_method",
-        BlockVerificationMethod
-    );
     let block_production_method = value_t!(
         arg_matches,
         "block_production_method",
@@ -395,10 +451,7 @@ pub fn load_and_process_ledger(
     )
     .unwrap_or_default();
     block_production_method.warn_if_deprecated_value();
-    info!(
-        "Using: block-verification-method: {block_verification_method}, block-production-method: \
-         {block_production_method}",
-    );
+    info!("Using: block-production-method: {block_production_method}",);
 
     let (snapshot_request_sender, snapshot_request_receiver) = crossbeam_channel::unbounded();
 
@@ -434,21 +487,34 @@ pub fn load_and_process_ledger(
     let accounts_background_service =
         AccountsBackgroundService::new(bank_forks.clone(), exit.clone(), abs_request_handler);
 
-    let result = blockstore_processor::process_blockstore_from_root(
-        blockstore.as_ref(),
-        &bank_forks,
-        &leader_schedule_cache,
-        &process_options,
-        transaction_status_sender.as_ref(),
-        None, // entry_notification_sender
-        Some(&snapshot_controller),
-    )
-    .map(|_| LoadAndProcessLedgerOutput {
-        bank_forks,
-        starting_snapshot_hashes,
-        accounts_background_service,
-    })
-    .map_err(LoadAndProcessLedgerError::ProcessBlockstoreFromRoot);
+    let result = (|| {
+        let mut block_verification = LedgerBlockVerification::new(
+            bank_forks.clone(),
+            blockstore.clone(),
+            transaction_status_sender.clone(),
+            process_options.runtime_config.log_messages_bytes_limit,
+        )?;
+
+        let process_result =
+            blockstore_processor::process_blockstore_from_root_with_block_verification(
+                blockstore.as_ref(),
+                &bank_forks,
+                &leader_schedule_cache,
+                &process_options,
+                transaction_status_sender.as_ref(),
+                None, // entry_notification_sender
+                Some(&snapshot_controller),
+                block_verification.runtime.block_verification(),
+            );
+
+        process_result
+            .map(|_| LoadAndProcessLedgerOutput {
+                bank_forks,
+                starting_snapshot_hashes,
+                accounts_background_service,
+            })
+            .map_err(LoadAndProcessLedgerError::ProcessBlockstoreFromRoot)
+    })();
 
     exit.store(true, Ordering::Relaxed);
     if let Some(service) = transaction_status_service {
@@ -600,7 +666,8 @@ mod tests {
         agave_snapshots::{paths::BANK_SNAPSHOTS_DIR, snapshot_config::SnapshotConfig},
         clap::{App, Arg},
         solana_ledger::{
-            blockstore::Blockstore, blockstore_processor::ProcessOptions,
+            blockstore::Blockstore,
+            blockstore_processor::{ProcessOptions, fill_blockstore_slot_with_ticks},
             genesis_utils::create_genesis_config,
         },
         solana_runtime::{bank::Bank, snapshot_bank_utils},
@@ -637,12 +704,6 @@ mod tests {
         // Setup the arguments such that a new snapshot will be generated from the loaded snapshot
         let arg_matches = App::new("test")
             .arg(
-                Arg::with_name("block_verification_method")
-                    .long("block-verification-method")
-                    .takes_value(true)
-                    .default_value("unified-scheduler"),
-            )
-            .arg(
                 Arg::with_name("snapshot_slot")
                     .long("snapshot-slot")
                     .takes_value(true),
@@ -668,5 +729,48 @@ mod tests {
                 .latest_full_snapshot_slot()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn test_load_and_process_ledger_verifies_with_block_verification_stage() {
+        let mut genesis_config = create_genesis_config(10_000).genesis_config;
+        genesis_config.ticks_per_slot = 1;
+        let (ledger_path, blockhash) =
+            solana_ledger::create_new_tmp_ledger_auto_delete!(&genesis_config);
+        let blockstore = Arc::new(Blockstore::open(ledger_path.path()).unwrap());
+        fill_blockstore_slot_with_ticks(
+            &blockstore,
+            genesis_config.ticks_per_slot,
+            1,
+            0,
+            blockhash,
+        );
+
+        let arg_matches = App::new("test")
+            .arg(
+                Arg::with_name("snapshot_slot")
+                    .long("snapshot-slot")
+                    .takes_value(true),
+            )
+            .get_matches_from(vec!["test"]);
+        let process_options = ProcessOptions {
+            run_verification: true,
+            halt_at_slot: Some(1),
+            ..ProcessOptions::default()
+        };
+
+        let LoadAndProcessLedgerOutput { bank_forks, .. } = load_and_process_ledger(
+            &arg_matches,
+            &genesis_config,
+            blockstore,
+            process_options,
+            None,
+        )
+        .unwrap();
+
+        let bank_forks = bank_forks.read().unwrap();
+        let bank = bank_forks.get(1).unwrap();
+        assert!(bank.is_frozen());
+        assert_eq!(bank.tick_height(), genesis_config.ticks_per_slot * 2);
     }
 }
