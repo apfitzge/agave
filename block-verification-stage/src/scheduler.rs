@@ -958,10 +958,15 @@ impl BlockVerificationScheduler {
                 && worker_response_count == 0
                 && transaction_execution_dispatch_count == 0
                 && terminal_cleanup_count == 0
+                && !self.has_in_flight_slots()
             {
                 thread::sleep(IDLE_SLEEP);
             }
         }
+    }
+
+    fn has_in_flight_slots(&self) -> bool {
+        !self.scheduling_states.is_empty()
     }
 
     pub fn service_ingress_queue(&mut self, max_messages: usize) -> usize {
@@ -2560,6 +2565,19 @@ mod tests {
 
         exit.store(true, Ordering::Relaxed);
         scheduler.run();
+    }
+
+    #[test]
+    fn scheduler_has_in_flight_slots_until_terminal_cleanup() {
+        let (mut scheduler, mut replay_stage) = setup_scheduler_and_replay_stage();
+        assert!(!scheduler.has_in_flight_slots());
+
+        write_replay_messages(&mut replay_stage, [begin(42), complete(42)]);
+        assert_eq!(scheduler.service_ingress_queue(2), 2);
+        assert!(scheduler.has_in_flight_slots());
+
+        assert_eq!(scheduler.service_terminal_slots(1), 1);
+        assert!(!scheduler.has_in_flight_slots());
     }
 
     #[test]
