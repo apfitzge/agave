@@ -124,6 +124,7 @@ struct SchedulingState {
     pending_transaction_checks: VecDeque<PendingTransactionCheck>,
     next_ready_transaction_index: usize,
     ready_transactions: VecDeque<usize>,
+    ready_scan_cursor: usize,
     unschedulable_read_locks: PubkeyHashSet,
     unschedulable_write_locks: PubkeyHashSet,
     ingress_complete: bool,
@@ -145,6 +146,7 @@ impl SchedulingState {
             pending_transaction_checks: VecDeque::new(),
             next_ready_transaction_index: 0,
             ready_transactions: VecDeque::new(),
+            ready_scan_cursor: 0,
             unschedulable_read_locks: PubkeyHashSet::with_hasher(PubkeyHasherBuilder::default()),
             unschedulable_write_locks: PubkeyHashSet::with_hasher(PubkeyHasherBuilder::default()),
             ingress_complete: false,
@@ -165,8 +167,7 @@ impl SchedulingState {
         self.pending_transaction_checks.clear();
         self.next_ready_transaction_index = 0;
         self.ready_transactions.clear();
-        self.unschedulable_read_locks.clear();
-        self.unschedulable_write_locks.clear();
+        self.reset_ready_scan();
         self.ingress_complete = false;
         self.entry_verification = EntryVerificationProgress::default();
         self.in_flight_worker_messages = 0;
@@ -184,6 +185,7 @@ impl SchedulingState {
         self.pending_transaction_checks = VecDeque::with_capacity(POOLED_SLOT_WORK_CAPACITY);
         self.next_ready_transaction_index = 0;
         self.ready_transactions = VecDeque::with_capacity(POOLED_SLOT_WORK_CAPACITY);
+        self.ready_scan_cursor = 0;
         self.unschedulable_read_locks = PubkeyHashSet::with_capacity_and_hasher(
             POOLED_SLOT_WORK_CAPACITY,
             PubkeyHasherBuilder::default(),
@@ -223,6 +225,12 @@ impl SchedulingState {
         }
     }
 
+    fn reset_ready_scan(&mut self) {
+        self.ready_scan_cursor = 0;
+        self.unschedulable_read_locks.clear();
+        self.unschedulable_write_locks.clear();
+    }
+
     fn service_transaction_execution_dispatches(
         &mut self,
         dispatch_context: &mut ExecutionDispatchContext<'_>,
@@ -238,38 +246,38 @@ impl SchedulingState {
 
         self.prune_scheduled_ready_prefix();
         if self.ready_transactions.is_empty() {
+            self.reset_ready_scan();
             return ExecutionDispatchCounts::default();
         }
 
-        self.unschedulable_read_locks.clear();
-        self.unschedulable_write_locks.clear();
-        let mut ready_transaction_index = 0;
         let mut counts = ExecutionDispatchCounts::default();
-        while ready_transaction_index < self.ready_transactions.len()
+        while self.ready_scan_cursor < self.ready_transactions.len()
             && counts.scanned < max_scanned_transactions
             && counts.scheduled < max_executions
             && dispatch_context.has_capacity()
         {
             let transaction_index = *self
                 .ready_transactions
-                .get(ready_transaction_index)
+                .get(self.ready_scan_cursor)
                 .expect("ready transaction index must be in-bounds");
             match self.try_dispatch_ready_transaction(transaction_index, dispatch_context) {
                 ReadyTransactionDispatchResult::AlreadyScheduled => {}
                 ReadyTransactionDispatchResult::Deferred => {
                     counts.scanned += 1;
                 }
+                ReadyTransactionDispatchResult::Unavailable => {
+                    counts.scanned += 1;
+                    break;
+                }
                 ReadyTransactionDispatchResult::Scheduled => {
                     counts.scanned += 1;
                     counts.scheduled += 1;
                 }
             }
-            ready_transaction_index += 1;
+            self.ready_scan_cursor += 1;
         }
 
         self.prune_scheduled_ready_prefix();
-        self.unschedulable_read_locks.clear();
-        self.unschedulable_write_locks.clear();
 
         counts
     }
@@ -305,19 +313,25 @@ impl SchedulingState {
                 return ReadyTransactionDispatchResult::Deferred;
             }
 
-            let Some(thread_id) = dispatch_context.try_dispatch_transaction_execution(
+            let dispatch_result = dispatch_context.try_dispatch_transaction_execution(
                 slot,
                 transaction_index,
                 transaction,
                 &mut self.account_locks,
-            ) else {
-                transaction.record_unschedulable_locks(
-                    &mut self.unschedulable_read_locks,
-                    &mut self.unschedulable_write_locks,
-                );
-                return ReadyTransactionDispatchResult::Deferred;
-            };
-            thread_id
+            );
+            match dispatch_result {
+                ExecutionDispatchResult::Scheduled(thread_id) => thread_id,
+                ExecutionDispatchResult::AccountConflict => {
+                    transaction.record_unschedulable_locks(
+                        &mut self.unschedulable_read_locks,
+                        &mut self.unschedulable_write_locks,
+                    );
+                    return ReadyTransactionDispatchResult::Deferred;
+                }
+                ExecutionDispatchResult::Unavailable => {
+                    return ReadyTransactionDispatchResult::Unavailable;
+                }
+            }
         };
 
         self.move_checked_transaction_to_in_flight(transaction_index, thread_id);
@@ -325,6 +339,7 @@ impl SchedulingState {
     }
 
     fn prune_scheduled_ready_prefix(&mut self) {
+        let mut pruned = 0usize;
         while self
             .ready_transactions
             .front()
@@ -336,6 +351,14 @@ impl SchedulingState {
             })
         {
             self.ready_transactions.pop_front();
+            pruned += 1;
+        }
+        self.ready_scan_cursor = self
+            .ready_scan_cursor
+            .saturating_sub(pruned)
+            .min(self.ready_transactions.len());
+        if self.ready_transactions.is_empty() {
+            self.reset_ready_scan();
         }
     }
 
@@ -440,6 +463,7 @@ impl SchedulingState {
             .checked_sub(1)
             .expect("execution response without in-flight execution");
         self.prune_scheduled_ready_prefix();
+        self.reset_ready_scan();
 
         previous_transaction_state
     }
@@ -534,7 +558,14 @@ impl SlotWorkTiming {
 enum ReadyTransactionDispatchResult {
     AlreadyScheduled,
     Deferred,
+    Unavailable,
     Scheduled,
+}
+
+enum ExecutionDispatchResult {
+    AccountConflict,
+    Scheduled(ThreadId),
+    Unavailable,
 }
 
 impl ExecutionDispatchContext<'_> {
@@ -557,15 +588,15 @@ impl ExecutionDispatchContext<'_> {
         transaction_index: usize,
         transaction: &TransactionState,
         account_locks: &mut ThreadAwareAccountLocks,
-    ) -> Option<ThreadId> {
+    ) -> ExecutionDispatchResult {
         if !self.has_capacity() {
-            return None;
+            return ExecutionDispatchResult::Unavailable;
         }
 
         let estimated_cost_units = transaction.estimated_cost_units();
         let available_threads = self.available_worker_threads(estimated_cost_units);
         if available_threads.is_empty() {
-            return None;
+            return ExecutionDispatchResult::Unavailable;
         }
 
         let Ok(thread_id) = account_locks.try_lock_accounts(
@@ -580,7 +611,7 @@ impl ExecutionDispatchContext<'_> {
                 )
             },
         ) else {
-            return None;
+            return ExecutionDispatchResult::AccountConflict;
         };
 
         let Some(batch) = self.allocate_transaction_execution_batch(
@@ -594,7 +625,7 @@ impl ExecutionDispatchContext<'_> {
                 transaction.read_locks(),
                 thread_id,
             );
-            return None;
+            return ExecutionDispatchResult::Unavailable;
         };
 
         let message = PackToWorkerMessage {
@@ -609,12 +640,12 @@ impl ExecutionDispatchContext<'_> {
                 transaction.read_locks(),
                 thread_id,
             );
-            return None;
+            return ExecutionDispatchResult::Unavailable;
         }
         self.workers[thread_id].pack_to_worker.commit();
 
         self.increment_in_flight_execution_messages(thread_id, estimated_cost_units);
-        Some(thread_id)
+        ExecutionDispatchResult::Scheduled(thread_id)
     }
 
     fn available_worker_threads(&mut self, estimated_cost_units: u64) -> ThreadSet {
@@ -1953,8 +1984,7 @@ impl BlockVerificationScheduler {
             self.free_transaction_state_allocations(transaction_state);
         }
         state.ready_transactions.clear();
-        state.unschedulable_read_locks.clear();
-        state.unschedulable_write_locks.clear();
+        state.reset_ready_scan();
     }
 
     fn free_transaction_allocation(&mut self, transaction: TransactionPtr) {
@@ -2048,8 +2078,7 @@ impl BlockVerificationScheduler {
                 state.terminal_status = Some(SlotTerminalStatus::Failed(reason));
                 state.pending_transaction_checks.clear();
                 state.ready_transactions.clear();
-                state.unschedulable_read_locks.clear();
-                state.unschedulable_write_locks.clear();
+                state.reset_ready_scan();
                 if previous_status.is_none() {
                     self.terminal_slot_queue.push_back(slot);
                 }
@@ -2067,8 +2096,7 @@ impl BlockVerificationScheduler {
                 state.terminal_status = Some(terminal_status);
                 state.pending_transaction_checks.clear();
                 state.ready_transactions.clear();
-                state.unschedulable_read_locks.clear();
-                state.unschedulable_write_locks.clear();
+                state.reset_ready_scan();
                 if previous_status.is_none() {
                     self.terminal_slot_queue.push_back(slot);
                 }
@@ -2260,6 +2288,19 @@ mod tests {
         worker.pack_to_worker.finalize();
 
         message
+    }
+
+    fn read_all_pack_to_worker_messages(
+        workers: &mut [BlockVerificationWorkerSession],
+    ) -> Vec<(usize, PackToWorkerMessage)> {
+        let mut messages = Vec::new();
+        for (worker_index, worker) in workers.iter_mut().enumerate() {
+            while let Some(message) = read_pack_to_worker_message(worker) {
+                messages.push((worker_index, message));
+            }
+        }
+
+        messages
     }
 
     fn transaction_batch_regions(
@@ -3771,6 +3812,225 @@ mod tests {
 
         let state = scheduler.scheduling_states.get(&42).unwrap();
         assert!(state.ready_transactions.iter().copied().eq(2..3));
+    }
+
+    #[test]
+    fn execution_dispatch_does_not_rescan_deferred_ready_transactions_without_completion() {
+        let (mut scheduler, mut replay_stage, mut workers) =
+            setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
+                allocator_size: 64 * 1024 * 1024,
+                replay_to_pack_capacity: 8,
+                replay_block_status_capacity: 8,
+                worker_count: 2,
+                pack_to_worker_capacity: 8,
+                worker_to_pack_capacity: 8,
+            });
+        let account = Pubkey::new_unique();
+        let transactions: [SharableTransactionRegion; 3] = core::array::from_fn(|index| {
+            allocate_minimal_transaction_region_with_account(
+                &replay_stage.allocator,
+                index as u8,
+                account,
+            )
+        });
+        write_replay_messages(
+            &mut replay_stage,
+            [
+                begin(42),
+                entry(42, 3),
+                transaction_message(transactions[0]),
+                transaction_message(transactions[1]),
+                transaction_message(transactions[2]),
+            ],
+        );
+        assert_eq!(scheduler.service_ingress_queue(5), 5);
+        assert_eq!(scheduler.service_transaction_check_dispatches(1024), 3);
+        for (worker_index, message) in read_all_pack_to_worker_messages(&mut workers) {
+            queue_worker_check_response(
+                &mut workers[worker_index],
+                message.batch,
+                successful_check_response_with_cost(
+                    MAX_OUTSTANDING_EXECUTION_COST_UNITS_PER_WORKER,
+                ),
+            );
+        }
+        assert_eq!(scheduler.service_worker_responses(3), 3);
+
+        assert_eq!(scheduler.service_transaction_execution_dispatches(3, 3), 1);
+        let first_execution = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        assert_eq!(
+            transaction_execution_metadata(&replay_stage.allocator, first_execution.batch)
+                .transaction_index,
+            0,
+        );
+        assert!(read_pack_to_worker_message(&mut workers[1]).is_none());
+
+        {
+            let state = scheduler.scheduling_states.get(&42).unwrap();
+            assert!(state.ready_transactions.iter().copied().eq([1, 2]));
+            assert_eq!(state.ready_scan_cursor, 2);
+            assert!(state.unschedulable_write_locks.contains(&account));
+        }
+
+        assert_eq!(scheduler.service_transaction_execution_dispatches(3, 3), 0);
+        assert!(read_pack_to_worker_message(&mut workers[0]).is_none());
+        assert!(read_pack_to_worker_message(&mut workers[1]).is_none());
+        let state = scheduler.scheduling_states.get(&42).unwrap();
+        assert!(state.ready_transactions.iter().copied().eq([1, 2]));
+        assert_eq!(state.ready_scan_cursor, 2);
+    }
+
+    #[test]
+    fn execution_dispatch_scans_appended_ready_transactions_without_rescanning_prefix() {
+        let (mut scheduler, mut replay_stage, mut workers) =
+            setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
+                allocator_size: 64 * 1024 * 1024,
+                replay_to_pack_capacity: 8,
+                replay_block_status_capacity: 8,
+                worker_count: 2,
+                pack_to_worker_capacity: 8,
+                worker_to_pack_capacity: 8,
+            });
+        let account = Pubkey::new_unique();
+        let transactions: [SharableTransactionRegion; 3] = core::array::from_fn(|index| {
+            allocate_minimal_transaction_region_with_account(
+                &replay_stage.allocator,
+                index as u8,
+                account,
+            )
+        });
+        write_replay_messages(
+            &mut replay_stage,
+            [
+                begin(42),
+                entry(42, 3),
+                transaction_message(transactions[0]),
+                transaction_message(transactions[1]),
+                transaction_message(transactions[2]),
+            ],
+        );
+        assert_eq!(scheduler.service_ingress_queue(5), 5);
+        assert_eq!(scheduler.service_transaction_check_dispatches(1024), 3);
+        let mut check_messages = read_all_pack_to_worker_messages(&mut workers);
+        check_messages.sort_by_key(|(_, message)| {
+            transaction_check_metadata(&replay_stage.allocator, message.batch).transaction_index
+        });
+        for (worker_index, message) in check_messages.iter().copied().take(2) {
+            queue_worker_check_response(
+                &mut workers[worker_index],
+                message.batch,
+                successful_check_response_with_cost(
+                    MAX_OUTSTANDING_EXECUTION_COST_UNITS_PER_WORKER,
+                ),
+            );
+        }
+        assert_eq!(scheduler.service_worker_responses(2), 2);
+        assert_eq!(scheduler.service_transaction_execution_dispatches(3, 3), 1);
+        let first_execution = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        assert_eq!(
+            transaction_execution_metadata(&replay_stage.allocator, first_execution.batch)
+                .transaction_index,
+            0,
+        );
+
+        {
+            let state = scheduler.scheduling_states.get(&42).unwrap();
+            assert!(state.ready_transactions.iter().copied().eq([1]));
+            assert_eq!(state.ready_scan_cursor, 1);
+            assert!(state.unschedulable_write_locks.contains(&account));
+        }
+
+        let (worker_index, third_check) = check_messages[2];
+        queue_worker_check_response(
+            &mut workers[worker_index],
+            third_check.batch,
+            successful_check_response_with_cost(MAX_OUTSTANDING_EXECUTION_COST_UNITS_PER_WORKER),
+        );
+        assert_eq!(scheduler.service_worker_responses(1), 1);
+        {
+            let state = scheduler.scheduling_states.get(&42).unwrap();
+            assert!(state.ready_transactions.iter().copied().eq([1, 2]));
+            assert_eq!(state.ready_scan_cursor, 1);
+        }
+
+        assert_eq!(scheduler.service_transaction_execution_dispatches(3, 1), 0);
+        assert!(read_pack_to_worker_message(&mut workers[0]).is_none());
+        assert!(read_pack_to_worker_message(&mut workers[1]).is_none());
+        let state = scheduler.scheduling_states.get(&42).unwrap();
+        assert!(state.ready_transactions.iter().copied().eq([1, 2]));
+        assert_eq!(state.ready_scan_cursor, 2);
+    }
+
+    #[test]
+    fn execution_completion_resets_ready_scan_cursor() {
+        let (mut scheduler, mut replay_stage, mut workers) =
+            setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
+                allocator_size: 64 * 1024 * 1024,
+                replay_to_pack_capacity: 8,
+                replay_block_status_capacity: 8,
+                worker_count: 2,
+                pack_to_worker_capacity: 8,
+                worker_to_pack_capacity: 8,
+            });
+        let account = Pubkey::new_unique();
+        let transactions: [SharableTransactionRegion; 2] = core::array::from_fn(|index| {
+            allocate_minimal_transaction_region_with_account(
+                &replay_stage.allocator,
+                index as u8,
+                account,
+            )
+        });
+        write_replay_messages(
+            &mut replay_stage,
+            [
+                begin(42),
+                entry(42, 2),
+                transaction_message(transactions[0]),
+                transaction_message(transactions[1]),
+            ],
+        );
+        assert_eq!(scheduler.service_ingress_queue(4), 4);
+        assert_eq!(scheduler.service_transaction_check_dispatches(1024), 2);
+        for (worker_index, message) in read_all_pack_to_worker_messages(&mut workers) {
+            queue_worker_check_response(
+                &mut workers[worker_index],
+                message.batch,
+                successful_check_response_with_cost(
+                    MAX_OUTSTANDING_EXECUTION_COST_UNITS_PER_WORKER,
+                ),
+            );
+        }
+        assert_eq!(scheduler.service_worker_responses(2), 2);
+        assert_eq!(scheduler.service_transaction_execution_dispatches(2, 2), 1);
+        let first_execution = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        {
+            let state = scheduler.scheduling_states.get(&42).unwrap();
+            assert!(state.ready_transactions.iter().copied().eq([1]));
+            assert_eq!(state.ready_scan_cursor, 1);
+            assert!(state.unschedulable_write_locks.contains(&account));
+        }
+
+        queue_worker_execution_response(
+            &mut workers[0],
+            first_execution.batch,
+            successful_execution_response(),
+        );
+        assert_eq!(scheduler.service_worker_responses(1), 1);
+        {
+            let state = scheduler.scheduling_states.get(&42).unwrap();
+            assert!(state.ready_transactions.iter().copied().eq([1]));
+            assert_eq!(state.ready_scan_cursor, 0);
+            assert!(state.unschedulable_read_locks.is_empty());
+            assert!(state.unschedulable_write_locks.is_empty());
+        }
+
+        assert_eq!(scheduler.service_transaction_execution_dispatches(1, 1), 1);
+        let second_execution = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        assert_eq!(
+            transaction_execution_metadata(&replay_stage.allocator, second_execution.batch)
+                .transaction_index,
+            1,
+        );
     }
 
     #[test]
