@@ -1950,6 +1950,7 @@ impl BlockVerificationScheduler {
     }
 
     fn send_replay_block_status(&mut self, status: FinishedSlotStatus) {
+        self.session.replay_block_status.sync();
         self.session
             .replay_block_status
             .try_write(status.message)
@@ -4203,6 +4204,34 @@ mod tests {
                 reason: replay_block_status_reasons::NONE,
             }),
         );
+    }
+
+    #[test]
+    fn send_replay_block_status_observes_freed_queue_capacity() {
+        let (mut scheduler, mut replay_stage, _) =
+            setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
+                allocator_size: 64 * 1024 * 1024,
+                replay_to_pack_capacity: 8,
+                replay_block_status_capacity: 1,
+                worker_count: 1,
+                pack_to_worker_capacity: 8,
+                worker_to_pack_capacity: 8,
+            });
+        let first = ReplayBlockStatusMessage {
+            slot: 42,
+            status: replay_block_status_codes::SUCCESS,
+            reason: replay_block_status_reasons::NONE,
+        };
+        let second = ReplayBlockStatusMessage {
+            slot: 43,
+            status: replay_block_status_codes::SUCCESS,
+            reason: replay_block_status_reasons::NONE,
+        };
+
+        scheduler.send_replay_block_status(FinishedSlotStatus { message: first });
+        assert_eq!(read_replay_block_status(&mut replay_stage), Some(first));
+        scheduler.send_replay_block_status(FinishedSlotStatus { message: second });
+        assert_eq!(read_replay_block_status(&mut replay_stage), Some(second));
     }
 
     #[test]

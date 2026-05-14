@@ -343,8 +343,6 @@ pub(crate) mod external {
 
             match receiver.try_read() {
                 Some(message) => {
-                    self.sender.sync();
-
                     // Process message, if bank is unavailable enable draining for the
                     // remainder of the current batch (i.e. what our `receiver.sync()`
                     // fetched).
@@ -359,6 +357,16 @@ pub(crate) mod external {
                 }
                 None => Ok(IterationResult::Idle),
             }
+        }
+
+        fn send_response_message(
+            &mut self,
+            response: WorkerToPackMessage,
+        ) -> Result<(), ExternalConsumeWorkerError> {
+            self.sender.sync();
+            self.sender
+                .try_write(response)
+                .map_err(|_| ExternalConsumeWorkerError::SenderDisconnected)
         }
 
         /// Return true if fetching a bank for execution timed out.
@@ -626,9 +634,7 @@ pub(crate) mod external {
                 responses,
             };
 
-            self.sender
-                .try_write(response)
-                .map_err(|_| ExternalConsumeWorkerError::SenderDisconnected)?;
+            self.send_response_message(response)?;
 
             Ok(())
         }
@@ -676,9 +682,7 @@ pub(crate) mod external {
                 responses,
             };
 
-            self.sender
-                .try_write(response)
-                .map_err(|_| ExternalConsumeWorkerError::SenderDisconnected)?;
+            self.send_response_message(response)?;
 
             Ok(())
         }
@@ -759,9 +763,7 @@ pub(crate) mod external {
 
             // Should de-allocate the memory, but this is a non-recoverable
             // error and so it's not needed.
-            self.sender
-                .try_write(response_message)
-                .map_err(|_| ExternalConsumeWorkerError::SenderDisconnected)?;
+            self.send_response_message(response_message)?;
 
             Ok(())
         }
@@ -868,9 +870,7 @@ pub(crate) mod external {
                 },
             };
 
-            self.sender
-                .try_write(response)
-                .map_err(|_| ExternalConsumeWorkerError::SenderDisconnected)?;
+            self.send_response_message(response)?;
 
             Ok(())
         }
