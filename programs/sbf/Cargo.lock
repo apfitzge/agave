@@ -70,13 +70,17 @@ dependencies = [
  "agave-scheduling-utils",
  "agave-transaction-view",
  "crossbeam-channel",
+ "log",
  "rts-alloc",
  "shaq",
  "slab",
+ "solana-clock",
  "solana-entry",
  "solana-hash 4.3.0",
+ "solana-metrics",
  "solana-pubkey 4.2.0",
  "solana-signature",
+ "wincode",
 ]
 
 [[package]]
@@ -7286,6 +7290,7 @@ dependencies = [
 name = "solana-ledger"
 version = "4.1.0-alpha.0"
 dependencies = [
+ "agave-block-verification-stage",
  "agave-feature-set",
  "agave-reserved-account-keys",
  "agave-snapshots",

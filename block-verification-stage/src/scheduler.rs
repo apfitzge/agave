@@ -30,6 +30,7 @@ use {
     slab::Slab,
     solana_entry::entry::EntryVerificationData,
     solana_hash::Hash,
+    solana_metrics::datapoint_info,
     solana_pubkey::Pubkey,
     std::{
         collections::{HashMap, HashSet, VecDeque},
@@ -39,7 +40,7 @@ use {
             atomic::{AtomicBool, Ordering},
         },
         thread,
-        time::Duration,
+        time::{Duration, Instant},
     },
 };
 
@@ -130,6 +131,7 @@ struct SchedulingState {
     in_flight_worker_messages: usize,
     in_flight_execution_messages: usize,
     terminal_status: Option<SlotTerminalStatus>,
+    work_timing: SlotWorkTiming,
 }
 
 impl SchedulingState {
@@ -150,6 +152,7 @@ impl SchedulingState {
             in_flight_worker_messages: 0,
             in_flight_execution_messages: 0,
             terminal_status: None,
+            work_timing: SlotWorkTiming::default(),
         }
     }
 
@@ -169,6 +172,7 @@ impl SchedulingState {
         self.in_flight_worker_messages = 0;
         self.in_flight_execution_messages = 0;
         self.terminal_status = None;
+        self.work_timing = SlotWorkTiming::default();
     }
 
     fn clear_for_pool(&mut self) {
@@ -189,6 +193,7 @@ impl SchedulingState {
         self.in_flight_worker_messages = 0;
         self.in_flight_execution_messages = 0;
         self.terminal_status = None;
+        self.work_timing = SlotWorkTiming::default();
     }
 
     fn accepts_ingress(&self) -> bool {
@@ -434,6 +439,28 @@ impl SchedulingState {
 
         previous_transaction_state
     }
+
+    fn has_outstanding_work(&self) -> bool {
+        self.in_flight_worker_messages != 0
+            || self.in_flight_execution_messages != 0
+            || self.entry_verification.pending_jobs != 0
+            || !self.pending_transaction_checks.is_empty()
+            || !self.ready_transactions.is_empty()
+    }
+
+    fn start_work_timing(&mut self) {
+        if !self.work_timing.is_active() {
+            self.work_timing.maybe_start(Instant::now());
+        }
+    }
+
+    fn update_work_timing(&mut self, now: Instant) {
+        if self.has_outstanding_work() {
+            self.work_timing.maybe_start(now);
+        } else {
+            self.work_timing.stop(now);
+        }
+    }
 }
 
 fn select_execution_thread(
@@ -465,6 +492,39 @@ struct ExecutionDispatchContext<'a> {
 struct ExecutionDispatchCounts {
     scheduled: usize,
     scanned: usize,
+}
+
+#[derive(Default)]
+struct SlotWorkTiming {
+    active_start: Option<Instant>,
+    accumulated: Duration,
+    active_periods: u64,
+}
+
+impl SlotWorkTiming {
+    fn is_active(&self) -> bool {
+        self.active_start.is_some()
+    }
+
+    fn maybe_start(&mut self, now: Instant) {
+        if self.active_start.is_none() {
+            self.active_start = Some(now);
+            self.active_periods = self.active_periods.saturating_add(1);
+        }
+    }
+
+    fn stop(&mut self, now: Instant) {
+        if let Some(active_start) = self.active_start.take() {
+            self.accumulated = self.accumulated.saturating_add(
+                now.checked_duration_since(active_start)
+                    .unwrap_or(Duration::ZERO),
+            );
+        }
+    }
+
+    fn accumulated_us(&self) -> u64 {
+        self.accumulated.as_micros().try_into().unwrap_or(u64::MAX)
+    }
 }
 
 enum ReadyTransactionDispatchResult {
@@ -695,6 +755,21 @@ enum SlotTerminalStatus {
 }
 
 impl SlotTerminalStatus {
+    fn status_code(self) -> u8 {
+        match self {
+            Self::Success => replay_block_status_codes::SUCCESS,
+            Self::Failed(_) => replay_block_status_codes::FAILED,
+            Self::Aborted => replay_block_status_codes::ABORTED,
+        }
+    }
+
+    fn reason(self) -> u16 {
+        match self {
+            Self::Success | Self::Aborted => replay_block_status_reasons::NONE,
+            Self::Failed(reason) => reason,
+        }
+    }
+
     fn into_replay_block_status(self, slot: u64) -> ReplayBlockStatusMessage {
         match self {
             Self::Success => ReplayBlockStatusMessage {
@@ -951,6 +1026,7 @@ impl BlockVerificationScheduler {
                     TRANSACTION_EXECUTION_DISPATCH_LIMIT,
                     TRANSACTION_EXECUTION_SCAN_LIMIT,
                 );
+            self.update_slot_work_timings(Instant::now());
             let terminal_cleanup_count = self.service_terminal_slots(TERMINAL_SLOT_CLEANUP_LIMIT);
             if ingress_count == 0
                 && entry_verification_count == 0
@@ -967,6 +1043,12 @@ impl BlockVerificationScheduler {
 
     fn has_in_flight_slots(&self) -> bool {
         !self.scheduling_states.is_empty()
+    }
+
+    fn update_slot_work_timings(&mut self, now: Instant) {
+        for state in self.scheduling_states.values_mut() {
+            state.update_work_timing(now);
+        }
     }
 
     pub fn service_ingress_queue(&mut self, max_messages: usize) -> usize {
@@ -1189,9 +1271,9 @@ impl BlockVerificationScheduler {
     fn finish_pending_entry(&mut self, pending_entry: PendingEntryIngress) {
         let slot = pending_entry.header.slot;
         if self.is_slot_accepting_work(slot) {
-            self.scheduling_state_mut(slot)
-                .entry_headers
-                .push(pending_entry.header);
+            let state = self.scheduling_state_mut(slot);
+            state.start_work_timing();
+            state.entry_headers.push(pending_entry.header);
             self.spawn_entry_hash_verification(
                 pending_entry.header,
                 &pending_entry.retained_transactions,
@@ -1213,6 +1295,7 @@ impl BlockVerificationScheduler {
         };
 
         let state = self.scheduling_state_mut(slot);
+        state.start_work_timing();
         let transaction_index = state.transactions.len();
         let transaction_key = state
             .transactions
@@ -1833,6 +1916,8 @@ impl BlockVerificationScheduler {
         }
 
         let mut state = self.scheduling_states.remove(&slot).unwrap();
+        state.update_work_timing(Instant::now());
+        self.report_slot_work_timing(&state, terminal_status);
         self.free_scheduling_state_allocations(&mut state);
         if self.scheduling_state_pool.len() < SCHEDULING_STATE_POOL_LIMIT {
             state.clear_for_pool();
@@ -1842,6 +1927,21 @@ impl BlockVerificationScheduler {
         Some(FinishedSlotStatus {
             message: terminal_status.into_replay_block_status(slot),
         })
+    }
+
+    fn report_slot_work_timing(
+        &self,
+        state: &SchedulingState,
+        terminal_status: SlotTerminalStatus,
+    ) {
+        datapoint_info!(
+            "block-verification-slot-work",
+            ("slot", state.slot, i64),
+            ("status", terminal_status.status_code(), i64),
+            ("reason", terminal_status.reason(), i64),
+            ("active_us", state.work_timing.accumulated_us(), i64),
+            ("active_periods", state.work_timing.active_periods, i64),
+        );
     }
 
     fn free_scheduling_state_allocations(&mut self, state: &mut SchedulingState) {
@@ -2568,6 +2668,28 @@ mod tests {
     }
 
     #[test]
+    fn slot_work_timing_accumulates_active_periods() {
+        let mut timing = SlotWorkTiming::default();
+        let start = Instant::now();
+
+        timing.maybe_start(start);
+        timing.maybe_start(start + Duration::from_micros(5));
+        timing.stop(start + Duration::from_micros(10));
+        timing.stop(start + Duration::from_micros(15));
+
+        assert_eq!(timing.accumulated_us(), 10);
+        assert_eq!(timing.active_periods, 1);
+        assert!(!timing.is_active());
+
+        timing.maybe_start(start + Duration::from_micros(20));
+        timing.stop(start + Duration::from_micros(25));
+
+        assert_eq!(timing.accumulated_us(), 15);
+        assert_eq!(timing.active_periods, 2);
+        assert!(!timing.is_active());
+    }
+
+    #[test]
     fn scheduler_has_in_flight_slots_until_terminal_cleanup() {
         let (mut scheduler, mut replay_stage) = setup_scheduler_and_replay_stage();
         assert!(!scheduler.has_in_flight_slots());
@@ -2578,6 +2700,68 @@ mod tests {
 
         assert_eq!(scheduler.service_terminal_slots(1), 1);
         assert!(!scheduler.has_in_flight_slots());
+    }
+
+    #[test]
+    fn slot_work_timing_stops_when_scheduler_work_drains() {
+        let (mut scheduler, mut replay_stage, mut workers) =
+            setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
+                allocator_size: 64 * 1024 * 1024,
+                replay_to_pack_capacity: 8,
+                replay_block_status_capacity: 8,
+                worker_count: 1,
+                pack_to_worker_capacity: 8,
+                worker_to_pack_capacity: 8,
+            });
+        let start_hash = Hash::new_from_array([9; 32]);
+        let signature = Signature::from([9; SIGNATURE_BYTES]);
+        let transaction = minimal_transaction(signature);
+        let entry = solana_entry::next_versioned_entry(&start_hash, 1, vec![transaction.clone()]);
+        let transaction_region = allocate_transaction(
+            &replay_stage.allocator,
+            &wincode::serialize(&transaction).unwrap(),
+        );
+        write_replay_messages(
+            &mut replay_stage,
+            [
+                begin_with_last_entry_hash(42, start_hash),
+                entry_with_hash(42, entry.num_hashes, entry.hash, 1),
+                transaction_message(transaction_region),
+            ],
+        );
+
+        assert_eq!(scheduler.service_ingress_queue(3), 3);
+        assert!(
+            scheduler
+                .scheduling_states
+                .get(&42)
+                .unwrap()
+                .work_timing
+                .is_active()
+        );
+        wait_for_entry_verification(&mut scheduler, 42);
+        assert_eq!(scheduler.service_transaction_check_dispatches(1024), 1);
+        let check_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        queue_worker_check_response(
+            &mut workers[0],
+            check_message.batch,
+            successful_check_response(),
+        );
+        assert_eq!(scheduler.service_worker_responses(1), 1);
+        assert_eq!(scheduler.service_transaction_execution_dispatches(1, 1), 1);
+        let execution_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        queue_worker_execution_response(
+            &mut workers[0],
+            execution_message.batch,
+            successful_execution_response(),
+        );
+        assert_eq!(scheduler.service_worker_responses(1), 1);
+
+        scheduler.update_slot_work_timings(Instant::now());
+
+        let timing = &scheduler.scheduling_states.get(&42).unwrap().work_timing;
+        assert!(!timing.is_active());
+        assert_eq!(timing.active_periods, 1);
     }
 
     #[test]
