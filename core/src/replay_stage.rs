@@ -218,14 +218,7 @@ struct ProcessActiveBanksContext {
     votor_event_sender: VotorEventSender,
     replay_mode: ForkReplayMode,
     block_verification: Arc<Mutex<ReplayBlockVerification>>,
-    pending_replay_tick_registrations: Mutex<HashMap<Slot, ReplayTickRegistration>>,
     migration_status: Arc<MigrationStatus>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ReplayTickRegistration {
-    final_tick_hash: Hash,
-    tick_count: u64,
 }
 
 #[cfg(test)]
@@ -258,7 +251,6 @@ impl ProcessActiveBanksContext {
             votor_event_sender,
             replay_mode: ForkReplayMode::Serial,
             block_verification: Arc::new(Mutex::new(block_verification)),
-            pending_replay_tick_registrations: Mutex::new(HashMap::new()),
             migration_status,
         }
     }
@@ -831,7 +823,6 @@ impl ReplayStage {
                 votor_event_sender: votor_event_sender.clone(),
                 replay_mode,
                 block_verification: Arc::new(Mutex::new(block_verification)),
-                pending_replay_tick_registrations: Mutex::new(HashMap::new()),
                 migration_status: migration_status.clone(),
             };
 
@@ -2620,12 +2611,7 @@ impl ReplayStage {
             .lock()
             .unwrap()
             .clean_remote_free_lists();
-        if process_active_banks_context
-            .pending_replay_tick_registrations
-            .lock()
-            .unwrap()
-            .contains_key(&slot)
-        {
+        if bank.is_complete() {
             return Ok(());
         }
 
@@ -2703,7 +2689,7 @@ impl ReplayStage {
         }
 
         if slot_full {
-            {
+            let status = {
                 let mut block_verification = process_active_banks_context
                     .block_verification
                     .lock()
@@ -2713,23 +2699,16 @@ impl ReplayStage {
                 {
                     return Ok(());
                 }
-            }
 
+                block_verification.wait_for_status(slot)
+            };
             replay_elapsed.stop();
             replay_stats.replay_elapsed += replay_elapsed.as_us();
-
-            let previous = process_active_banks_context
-                .pending_replay_tick_registrations
-                .lock()
-                .unwrap()
-                .insert(
-                    slot,
-                    ReplayTickRegistration {
-                        final_tick_hash: replay_progress.last_entry,
-                        tick_count: replay_progress.num_ticks,
-                    },
-                );
-            debug_assert!(previous.is_none());
+            let Some(status) = status else {
+                return Ok(());
+            };
+            blockstore_processor::block_verification_status_result(status)?;
+            bank.register_ticks_for_replay(&replay_progress.last_entry, replay_progress.num_ticks);
         } else {
             replay_elapsed.stop();
             replay_stats.replay_elapsed += replay_elapsed.as_us();
@@ -3721,13 +3700,7 @@ impl ReplayStage {
             }
 
             assert_eq!(bank_slot, bank.slot());
-            let pending_replay_tick_registration = process_active_banks_context
-                .pending_replay_tick_registrations
-                .lock()
-                .unwrap()
-                .get(&bank_slot)
-                .copied();
-            if bank.is_complete() || pending_replay_tick_registration.is_some() {
+            if bank.is_complete() {
                 let mut bank_complete_time = Measure::start("bank_complete_time");
                 let bank_progress = progress
                     .get_mut(&bank.slot())
@@ -3752,26 +3725,6 @@ impl ReplayStage {
                         .accumulate(metrics, is_unified_scheduler_enabled);
 
                     result.map_err(BlockstoreProcessorError::InvalidTransaction)
-                } else {
-                    Ok(())
-                };
-                let block_verification_res = if pending_replay_tick_registration.is_some() {
-                    let status = process_active_banks_context
-                        .block_verification
-                        .lock()
-                        .unwrap()
-                        .poll_status(bank_slot);
-                    match status {
-                        Some(status) => {
-                            process_active_banks_context
-                                .pending_replay_tick_registrations
-                                .lock()
-                                .unwrap()
-                                .remove(&bank_slot);
-                            blockstore_processor::block_verification_status_result(status)
-                        }
-                        None => continue,
-                    }
                 } else {
                     Ok(())
                 };
@@ -3809,7 +3762,7 @@ impl ReplayStage {
                         replay_slot: bank.slot(),
                     },
                 );
-                if let Err(err) = replay_res.and(block_verification_res).and(verify_res) {
+                if let Err(err) = replay_res.and(verify_res) {
                     let root = bank_forks.read().unwrap().root();
                     Self::mark_dead_slot(
                         &process_active_banks_context.blockstore,
@@ -3843,13 +3796,6 @@ impl ReplayStage {
                     bank.set_block_id(block_id);
                 }
 
-                if let Some(tick_registration) = pending_replay_tick_registration {
-                    debug_assert!(!bank.is_complete());
-                    bank.register_ticks_for_replay(
-                        &tick_registration.final_tick_hash,
-                        tick_registration.tick_count,
-                    );
-                }
                 debug_assert!(bank.is_complete());
 
                 // Freeze the bank before sending to any auxiliary threads that may expect to be
@@ -4095,8 +4041,11 @@ impl ReplayStage {
                 }
                 bank_complete_time.stop();
 
-                let uses_task_submission_metrics =
-                    is_unified_scheduler_enabled || pending_replay_tick_registration.is_some();
+                let uses_task_submission_metrics = is_unified_scheduler_enabled
+                    || replay_result
+                        .replay_result
+                        .as_ref()
+                        .is_some_and(|result| result.is_ok());
                 r_replay_stats.report_stats(
                     bank.slot(),
                     r_replay_progress.num_txs,
@@ -4145,15 +4094,6 @@ impl ReplayStage {
         block_verification.clean_remote_free_lists();
         for slot in &slots {
             block_verification.finish_slot_before_bank_forks_removal(*slot);
-        }
-        drop(block_verification);
-
-        let mut pending_replay_tick_registrations = process_active_banks_context
-            .pending_replay_tick_registrations
-            .lock()
-            .unwrap();
-        for slot in slots {
-            pending_replay_tick_registrations.remove(&slot);
         }
     }
 
@@ -6091,8 +6031,6 @@ pub(crate) mod tests {
             }
         };
 
-        assert_matches!(&replay_result.replay_result, Some(Ok(_)));
-
         let my_pubkey = Pubkey::default();
 
         assert!(!process_active_banks_context.blockstore.is_dead(slot));
@@ -6101,23 +6039,17 @@ pub(crate) mod tests {
 
         let mut duplicate_slots_to_repair = DuplicateSlotsToRepair::default();
         let mut purge_repair_slot_counter = PurgeRepairSlotCounter::default();
-        for _ in 0..1000 {
-            ReplayStage::process_replay_results(
-                &process_active_banks_context,
-                &mut progress,
-                &mut Vec::new(),
-                &mut latest_validator_votes_for_frozen_banks,
-                &mut duplicate_slots_to_repair,
-                &mut purge_repair_slot_counter,
-                None,
-                std::slice::from_ref(&replay_result),
-                &my_pubkey,
-            );
-            if progress.get(&slot).unwrap().is_dead {
-                break;
-            }
-            thread::sleep(Duration::from_millis(1));
-        }
+        ReplayStage::process_replay_results(
+            &process_active_banks_context,
+            &mut progress,
+            &mut Vec::new(),
+            &mut latest_validator_votes_for_frozen_banks,
+            &mut duplicate_slots_to_repair,
+            &mut purge_repair_slot_counter,
+            None,
+            std::slice::from_ref(&replay_result),
+            &my_pubkey,
+        );
 
         assert!(progress.get(&slot).unwrap().is_dead);
         assert!(blockstore.is_dead(slot));
@@ -6180,13 +6112,7 @@ pub(crate) mod tests {
             &bank_progress.replay_progress,
         );
         assert_matches!(first_replay_result, Ok(1));
-        assert!(
-            !process_active_banks_context
-                .pending_replay_tick_registrations
-                .lock()
-                .unwrap()
-                .contains_key(&slot)
-        );
+        assert!(!bank.is_complete());
 
         let final_shreds = entries_to_test_shreds_with_next_index(
             &entries[1..],
@@ -6207,13 +6133,7 @@ pub(crate) mod tests {
             &bank_progress.replay_progress,
         );
         assert_matches!(second_replay_result, Ok(0));
-        assert!(
-            process_active_banks_context
-                .pending_replay_tick_registrations
-                .lock()
-                .unwrap()
-                .contains_key(&slot)
-        );
+        assert!(bank.is_complete());
 
         let progress_after_complete = {
             let replay_progress = bank_progress.replay_progress.read().unwrap();
@@ -6246,7 +6166,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_purge_unconfirmed_slot_finishes_pending_block_verification() {
+    fn test_purge_unconfirmed_slot_finishes_in_progress_block_verification() {
         let ReplayBlockstoreComponents {
             blockstore,
             vote_simulator,
@@ -6276,7 +6196,7 @@ pub(crate) mod tests {
             bank.last_blockhash(),
         );
         let entries = make_complete_slot_entries(&bank, vec![tx]);
-        let shreds = entries_to_test_shreds(&entries, slot, bank.parent_slot(), true, 0);
+        let shreds = entries_to_test_shreds(&entries[..1], slot, bank.parent_slot(), false, 0);
         blockstore.insert_shreds(shreds, None, false).unwrap();
 
         let (replay_vote_sender, _replay_vote_receiver) = unbounded();
@@ -6290,13 +6210,7 @@ pub(crate) mod tests {
             &bank_progress.replay_progress,
         );
         assert_matches!(replay_result, Ok(1));
-        assert!(
-            process_active_banks_context
-                .pending_replay_tick_registrations
-                .lock()
-                .unwrap()
-                .contains_key(&slot)
-        );
+        assert!(!bank.is_complete());
 
         let root_bank = process_active_banks_context
             .bank_forks
@@ -6333,13 +6247,6 @@ pub(crate) mod tests {
                 .is_none()
         );
         assert!(progress.get(&slot).is_none());
-        assert!(
-            !process_active_banks_context
-                .pending_replay_tick_registrations
-                .lock()
-                .unwrap()
-                .contains_key(&slot)
-        );
     }
 
     #[test]
@@ -6392,37 +6299,23 @@ pub(crate) mod tests {
         };
 
         assert_matches!(&replay_result.replay_result, Some(Ok(1)));
-        assert!(!bank.is_complete());
-        assert!(
-            process_active_banks_context
-                .pending_replay_tick_registrations
-                .lock()
-                .unwrap()
-                .contains_key(&slot)
-        );
+        assert!(bank.is_complete());
 
         let mut latest_validator_votes_for_frozen_banks =
             LatestValidatorVotesForFrozenBanks::default();
         let mut duplicate_slots_to_repair = DuplicateSlotsToRepair::default();
         let mut purge_repair_slot_counter = PurgeRepairSlotCounter::default();
-        let mut new_frozen_slots = vec![];
-        for _ in 0..1000 {
-            new_frozen_slots = ReplayStage::process_replay_results(
-                &process_active_banks_context,
-                &mut progress,
-                &mut Vec::new(),
-                &mut latest_validator_votes_for_frozen_banks,
-                &mut duplicate_slots_to_repair,
-                &mut purge_repair_slot_counter,
-                None,
-                std::slice::from_ref(&replay_result),
-                &Pubkey::default(),
-            );
-            if !new_frozen_slots.is_empty() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(1));
-        }
+        let new_frozen_slots = ReplayStage::process_replay_results(
+            &process_active_banks_context,
+            &mut progress,
+            &mut Vec::new(),
+            &mut latest_validator_votes_for_frozen_banks,
+            &mut duplicate_slots_to_repair,
+            &mut purge_repair_slot_counter,
+            None,
+            std::slice::from_ref(&replay_result),
+            &Pubkey::default(),
+        );
 
         assert_eq!(new_frozen_slots, vec![slot]);
         assert!(bank.is_complete());
@@ -6497,39 +6390,6 @@ pub(crate) mod tests {
                 }
                 verify_result?;
                 Ok(replay_tx_count)
-            });
-            let res = res.and_then(|replay_tx_count| {
-                if !process_active_banks_context
-                    .pending_replay_tick_registrations
-                    .lock()
-                    .unwrap()
-                    .contains_key(&bank1.slot())
-                {
-                    return Ok(replay_tx_count);
-                }
-
-                for _ in 0..1000 {
-                    if let Some(status) = process_active_banks_context
-                        .block_verification
-                        .lock()
-                        .unwrap()
-                        .poll_status(bank1.slot())
-                    {
-                        process_active_banks_context
-                            .pending_replay_tick_registrations
-                            .lock()
-                            .unwrap()
-                            .remove(&bank1.slot());
-                        return blockstore_processor::block_verification_status_result(status)
-                            .map(|_| replay_tx_count);
-                    }
-                    thread::sleep(Duration::from_millis(1));
-                }
-
-                panic!(
-                    "block verification did not finish for slot {}",
-                    bank1.slot()
-                );
             });
             let max_complete_transaction_status_slot = Arc::new(AtomicU64::default());
             let rpc_subscriptions = Arc::new(RpcSubscriptions::new_for_tests(

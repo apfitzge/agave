@@ -1652,9 +1652,7 @@ impl BlockVerificationScheduler {
             {
                 break;
             }
-            let scheduling_start = state
-                .has_transaction_scheduling_work()
-                .then(Instant::now);
+            let scheduling_start = state.has_transaction_scheduling_work().then(Instant::now);
             let state_counts = state.service_transaction_execution_dispatches(
                 &mut dispatch_context,
                 max_executions - counts.scheduled,

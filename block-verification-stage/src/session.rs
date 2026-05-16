@@ -116,6 +116,10 @@ impl ReplayBlockVerification {
     pub fn poll_status(&mut self, slot: Slot) -> Option<BlockVerificationSlotStatus> {
         self.session.poll_status(slot)
     }
+
+    pub fn wait_for_status(&mut self, slot: Slot) -> Option<BlockVerificationSlotStatus> {
+        self.session.wait_for_status(slot, &self.exit)
+    }
 }
 
 impl BlockVerificationSession {
@@ -151,6 +155,14 @@ impl BlockVerificationSession {
             return None;
         }
 
+        self.wait_for_status(slot, exit)
+    }
+
+    pub fn wait_for_status(
+        &mut self,
+        slot: Slot,
+        exit: &AtomicBool,
+    ) -> Option<BlockVerificationSlotStatus> {
         while !exit.load(Ordering::Relaxed) {
             self.clean_remote_free_lists();
             if let Some(status) = self.poll_status(slot) {
