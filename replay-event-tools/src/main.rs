@@ -59,6 +59,7 @@ struct App {
     transaction_index: usize,
     tx_timeline_scroll: u16,
     worker_timeline_scroll: u16,
+    worker_filter: Option<u64>,
     focus: FocusPane,
 }
 
@@ -493,6 +494,10 @@ fn handle_key(app: &mut App, key: KeyEvent, snapshot: &UiSnapshot) -> bool {
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
         KeyCode::Char('q') => return true,
+        KeyCode::Char('a' | 'A') if key.modifiers.is_empty() && app.clear_worker_filter() => {}
+        KeyCode::Char(value) if key.modifiers.is_empty() && app.push_worker_filter_digit(value) => {
+        }
+        KeyCode::Backspace if app.pop_worker_filter_digit() => {}
         KeyCode::Esc | KeyCode::Backspace | KeyCode::Left => app.move_back(),
         KeyCode::Enter | KeyCode::Right => app.move_forward(snapshot),
         KeyCode::Tab => app.next_focus(snapshot),
@@ -509,10 +514,67 @@ fn handle_key(app: &mut App, key: KeyEvent, snapshot: &UiSnapshot) -> bool {
 }
 
 impl App {
+    fn set_selected_slot(&mut self, selected_slot: Option<u64>) -> bool {
+        let changed = self.selected_slot != selected_slot;
+        self.selected_slot = selected_slot;
+        if changed {
+            self.selected_transaction = None;
+            self.transaction_index = 0;
+            self.tx_timeline_scroll = 0;
+            self.worker_timeline_scroll = 0;
+            self.worker_filter = None;
+        }
+        changed
+    }
+
+    fn push_worker_filter_digit(&mut self, value: char) -> bool {
+        if self.focus != FocusPane::WorkerTimeline || !value.is_ascii_digit() {
+            return false;
+        }
+
+        let digit = value.to_digit(10).expect("ascii digit must parse");
+        self.worker_filter = Some(
+            self.worker_filter
+                .unwrap_or_default()
+                .saturating_mul(10)
+                .saturating_add(u64::from(digit)),
+        );
+        self.worker_timeline_scroll = 0;
+        true
+    }
+
+    fn pop_worker_filter_digit(&mut self) -> bool {
+        if self.focus != FocusPane::WorkerTimeline {
+            return false;
+        }
+        let Some(worker_filter) = self.worker_filter else {
+            return false;
+        };
+
+        self.worker_filter = if worker_filter < 10 {
+            None
+        } else {
+            Some(worker_filter / 10)
+        };
+        self.worker_timeline_scroll = 0;
+        true
+    }
+
+    fn clear_worker_filter(&mut self) -> bool {
+        if self.focus != FocusPane::WorkerTimeline || self.worker_filter.is_none() {
+            return false;
+        }
+
+        self.worker_filter = None;
+        self.worker_timeline_scroll = 0;
+        true
+    }
+
     fn sync_slots(&mut self, slots: &[SlotSummary]) -> bool {
         if slots.is_empty() {
-            let changed =
-                self.selected_slot.take().is_some() || self.selected_transaction.take().is_some();
+            let changed = self.selected_slot.take().is_some()
+                || self.selected_transaction.take().is_some()
+                || self.worker_filter.take().is_some();
             self.slot_index = 0;
             self.transaction_index = 0;
             self.tx_timeline_scroll = 0;
@@ -528,11 +590,7 @@ impl App {
         }
 
         self.slot_index = slots.len().saturating_sub(1);
-        self.selected_slot = Some(slots[self.slot_index].slot);
-        self.selected_transaction = None;
-        self.transaction_index = 0;
-        self.tx_timeline_scroll = 0;
-        self.worker_timeline_scroll = 0;
+        self.set_selected_slot(Some(slots[self.slot_index].slot));
         true
     }
 
@@ -619,11 +677,7 @@ impl App {
         match self.focus {
             FocusPane::Slots => {
                 self.slot_index = 0;
-                self.selected_slot = snapshot.slots.first().map(|slot| slot.slot);
-                self.selected_transaction = None;
-                self.transaction_index = 0;
-                self.tx_timeline_scroll = 0;
-                self.worker_timeline_scroll = 0;
+                self.set_selected_slot(snapshot.slots.first().map(|slot| slot.slot));
             }
             FocusPane::Transactions => {
                 self.transaction_index = 0;
@@ -647,11 +701,7 @@ impl App {
         match self.focus {
             FocusPane::Slots => {
                 self.slot_index = snapshot.slots.len().saturating_sub(1);
-                self.selected_slot = snapshot.slots.get(self.slot_index).map(|slot| slot.slot);
-                self.selected_transaction = None;
-                self.transaction_index = 0;
-                self.tx_timeline_scroll = 0;
-                self.worker_timeline_scroll = 0;
+                self.set_selected_slot(snapshot.slots.get(self.slot_index).map(|slot| slot.slot));
             }
             FocusPane::Transactions => {
                 if let Some(slot) = &snapshot.selected_slot {
@@ -670,7 +720,7 @@ impl App {
                     .unwrap_or(u16::MAX);
             }
             FocusPane::WorkerTimeline => {
-                self.worker_timeline_scroll = worker_timeline_line_count(snapshot)
+                self.worker_timeline_scroll = worker_timeline_line_count(snapshot, self.worker_filter)
                     .saturating_sub(1)
                     .try_into()
                     .unwrap_or(u16::MAX);
@@ -682,11 +732,7 @@ impl App {
         match self.focus {
             FocusPane::Slots => {
                 self.slot_index = self.slot_index.saturating_sub(1);
-                self.selected_slot = snapshot.slots.get(self.slot_index).map(|slot| slot.slot);
-                self.selected_transaction = None;
-                self.transaction_index = 0;
-                self.tx_timeline_scroll = 0;
-                self.worker_timeline_scroll = 0;
+                self.set_selected_slot(snapshot.slots.get(self.slot_index).map(|slot| slot.slot));
             }
             FocusPane::Transactions => {
                 self.transaction_index = self.transaction_index.saturating_sub(1);
@@ -710,11 +756,9 @@ impl App {
                         .slot_index
                         .saturating_add(1)
                         .min(snapshot.slots.len().saturating_sub(1));
-                    self.selected_slot = snapshot.slots.get(self.slot_index).map(|slot| slot.slot);
-                    self.selected_transaction = None;
-                    self.transaction_index = 0;
-                    self.tx_timeline_scroll = 0;
-                    self.worker_timeline_scroll = 0;
+                    self.set_selected_slot(
+                        snapshot.slots.get(self.slot_index).map(|slot| slot.slot),
+                    );
                 }
             }
             FocusPane::Transactions => {
@@ -739,11 +783,7 @@ impl App {
         match self.focus {
             FocusPane::Slots => {
                 self.slot_index = self.slot_index.saturating_sub(PAGE_STEP);
-                self.selected_slot = snapshot.slots.get(self.slot_index).map(|slot| slot.slot);
-                self.selected_transaction = None;
-                self.transaction_index = 0;
-                self.tx_timeline_scroll = 0;
-                self.worker_timeline_scroll = 0;
+                self.set_selected_slot(snapshot.slots.get(self.slot_index).map(|slot| slot.slot));
             }
             FocusPane::Transactions => {
                 self.transaction_index = self.transaction_index.saturating_sub(PAGE_STEP);
@@ -771,11 +811,9 @@ impl App {
                         .slot_index
                         .saturating_add(PAGE_STEP)
                         .min(snapshot.slots.len().saturating_sub(1));
-                    self.selected_slot = snapshot.slots.get(self.slot_index).map(|slot| slot.slot);
-                    self.selected_transaction = None;
-                    self.transaction_index = 0;
-                    self.tx_timeline_scroll = 0;
-                    self.worker_timeline_scroll = 0;
+                    self.set_selected_slot(
+                        snapshot.slots.get(self.slot_index).map(|slot| slot.slot),
+                    );
                 }
             }
             FocusPane::Transactions => {
@@ -807,7 +845,7 @@ impl App {
         );
         bound_scroll(
             &mut self.worker_timeline_scroll,
-            worker_timeline_line_count(snapshot),
+            worker_timeline_line_count(snapshot, self.worker_filter),
         );
     }
 }
@@ -1057,9 +1095,9 @@ fn render_tx_timeline(frame: &mut Frame<'_>, area: Rect, app: &App, snapshot: &U
 
 fn render_worker_timeline(frame: &mut Frame<'_>, area: Rect, app: &App, snapshot: &UiSnapshot) {
     frame.render_widget(
-        Paragraph::new(worker_timeline_lines(snapshot))
+        Paragraph::new(worker_timeline_lines(snapshot, app.worker_filter))
             .block(focused_block(
-                "Worker Timeline",
+                worker_timeline_title(app.worker_filter),
                 app.focus == FocusPane::WorkerTimeline,
             ))
             .scroll((app.worker_timeline_scroll, 0)),
@@ -1071,8 +1109,8 @@ fn tx_timeline_line_count(snapshot: &UiSnapshot) -> usize {
     tx_timeline_lines(snapshot).len()
 }
 
-fn worker_timeline_line_count(snapshot: &UiSnapshot) -> usize {
-    worker_timeline_lines(snapshot).len()
+fn worker_timeline_line_count(snapshot: &UiSnapshot, worker_filter: Option<u64>) -> usize {
+    worker_timeline_lines(snapshot, worker_filter).len()
 }
 
 fn tx_timeline_lines(snapshot: &UiSnapshot) -> Vec<Line<'static>> {
@@ -1133,32 +1171,58 @@ fn tx_timeline_lines(snapshot: &UiSnapshot) -> Vec<Line<'static>> {
     lines
 }
 
-fn worker_timeline_lines(snapshot: &UiSnapshot) -> Vec<Line<'static>> {
+fn worker_timeline_lines(
+    snapshot: &UiSnapshot,
+    worker_filter: Option<u64>,
+) -> Vec<Line<'static>> {
     let Some(slot) = &snapshot.selected_slot else {
         return vec![Line::from("waiting for replay events")];
     };
 
     let mut lines = vec![Line::from(format!(
-        "slot={} status={} slot_duration={} transactions={}",
+        "slot={} status={} slot_duration={} transactions={} worker={}",
         slot.slot,
         slot.status,
         slot.duration_ns
             .map(format_duration_ns)
             .unwrap_or_else(|| "-".to_string()),
-        slot.transactions.len()
+        slot.transactions.len(),
+        worker_filter
+            .map(|worker_id| worker_id.to_string())
+            .unwrap_or_else(|| "all".to_string())
     ))];
     lines.push(Line::from(""));
     lines.push(Line::from(format!(
         "{:>14} {:>22} {:>6} {:>8} worker event",
         "delta", "timestamp_ns", "worker", "tx"
     )));
-    if slot.worker_events.is_empty() {
-        lines.push(Line::from("no worker events recorded for selected slot"));
-    } else {
-        lines.extend(slot.worker_events.iter().map(worker_timeline_event_line));
+    let worker_events = slot
+        .worker_events
+        .iter()
+        .filter(|event| worker_filter.is_none_or(|worker_id| event.worker_id == worker_id));
+    let mut has_events = false;
+    for event in worker_events {
+        has_events = true;
+        lines.push(worker_timeline_event_line(event));
+    }
+    if !has_events {
+        lines.push(Line::from(match worker_filter {
+            Some(worker_id) => {
+                format!("no worker events recorded for worker {worker_id} in selected slot")
+            }
+            None => "no worker events recorded for selected slot".to_string(),
+        }));
     }
 
     lines
+}
+
+fn worker_timeline_title(worker_filter: Option<u64>) -> String {
+    if let Some(worker_id) = worker_filter {
+        format!("Worker Timeline worker={worker_id}")
+    } else {
+        "Worker Timeline all".to_string()
+    }
 }
 
 fn timeline_event_line(event: &TimelineEvent) -> Line<'static> {
@@ -1197,7 +1261,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(
         Paragraph::new(
             "Up/Down select  Enter/Right open  Esc/Left back  Tab pane  Home/End jump  PgUp/PgDn \
-             page  q quit",
+             page  Worker pane: digits filter, a all  q quit",
         )
         .block(Block::default().borders(Borders::ALL)),
         area,
@@ -1399,6 +1463,77 @@ mod tests {
     }
 
     #[test]
+    fn worker_timeline_digit_input_filters_worker() {
+        let mut app = App {
+            focus: FocusPane::WorkerTimeline,
+            worker_timeline_scroll: 9,
+            ..App::default()
+        };
+
+        assert!(app.push_worker_filter_digit('1'));
+        assert!(app.push_worker_filter_digit('2'));
+        assert_eq!(app.worker_filter, Some(12));
+        assert_eq!(app.worker_timeline_scroll, 0);
+
+        assert!(app.pop_worker_filter_digit());
+        assert_eq!(app.worker_filter, Some(1));
+        assert!(app.clear_worker_filter());
+        assert_eq!(app.worker_filter, None);
+    }
+
+    #[test]
+    fn worker_filter_resets_when_slot_changes() {
+        let snapshot = UiSnapshot {
+            received_events: 0,
+            skipped_events: 0,
+            slots: (0..3).map(slot_summary).collect(),
+            selected_slot: None,
+        };
+        let mut app = App {
+            selected_slot: Some(1),
+            slot_index: 1,
+            worker_filter: Some(7),
+            focus: FocusPane::Slots,
+            ..App::default()
+        };
+
+        app.move_down(&snapshot);
+
+        assert_eq!(app.selected_slot, Some(2));
+        assert_eq!(app.worker_filter, None);
+    }
+
+    #[test]
+    fn worker_timeline_lines_filter_by_worker() {
+        let mut snapshot = snapshot_with_transactions(&[]);
+        let slot = snapshot.selected_slot.as_mut().unwrap();
+        slot.worker_events = vec![
+            WorkerTimelineEvent {
+                delta_ns: 0,
+                timestamp_ns: 10,
+                worker_id: 3,
+                transaction_index: 7,
+                name: "worker-three",
+                detail: String::new(),
+            },
+            WorkerTimelineEvent {
+                delta_ns: 1,
+                timestamp_ns: 11,
+                worker_id: 4,
+                transaction_index: 8,
+                name: "worker-four",
+                detail: String::new(),
+            },
+        ];
+
+        let rendered = rendered_lines(worker_timeline_lines(&snapshot, Some(3)));
+
+        assert!(rendered.iter().any(|line| line.contains("worker=3")));
+        assert!(rendered.iter().any(|line| line.contains("worker-three")));
+        assert!(!rendered.iter().any(|line| line.contains("worker-four")));
+    }
+
+    #[test]
     fn timeline_lines_include_slot_events_without_transaction() {
         let mut snapshot = snapshot_with_transactions(&[]);
         let slot = snapshot.selected_slot.as_mut().unwrap();
@@ -1416,15 +1551,7 @@ mod tests {
             detail: String::new(),
         });
 
-        let rendered = tx_timeline_lines(&snapshot)
-            .into_iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>();
+        let rendered = rendered_lines(tx_timeline_lines(&snapshot));
         assert!(
             rendered
                 .iter()
@@ -1451,15 +1578,7 @@ mod tests {
             events: Vec::new(),
         });
 
-        let rendered = tx_timeline_lines(&snapshot)
-            .into_iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>();
+        let rendered = rendered_lines(tx_timeline_lines(&snapshot));
         assert!(
             rendered
                 .iter()
@@ -1495,15 +1614,7 @@ mod tests {
             }],
         });
 
-        let rendered = tx_timeline_lines(&snapshot)
-            .into_iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>();
+        let rendered = rendered_lines(tx_timeline_lines(&snapshot));
         assert!(
             rendered
                 .iter()
@@ -1631,7 +1742,7 @@ mod tests {
             .saturating_sub(1)
             .try_into()
             .unwrap();
-        let expected_worker_scroll = worker_timeline_line_count(&snapshot)
+        let expected_worker_scroll = worker_timeline_line_count(&snapshot, app.worker_filter)
             .saturating_sub(1)
             .try_into()
             .unwrap();
@@ -1664,6 +1775,18 @@ mod tests {
                 selected_transaction: None,
             }),
         }
+    }
+
+    fn rendered_lines(lines: Vec<Line<'static>>) -> Vec<String> {
+        lines
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
     }
 
     fn slot_summary(slot: u64) -> SlotSummary {
