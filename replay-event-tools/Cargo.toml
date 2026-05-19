@@ -1,0 +1,15 @@
+[workspace]
+members = ["."]
+resolver = "2"
+
+[package]
+name = "agave-replay-event-viewer"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+agave-scheduling-utils = { path = "../scheduling-utils", features = ["agave-unstable-api"] }
+bs58 = "0.5.1"
+crossterm = "0.28.1"
+ratatui = "0.29.0"
