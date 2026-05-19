@@ -41,28 +41,27 @@ use {
     solana_pubkey::{Pubkey, PubkeyHasherBuilder},
     std::{
         collections::{HashMap, HashSet, VecDeque},
+        hash::BuildHasher,
         num::NonZeroUsize,
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
         },
-        thread,
         time::{Duration, Instant},
     },
 };
 
-const IDLE_SLEEP: Duration = Duration::from_millis(1);
-const INGRESS_MESSAGE_LIMIT: usize = 1024;
-const ENTRY_VERIFICATION_RESULT_LIMIT: usize = 1024;
-const SIGNATURE_VERIFICATION_SUBMISSION_LIMIT: usize = 1024;
-const SIGNATURE_VERIFICATION_RESULT_LIMIT: usize = 1024;
-const SIGNATURE_CHECK_DISPATCH_LIMIT: usize = 1024;
-const TRANSACTION_EXECUTION_DISPATCH_LIMIT: usize = 1024;
-const TRANSACTION_EXECUTION_SCAN_LIMIT: usize = 1024;
+const INGRESS_MESSAGE_LIMIT: usize = 128;
+const ENTRY_VERIFICATION_RESULT_LIMIT: usize = 128;
+const SIGNATURE_VERIFICATION_SUBMISSION_LIMIT: usize = 128;
+const SIGNATURE_VERIFICATION_RESULT_LIMIT: usize = 128;
+const SIGNATURE_CHECK_DISPATCH_LIMIT: usize = 128;
+const TRANSACTION_EXECUTION_DISPATCH_LIMIT: usize = 128;
+const TRANSACTION_EXECUTION_SCAN_LIMIT: usize = 128;
 const MAX_OUTSTANDING_EXECUTIONS_PER_WORKER: usize = 128;
 const MAX_OUTSTANDING_EXECUTION_COST_UNITS_PER_WORKER: u64 = 4_000_000;
-const WORKER_RESPONSE_LIMIT: usize = 1024;
-const TERMINAL_SLOT_CLEANUP_LIMIT: usize = 1024;
+const WORKER_RESPONSE_LIMIT: usize = 128;
+const TERMINAL_SLOT_CLEANUP_LIMIT: usize = 128;
 const SCHEDULING_STATE_POOL_LIMIT: usize = 5;
 const POOLED_ENTRY_HEADERS_CAPACITY: usize = 1024;
 const POOLED_SLOT_WORK_CAPACITY: usize = 50_000;
@@ -78,6 +77,33 @@ const REPLAY_TRANSACTION_EXECUTION_FLAGS: u16 =
     pack_message_flags::EXECUTE | execution_flags::REPLAY;
 
 type PubkeyHashSet = HashSet<Pubkey, PubkeyHasherBuilder>;
+
+fn reserve_vec_capacity<T>(values: &mut Vec<T>, min_capacity: usize) {
+    if values.capacity() < min_capacity {
+        values.reserve(min_capacity.saturating_sub(values.len()));
+    }
+}
+
+fn reserve_vec_deque_capacity<T>(values: &mut VecDeque<T>, min_capacity: usize) {
+    if values.capacity() < min_capacity {
+        values.reserve(min_capacity.saturating_sub(values.len()));
+    }
+}
+
+fn reserve_hash_set_capacity<T: Eq + std::hash::Hash, S: BuildHasher>(
+    values: &mut HashSet<T, S>,
+    min_capacity: usize,
+) {
+    if values.capacity() < min_capacity {
+        values.reserve(min_capacity.saturating_sub(values.len()));
+    }
+}
+
+fn reserve_slab_capacity<T>(values: &mut Slab<T>, min_capacity: usize) {
+    if values.capacity() < min_capacity {
+        values.reserve(min_capacity.saturating_sub(values.len()));
+    }
+}
 
 fn is_check_response_region(
     batch: SharableTransactionBatchRegion,
@@ -193,7 +219,7 @@ impl SchedulingState {
         self.last_entry_hash = last_entry_hash;
         self.entry_headers.clear();
         self.transactions.clear();
-        self.account_locks = ThreadAwareAccountLocks::new(worker_count);
+        self.account_locks.clear_for_threads(worker_count);
         self.pending_transaction_checks.clear();
         self.pending_signature_verification_requests.clear();
         self.pending_signature_verification_transactions.clear();
@@ -216,25 +242,40 @@ impl SchedulingState {
         self.slot = 0;
         self.bank_id = 0;
         self.last_entry_hash = Hash::default();
-        self.entry_headers = Vec::with_capacity(POOLED_ENTRY_HEADERS_CAPACITY);
-        self.transactions = Slab::with_capacity(POOLED_SLOT_WORK_CAPACITY);
-        self.account_locks = ThreadAwareAccountLocks::new(1);
-        self.pending_transaction_checks = VecDeque::with_capacity(POOLED_SLOT_WORK_CAPACITY);
-        self.pending_signature_verification_requests =
-            VecDeque::with_capacity(POOLED_SLOT_WORK_CAPACITY);
-        self.pending_signature_verification_transactions =
-            HashSet::with_capacity(POOLED_SLOT_WORK_CAPACITY);
+        self.entry_headers.clear();
+        reserve_vec_capacity(&mut self.entry_headers, POOLED_ENTRY_HEADERS_CAPACITY);
+        self.transactions.clear();
+        reserve_slab_capacity(&mut self.transactions, POOLED_SLOT_WORK_CAPACITY);
+        self.account_locks.clear_for_threads(1);
+        self.pending_transaction_checks.clear();
+        reserve_vec_deque_capacity(
+            &mut self.pending_transaction_checks,
+            POOLED_SLOT_WORK_CAPACITY,
+        );
+        self.pending_signature_verification_requests.clear();
+        reserve_vec_deque_capacity(
+            &mut self.pending_signature_verification_requests,
+            POOLED_SLOT_WORK_CAPACITY,
+        );
+        self.pending_signature_verification_transactions.clear();
+        reserve_hash_set_capacity(
+            &mut self.pending_signature_verification_transactions,
+            POOLED_SLOT_WORK_CAPACITY,
+        );
         self.in_flight_signature_verifications = 0;
         self.next_ready_transaction_index = 0;
-        self.ready_transactions = VecDeque::with_capacity(POOLED_SLOT_WORK_CAPACITY);
+        self.ready_transactions.clear();
+        reserve_vec_deque_capacity(&mut self.ready_transactions, POOLED_SLOT_WORK_CAPACITY);
         self.ready_scan_cursor = 0;
-        self.unschedulable_read_locks = PubkeyHashSet::with_capacity_and_hasher(
+        self.unschedulable_read_locks.clear();
+        reserve_hash_set_capacity(
+            &mut self.unschedulable_read_locks,
             POOLED_SLOT_WORK_CAPACITY,
-            PubkeyHasherBuilder::default(),
         );
-        self.unschedulable_write_locks = PubkeyHashSet::with_capacity_and_hasher(
+        self.unschedulable_write_locks.clear();
+        reserve_hash_set_capacity(
+            &mut self.unschedulable_write_locks,
             POOLED_SLOT_WORK_CAPACITY,
-            PubkeyHasherBuilder::default(),
         );
         self.ingress_complete = false;
         self.entry_verification = EntryVerificationProgress::default();
@@ -1342,41 +1383,24 @@ impl BlockVerificationScheduler {
 
     pub fn run(mut self) {
         while !self.exit.load(Ordering::Relaxed) {
-            let ingress_count = self.service_ingress_queue(INGRESS_MESSAGE_LIMIT);
-            let entry_verification_count =
-                self.service_entry_verification_results(ENTRY_VERIFICATION_RESULT_LIMIT);
-            let signature_verification_submission_count = self
-                .service_signature_verification_submissions(
-                    SIGNATURE_VERIFICATION_SUBMISSION_LIMIT,
-                );
-            let signature_check_dispatch_count =
-                self.service_transaction_check_dispatches(SIGNATURE_CHECK_DISPATCH_LIMIT);
-            let signature_verification_result_count =
-                self.service_signature_verification_results(SIGNATURE_VERIFICATION_RESULT_LIMIT);
-            let worker_response_count = self.service_worker_responses(WORKER_RESPONSE_LIMIT);
-            let transaction_execution_dispatch_count = self
-                .service_transaction_execution_dispatches(
-                    TRANSACTION_EXECUTION_DISPATCH_LIMIT,
-                    TRANSACTION_EXECUTION_SCAN_LIMIT,
-                );
+            self.service_ingress_queue(INGRESS_MESSAGE_LIMIT);
+            self.service_entry_verification_results(ENTRY_VERIFICATION_RESULT_LIMIT);
+            self.service_signature_verification_submissions(
+                SIGNATURE_VERIFICATION_SUBMISSION_LIMIT,
+            );
+            self.service_transaction_check_dispatches(SIGNATURE_CHECK_DISPATCH_LIMIT);
+            self.service_signature_verification_results(SIGNATURE_VERIFICATION_RESULT_LIMIT);
+            self.service_worker_responses(WORKER_RESPONSE_LIMIT);
+            self.service_transaction_execution_dispatches(
+                TRANSACTION_EXECUTION_DISPATCH_LIMIT,
+                TRANSACTION_EXECUTION_SCAN_LIMIT,
+            );
             self.update_slot_work_timings(Instant::now());
-            let terminal_cleanup_count = self.service_terminal_slots(TERMINAL_SLOT_CLEANUP_LIMIT);
-            let should_sleep = ingress_count == 0
-                && entry_verification_count == 0
-                && signature_verification_submission_count == 0
-                && signature_check_dispatch_count == 0
-                && signature_verification_result_count == 0
-                && worker_response_count == 0
-                && transaction_execution_dispatch_count == 0
-                && terminal_cleanup_count == 0
-                && !self.has_in_flight_slots();
-
-            if should_sleep {
-                thread::sleep(IDLE_SLEEP);
-            }
+            self.service_terminal_slots(TERMINAL_SLOT_CLEANUP_LIMIT);
         }
     }
 
+    #[cfg(test)]
     fn has_in_flight_slots(&self) -> bool {
         !self.scheduling_states.is_empty()
     }
@@ -2621,6 +2645,9 @@ impl BlockVerificationScheduler {
         {
             return None;
         }
+        // Aborted slots do not wait for a replay COMPLETE message, but the
+        // state must still outlive all slot-scoped work that can reference its
+        // allocations.
         if !matches!(terminal_status, SlotTerminalStatus::Aborted) && !state.ingress_complete {
             return None;
         }
@@ -3497,7 +3524,7 @@ mod tests {
             {
                 return;
             }
-            thread::sleep(Duration::from_millis(1));
+            std::thread::sleep(Duration::from_millis(1));
         }
 
         panic!("timed out waiting for entry verification results");
@@ -6566,29 +6593,34 @@ mod tests {
         let (mut scheduler, mut replay_stage) = setup_scheduler_and_replay_stage();
         write_replay_messages(&mut replay_stage, [begin(42), entry(42, 0), abort(42)]);
         assert_eq!(scheduler.service_ingress_queue(3), 3);
+        assert_eq!(scheduler.service_terminal_slots(1), 0);
+        assert!(scheduler.scheduling_states.contains_key(&42));
+        assert!(scheduler.scheduling_state_pool.is_empty());
         wait_for_entry_verification(&mut scheduler, 42);
         assert_eq!(scheduler.service_terminal_slots(1), 1);
 
         assert_eq!(scheduler.scheduling_state_pool.len(), 1);
-        assert_eq!(
+        assert!(
+            scheduler.scheduling_state_pool[0].entry_headers.capacity()
+                >= POOLED_ENTRY_HEADERS_CAPACITY,
+            "entry headers capacity {} is below pooled capacity {}",
             scheduler.scheduling_state_pool[0].entry_headers.capacity(),
             POOLED_ENTRY_HEADERS_CAPACITY,
         );
-        assert_eq!(
-            scheduler.scheduling_state_pool[0].transactions.capacity(),
-            POOLED_SLOT_WORK_CAPACITY,
+        assert!(
+            scheduler.scheduling_state_pool[0].transactions.capacity() >= POOLED_SLOT_WORK_CAPACITY,
         );
-        assert_eq!(
+        assert!(
             scheduler.scheduling_state_pool[0]
                 .pending_transaction_checks
-                .capacity(),
-            POOLED_SLOT_WORK_CAPACITY,
+                .capacity()
+                >= POOLED_SLOT_WORK_CAPACITY,
         );
-        assert_eq!(
+        assert!(
             scheduler.scheduling_state_pool[0]
                 .ready_transactions
-                .capacity(),
-            POOLED_SLOT_WORK_CAPACITY,
+                .capacity()
+                >= POOLED_SLOT_WORK_CAPACITY,
         );
 
         write_replay_messages(&mut replay_stage, [begin(43)]);
@@ -6625,7 +6657,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_shrinks_pooled_scheduling_state_allocations() {
+    fn cleanup_retains_pooled_scheduling_state_allocations() {
         let (mut scheduler, mut replay_stage) = setup_scheduler_and_replay_stage();
         let oversized_capacity = POOLED_SLOT_WORK_CAPACITY * 2;
 
@@ -6648,21 +6680,9 @@ mod tests {
         assert_eq!(scheduler.service_terminal_slots(1), 1);
 
         let pooled_state = &scheduler.scheduling_state_pool[0];
-        assert_eq!(
-            pooled_state.entry_headers.capacity(),
-            POOLED_ENTRY_HEADERS_CAPACITY,
-        );
-        assert_eq!(
-            pooled_state.transactions.capacity(),
-            POOLED_SLOT_WORK_CAPACITY,
-        );
-        assert_eq!(
-            pooled_state.pending_transaction_checks.capacity(),
-            POOLED_SLOT_WORK_CAPACITY,
-        );
-        assert_eq!(
-            pooled_state.ready_transactions.capacity(),
-            POOLED_SLOT_WORK_CAPACITY,
-        );
+        assert!(pooled_state.entry_headers.capacity() >= oversized_capacity);
+        assert!(pooled_state.transactions.capacity() >= oversized_capacity);
+        assert!(pooled_state.pending_transaction_checks.capacity() >= oversized_capacity);
+        assert!(pooled_state.ready_transactions.capacity() >= oversized_capacity);
     }
 }

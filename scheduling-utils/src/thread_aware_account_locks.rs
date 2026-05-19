@@ -79,6 +79,19 @@ impl ThreadAwareAccountLocks {
         }
     }
 
+    /// Clears all locks and updates the number of threads while retaining
+    /// the account-lock map allocation for reuse.
+    pub fn clear_for_threads(&mut self, num_threads: usize) {
+        assert!(num_threads > 0, "num threads must be > 0");
+        assert!(
+            num_threads <= MAX_THREADS,
+            "num threads must be <= {MAX_THREADS}"
+        );
+
+        self.num_threads = num_threads;
+        self.locks.clear();
+    }
+
     /// Returns the `ThreadId` if the accounts are able to be locked
     /// for the given thread, otherwise `None` is returned.
     /// `allowed_threads` is a set of threads that the caller restricts locking to.
