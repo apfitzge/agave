@@ -3087,7 +3087,7 @@ fn active_leader_state(
 
 const STARTING_SLEEP_DURATION: Duration = Duration::from_micros(250);
 const MAX_SLEEP_DURATION: Duration = Duration::from_millis(1);
-const IDLE_SLEEP_THRESHOLD: Duration = Duration::from_millis(1);
+const IDLE_SLEEP_THRESHOLD: Duration = Duration::from_millis(400);
 
 /// Sleeps for the specified time. Returns the next sleep duration to use.
 fn backoff(idle_duration: Duration, sleep_duration: &Duration) -> Duration {
@@ -4162,6 +4162,8 @@ mod tests {
 
     #[test]
     fn test_backoff() {
+        assert_eq!(IDLE_SLEEP_THRESHOLD, Duration::from_millis(400));
+
         let sleep_duration = STARTING_SLEEP_DURATION;
 
         // No idle time - does not increase duration for next sleep.
