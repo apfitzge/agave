@@ -194,6 +194,14 @@ impl TransactionRecord {
                 replay_event_tags::TRANSACTION_SCHEDULED_FOR_EXEC => Some("scheduled"),
                 replay_event_tags::TRANSACTION_SCHEDULING_SKIPPED => Some("skipped"),
                 replay_event_tags::TRANSACTION_READY_FOR_SCHEDULING => Some("ready"),
+                replay_event_tags::TRANSACTION_SIGNATURES_RETURNED => {
+                    if event.signature_verification_result() == Some(false) {
+                        Some("sigverify-failed")
+                    } else {
+                        Some("sigverified")
+                    }
+                }
+                replay_event_tags::TRANSACTION_SIGNATURES_SUBMITTED => Some("sigverifying"),
                 replay_event_tags::TRANSACTION_WORKER_CHECK_COMPLETED => Some("worker-check-done"),
                 replay_event_tags::TRANSACTION_WORKER_CHECK_STATUS_COMPLETE => {
                     Some("worker-check-status")
@@ -263,6 +271,8 @@ pub(crate) fn event_name(tag: u64) -> &'static str {
         replay_event_tags::TRANSACTION_SENT_FOR_CHECK => "tx-sent-for-check",
         replay_event_tags::TRANSACTION_CHECK_FAILED => "tx-check-failed",
         replay_event_tags::TRANSACTION_CHECK_PASSED => "tx-check-passed",
+        replay_event_tags::TRANSACTION_SIGNATURES_SUBMITTED => "tx-signatures-submitted",
+        replay_event_tags::TRANSACTION_SIGNATURES_RETURNED => "tx-signatures-returned",
         replay_event_tags::TRANSACTION_READY_FOR_SCHEDULING => "tx-ready-for-scheduling",
         replay_event_tags::TRANSACTION_WORKER_PICKED_UP => "tx-worker-picked-up",
         replay_event_tags::TRANSACTION_WORKER_CHECK_COMPLETED => "tx-worker-check-completed",

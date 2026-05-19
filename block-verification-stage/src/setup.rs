@@ -1,7 +1,8 @@
 use {
     crate::replay_event_timestamp::ReplayEventTimestampSource,
     agave_scheduler_bindings::{
-        PackToWorkerMessage, ReplayBlockStatusMessage, ReplayToPackMessage, WorkerToPackMessage,
+        PackToWorkerMessage, ReplayBlockStatusMessage, ReplayToPackMessage,
+        SharableTransactionRegion, WorkerToPackMessage,
     },
     agave_scheduling_utils::{
         replay_events::{REPLAY_EVENTS_IPC_FILE, ReplayEvent},
@@ -18,6 +19,9 @@ use {
 const SESSION_ALLOCATOR_HANDLES: usize = 2;
 const ALLOCATOR_SLAB_SIZE: u32 = 2 * 1024 * 1024;
 const REPLAY_EVENT_CAPACITY: usize = 1024 * 1024;
+pub const SIGNATURE_VERIFICATION_WORKER_COUNT: usize = 48;
+const SIGNATURE_VERIFICATION_REQUEST_CAPACITY: usize = 16 * 1024;
+const SIGNATURE_VERIFICATION_RESULT_CAPACITY: usize = 16 * 1024;
 
 const SHMEM_NAME: &std::ffi::CStr = c"agave-block-verification-stage";
 
@@ -38,6 +42,8 @@ pub struct BlockVerificationStageSession {
     pub replay_to_pack: shaq::spsc::Consumer<ReplayToPackMessage>,
     pub replay_block_status: shaq::spsc::Producer<ReplayBlockStatusMessage>,
     pub workers: Vec<BlockVerificationStageWorkerSession>,
+    pub signature_verification_requests: shaq::mpmc::Producer<SignatureVerificationRequest>,
+    pub signature_verification_results: shaq::mpmc::Consumer<SignatureVerificationResult>,
 }
 
 /// Scheduler-owned queue handles for one block verification worker.
@@ -60,11 +66,50 @@ pub struct BlockVerificationWorkerSession {
     pub worker_to_pack: shaq::spsc::Producer<WorkerToPackMessage>,
 }
 
+/// Sigverify-worker-owned queue and allocator handles.
+pub struct SignatureVerificationWorkerSession {
+    pub allocator: Allocator,
+    pub requests: shaq::mpmc::Consumer<SignatureVerificationRequest>,
+    pub results: shaq::mpmc::Producer<SignatureVerificationResult>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct SignatureVerificationRequest {
+    pub slot: u64,
+    pub bank_id: u64,
+    pub transaction_index: usize,
+    pub transaction: SharableTransactionRegion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct SignatureVerificationResult {
+    pub slot: u64,
+    pub transaction_index: usize,
+    pub verified: u8,
+}
+
+impl SignatureVerificationResult {
+    pub fn new(slot: u64, transaction_index: usize, verified: bool) -> Self {
+        Self {
+            slot,
+            transaction_index,
+            verified: u8::from(verified),
+        }
+    }
+
+    pub fn verified(self) -> bool {
+        self.verified != 0
+    }
+}
+
 /// Locally created session pair.
 pub struct BlockVerificationStageSessions {
     pub block_verification_stage: BlockVerificationStageSession,
     pub replay_stage: ReplayStageSession,
     pub workers: Vec<BlockVerificationWorkerSession>,
+    pub signature_verification_workers: Vec<SignatureVerificationWorkerSession>,
 }
 
 /// Locally created replay event broadcast.
@@ -101,16 +146,30 @@ impl BlockVerificationStageSessions {
     /// Creates the allocator and queues for an in-process block verification stage.
     pub fn setup(config: BlockVerificationStageSetupConfig) -> Result<Self, SetupError> {
         let (allocator_file, block_verification_allocator, replay_stage_allocator) =
-            create_allocator(config.allocator_size, config.worker_count)?;
+            create_allocator(
+                config.allocator_size,
+                config.worker_count,
+                SIGNATURE_VERIFICATION_WORKER_COUNT,
+            )?;
         let (replay_to_pack_producer, replay_to_pack_consumer) =
             create_queue_pair(config.replay_to_pack_capacity, true)?;
         let (replay_block_status_producer, replay_block_status_consumer) =
             create_queue_pair(config.replay_block_status_capacity, false)?;
+        let (signature_verification_request_producer, signature_verification_request_consumer) =
+            create_mpmc_queue_pair(SIGNATURE_VERIFICATION_REQUEST_CAPACITY, true)?;
+        let (signature_verification_result_producer, signature_verification_result_consumer) =
+            create_mpmc_queue_pair(SIGNATURE_VERIFICATION_RESULT_CAPACITY, true)?;
         let (block_verification_workers, workers) = create_worker_sessions(
             &allocator_file,
             config.worker_count,
             config.pack_to_worker_capacity,
             config.worker_to_pack_capacity,
+        )?;
+        let signature_verification_workers = create_signature_verification_worker_sessions(
+            &allocator_file,
+            SIGNATURE_VERIFICATION_WORKER_COUNT,
+            signature_verification_request_consumer,
+            signature_verification_result_producer,
         )?;
 
         Ok(Self {
@@ -119,6 +178,8 @@ impl BlockVerificationStageSessions {
                 replay_to_pack: replay_to_pack_consumer,
                 replay_block_status: replay_block_status_producer,
                 workers: block_verification_workers,
+                signature_verification_requests: signature_verification_request_producer,
+                signature_verification_results: signature_verification_result_consumer,
             },
             replay_stage: ReplayStageSession {
                 allocator: replay_stage_allocator,
@@ -126,6 +187,7 @@ impl BlockVerificationStageSessions {
                 replay_block_status: replay_block_status_consumer,
             },
             workers,
+            signature_verification_workers,
         })
     }
 }
@@ -135,8 +197,12 @@ pub type SetupError = SharedMemoryError;
 fn create_allocator(
     allocator_size: usize,
     worker_count: usize,
+    signature_verification_worker_count: usize,
 ) -> Result<(File, Allocator, Allocator), SetupError> {
-    let allocator_handles = SESSION_ALLOCATOR_HANDLES.checked_add(worker_count).unwrap();
+    let allocator_handles = SESSION_ALLOCATOR_HANDLES
+        .checked_add(worker_count)
+        .and_then(|count| count.checked_add(signature_verification_worker_count))
+        .unwrap();
     let (file, block_verification_allocator) = shared_memory::create_allocator(
         SHMEM_NAME,
         allocator_size,
@@ -153,6 +219,13 @@ fn create_queue_pair<T>(
     huge: bool,
 ) -> Result<(shaq::spsc::Producer<T>, shaq::spsc::Consumer<T>), SetupError> {
     shared_memory::create_queue_pair(SHMEM_NAME, capacity, huge)
+}
+
+fn create_mpmc_queue_pair<T>(
+    capacity: usize,
+    huge: bool,
+) -> Result<(shaq::mpmc::Producer<T>, shaq::mpmc::Consumer<T>), SetupError> {
+    shared_memory::create_mpmc_queue_pair(SHMEM_NAME, capacity, huge)
 }
 
 fn create_worker_sessions(
@@ -192,6 +265,23 @@ fn create_worker_sessions(
             Ok((block_verification_workers, workers))
         },
     )
+}
+
+fn create_signature_verification_worker_sessions(
+    allocator_file: &File,
+    worker_count: usize,
+    requests: shaq::mpmc::Consumer<SignatureVerificationRequest>,
+    results: shaq::mpmc::Producer<SignatureVerificationResult>,
+) -> Result<Vec<SignatureVerificationWorkerSession>, SetupError> {
+    (0..worker_count)
+        .map(|_| {
+            Ok(SignatureVerificationWorkerSession {
+                allocator: Allocator::join(allocator_file)?,
+                requests: requests.clone(),
+                results: results.clone(),
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -250,6 +340,7 @@ mod tests {
                         bank: ReplayBankMessage {
                             kind: replay_bank_message_kinds::BEGIN,
                             slot: 42,
+                            bank_id: 42,
                             last_entry_hash: [0; 32],
                         },
                     },

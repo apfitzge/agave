@@ -91,6 +91,27 @@ pub fn create_queue_pair<T>(
     Ok((producer, consumer))
 }
 
+pub fn create_mpmc_queue_pair<T>(
+    name: &CStr,
+    capacity: usize,
+    huge: bool,
+) -> Result<(shaq::mpmc::Producer<T>, shaq::mpmc::Consumer<T>), SharedMemoryError> {
+    let create = |huge: bool| {
+        let file = create_shmem(name, huge)?;
+        let minimum_file_size = shaq::mpmc::minimum_file_size::<T>(capacity);
+        let file_size = align_file_size(minimum_file_size, huge);
+        let producer = unsafe { shaq::mpmc::Producer::create(&file, file_size) }?;
+        let consumer = unsafe { shaq::mpmc::Consumer::join(&file) }?;
+
+        Ok((producer, consumer))
+    };
+
+    match huge {
+        true => create(true).or_else(|_| create(false)),
+        false => create(false),
+    }
+}
+
 pub fn create_broadcast_producer_at_path<T>(
     path: &Path,
     capacity: usize,

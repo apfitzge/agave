@@ -5,7 +5,7 @@ use {
         ReplayToPackMessagePayload, SharableTransactionRegion, replay_bank_message_kinds,
         replay_block_status_codes, replay_block_status_reasons, replay_to_pack_message_types,
     },
-    solana_clock::Slot,
+    solana_clock::{BankId, Slot},
     solana_entry::entry::Entry,
     solana_hash::Hash,
     std::{
@@ -84,16 +84,18 @@ impl ReplayBlockVerification {
 
     pub fn submit_entries_and_wait(
         &mut self,
+        bank_id: BankId,
         slot: Slot,
         last_entry_hash: Hash,
         entries: &[Entry],
     ) -> Option<BlockVerificationSlotStatus> {
         self.session
-            .submit_entries_and_wait(slot, last_entry_hash, entries, &self.exit)
+            .submit_entries_and_wait(bank_id, slot, last_entry_hash, entries, &self.exit)
     }
 
-    pub fn begin_slot(&mut self, slot: Slot, last_entry_hash: Hash) -> bool {
-        self.session.begin_slot(slot, last_entry_hash, &self.exit)
+    pub fn begin_slot(&mut self, bank_id: BankId, slot: Slot, last_entry_hash: Hash) -> bool {
+        self.session
+            .begin_slot(bank_id, slot, last_entry_hash, &self.exit)
     }
 
     pub fn send_entry(&mut self, slot: Slot, entry: &Entry) -> bool {
@@ -136,13 +138,14 @@ impl BlockVerificationSession {
 
     pub fn submit_entries_and_wait(
         &mut self,
+        bank_id: BankId,
         slot: Slot,
         last_entry_hash: Hash,
         entries: &[Entry],
         exit: &AtomicBool,
     ) -> Option<BlockVerificationSlotStatus> {
         self.clean_remote_free_lists();
-        if !self.begin_slot(slot, last_entry_hash, exit) {
+        if !self.begin_slot(bank_id, slot, last_entry_hash, exit) {
             return None;
         }
         for entry in entries {
@@ -174,7 +177,13 @@ impl BlockVerificationSession {
         None
     }
 
-    pub fn begin_slot(&mut self, slot: Slot, last_entry_hash: Hash, exit: &AtomicBool) -> bool {
+    pub fn begin_slot(
+        &mut self,
+        bank_id: BankId,
+        slot: Slot,
+        last_entry_hash: Hash,
+        exit: &AtomicBool,
+    ) -> bool {
         if self
             .slot_statuses
             .get(&slot)
@@ -189,6 +198,7 @@ impl BlockVerificationSession {
                 bank: ReplayBankMessage {
                     kind: replay_bank_message_kinds::BEGIN,
                     slot,
+                    bank_id,
                     last_entry_hash: last_entry_hash.to_bytes(),
                 },
             },
@@ -265,6 +275,7 @@ impl BlockVerificationSession {
                 bank: ReplayBankMessage {
                     kind: replay_bank_message_kinds::COMPLETE,
                     slot,
+                    bank_id: 0,
                     last_entry_hash: [0; 32],
                 },
             },
@@ -279,6 +290,7 @@ impl BlockVerificationSession {
                 bank: ReplayBankMessage {
                     kind: replay_bank_message_kinds::ABORT,
                     slot,
+                    bank_id: 0,
                     last_entry_hash: [0; 32],
                 },
             },

@@ -469,6 +469,9 @@ fn timeline_event_detail(event: &ReplayEvent) -> String {
     if let Some(worker_queue_len) = event.worker_queue_len() {
         details.push(format!("queue_len={worker_queue_len}"));
     }
+    if let Some(verified) = event.signature_verification_result() {
+        details.push(format!("verified={verified}"));
+    }
     if let Some(reason) = event.slot_failure_reason() {
         details.push(format!("reason={reason}"));
     }

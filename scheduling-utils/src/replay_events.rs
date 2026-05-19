@@ -81,6 +81,12 @@ pub mod replay_event_tags {
     ///
     /// Payload includes `worker_id: u64`.
     pub const TRANSACTION_WORKER_EXECUTION_COMPLETED: u64 = 15;
+    /// Transaction signatures were submitted for Agave-side verification.
+    pub const TRANSACTION_SIGNATURES_SUBMITTED: u64 = 16;
+    /// Agave-side signature verification returned for a transaction.
+    ///
+    /// Payload includes `verified: u64`.
+    pub const TRANSACTION_SIGNATURES_RETURNED: u64 = 17;
     /// Replay worker acquired the check bank.
     ///
     /// Payload includes `worker_id: u64`.
@@ -153,6 +159,7 @@ const TRANSACTION_INDEX_OFFSET: usize = SLOT_REASON_OFFSET;
 const SIGNATURE_OFFSET: usize = TRANSACTION_INDEX_OFFSET + core::mem::size_of::<u64>();
 const WORKER_ID_OFFSET: usize = SIGNATURE_OFFSET;
 const WORKER_QUEUE_LENGTH_OFFSET: usize = WORKER_ID_OFFSET + core::mem::size_of::<u64>();
+const SIGNATURE_VERIFICATION_RESULT_OFFSET: usize = SIGNATURE_OFFSET;
 
 impl ReplayEvent {
     pub fn slot_begin(timestamp_ns: u64, slot: u64) -> Self {
@@ -199,6 +206,22 @@ impl ReplayEvent {
         let mut event = Self::new(timestamp_ns, tag);
         event.write_u64(SLOT_OFFSET, slot);
         event.write_u64(TRANSACTION_INDEX_OFFSET, transaction_index);
+        event
+    }
+
+    pub fn transaction_signatures_returned(
+        timestamp_ns: u64,
+        slot: u64,
+        transaction_index: u64,
+        verified: bool,
+    ) -> Self {
+        let mut event = Self::transaction_event(
+            timestamp_ns,
+            replay_event_tags::TRANSACTION_SIGNATURES_RETURNED,
+            slot,
+            transaction_index,
+        );
+        event.write_u64(SIGNATURE_VERIFICATION_RESULT_OFFSET, u64::from(verified));
         event
     }
 
@@ -267,6 +290,14 @@ impl ReplayEvent {
         let mut signature = [0; 64];
         signature.copy_from_slice(&self.payload[SIGNATURE_OFFSET..]);
         Some(signature)
+    }
+
+    pub fn signature_verification_result(&self) -> Option<bool> {
+        if self.tag != replay_event_tags::TRANSACTION_SIGNATURES_RETURNED {
+            return None;
+        }
+
+        Some(self.read_u64(SIGNATURE_VERIFICATION_RESULT_OFFSET) != 0)
     }
 
     fn slot_event(timestamp_ns: u64, tag: u64, slot: u64) -> Self {
@@ -349,6 +380,8 @@ pub const fn is_transaction_event_tag(tag: u64) -> bool {
             | replay_event_tags::TRANSACTION_SENT_FOR_CHECK
             | replay_event_tags::TRANSACTION_CHECK_FAILED
             | replay_event_tags::TRANSACTION_CHECK_PASSED
+            | replay_event_tags::TRANSACTION_SIGNATURES_SUBMITTED
+            | replay_event_tags::TRANSACTION_SIGNATURES_RETURNED
             | replay_event_tags::TRANSACTION_READY_FOR_SCHEDULING
             | replay_event_tags::TRANSACTION_WORKER_PICKED_UP
             | replay_event_tags::TRANSACTION_WORKER_CHECK_COMPLETED

@@ -72,6 +72,9 @@ pub struct ExecutionFlags {
     /// Used to skip recording transactions into PoH.
     /// This is useful for replay where we simply commit the transactions.
     pub skip_poh_recording: bool,
+
+    /// Whether transaction signatures were verified before commit.
+    pub transactions_verified: bool,
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -181,6 +184,7 @@ impl Consumer {
                 skip_cost_tracking: false,
                 add_only_cost_tracking: false,
                 skip_poh_recording: false,
+                transactions_verified: true,
             },
         );
 
@@ -478,7 +482,7 @@ impl Consumer {
                 balance_collector,
                 &mut execute_and_commit_timings,
                 &processed_counts,
-                true, // for block-production assume transactions are verified
+                flags.transactions_verified,
             )
         } else {
             (
@@ -729,6 +733,7 @@ mod tests {
             skip_cost_tracking: false,
             add_only_cost_tracking: true,
             skip_poh_recording: true,
+            transactions_verified: false,
         }
     }
 
@@ -1028,6 +1033,7 @@ mod tests {
                 skip_cost_tracking: false,
                 add_only_cost_tracking: false,
                 skip_poh_recording: false,
+                transactions_verified: true,
             },
         );
 
@@ -1088,6 +1094,7 @@ mod tests {
                 skip_cost_tracking: false,
                 add_only_cost_tracking: false,
                 skip_poh_recording: true,
+                transactions_verified: true,
             },
         );
 
@@ -1137,6 +1144,7 @@ mod tests {
                 skip_cost_tracking: false,
                 add_only_cost_tracking: false,
                 skip_poh_recording: true,
+                transactions_verified: true,
             },
         );
 
@@ -1324,6 +1332,7 @@ mod tests {
                     skip_cost_tracking: false, // track costs
                     add_only_cost_tracking: false,
                     skip_poh_recording: false,
+                    transactions_verified: true,
                 },
             );
         let ExecuteAndCommitTransactionsOutput {
@@ -1358,6 +1367,7 @@ mod tests {
                 skip_cost_tracking: true,
                 add_only_cost_tracking: false,
                 skip_poh_recording: false,
+                transactions_verified: true,
             },
         );
 

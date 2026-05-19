@@ -195,6 +195,11 @@ pub struct ReplayBankMessage {
     pub kind: u8,
     /// Bank slot.
     pub slot: u64,
+    /// Bank id.
+    ///
+    /// This is required for replay vote verification messages. It is only
+    /// meaningful for [`replay_bank_message_kinds::BEGIN`].
+    pub bank_id: u64,
     /// Starting hash for verifying the slot's entry chain when `kind` is
     /// [`replay_bank_message_kinds::BEGIN`].
     ///

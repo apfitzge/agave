@@ -5,7 +5,7 @@ use {
         },
         setup::{
             BlockVerificationStageSession, BlockVerificationStageWorkerSession,
-            ReplayEventBroadcast,
+            ReplayEventBroadcast, SignatureVerificationRequest, SignatureVerificationResult,
         },
     },
     agave_scheduler_bindings::{
@@ -54,6 +54,8 @@ use {
 const IDLE_SLEEP: Duration = Duration::from_millis(1);
 const INGRESS_MESSAGE_LIMIT: usize = 1024;
 const ENTRY_VERIFICATION_RESULT_LIMIT: usize = 1024;
+const SIGNATURE_VERIFICATION_SUBMISSION_LIMIT: usize = 1024;
+const SIGNATURE_VERIFICATION_RESULT_LIMIT: usize = 1024;
 const SIGNATURE_CHECK_DISPATCH_LIMIT: usize = 1024;
 const TRANSACTION_EXECUTION_DISPATCH_LIMIT: usize = 1024;
 const TRANSACTION_EXECUTION_SCAN_LIMIT: usize = 1024;
@@ -69,7 +71,6 @@ const CHECK_TRANSACTION_BATCH_ALLOCATION_SIZE: u32 =
 const EXECUTION_TRANSACTION_BATCH_ALLOCATION_SIZE: u32 =
     TransactionPtrBatch::<PendingWorkerExecution>::TRANSACTION_META_END as u32;
 const REPLAY_TRANSACTION_CHECK_FLAGS: u16 = pack_message_flags::CHECK
-    | check_flags::VERIFY_SIGNATURES
     | check_flags::LOAD_ADDRESS_LOOKUP_TABLES
     | check_flags::ESTIMATE_COST
     | check_flags::REPLAY;
@@ -99,7 +100,6 @@ fn is_execution_response_region(
 fn check_response_is_invalid(response: &CheckResponse) -> bool {
     response.parsing_and_sanitization_flags & parsing_and_sanitization_flags::FAILED != 0
         || response.signature_verification_flags & signature_verification_flags::FAILED != 0
-        || response.signature_verification_flags & signature_verification_flags::PERFORMED == 0
         || response.resolve_flags & resolve_flags::FAILED != 0
         || response.resolve_flags & resolve_flags::PERFORMED == 0
 }
@@ -126,11 +126,15 @@ pub struct BlockVerificationScheduler {
 
 struct SchedulingState {
     slot: u64,
+    bank_id: u64,
     last_entry_hash: Hash,
     entry_headers: Vec<EntryHeader>,
     transactions: Slab<TransactionState>,
     account_locks: ThreadAwareAccountLocks,
     pending_transaction_checks: VecDeque<PendingTransactionCheck>,
+    pending_signature_verification_requests: VecDeque<PendingSignatureVerificationRequest>,
+    pending_signature_verification_transactions: HashSet<usize>,
+    in_flight_signature_verifications: usize,
     next_ready_transaction_index: usize,
     ready_transactions: VecDeque<usize>,
     ready_scan_cursor: usize,
@@ -148,14 +152,18 @@ struct SchedulingState {
 }
 
 impl SchedulingState {
-    fn new(slot: u64, last_entry_hash: Hash, worker_count: usize) -> Self {
+    fn new(slot: u64, bank_id: u64, last_entry_hash: Hash, worker_count: usize) -> Self {
         Self {
             slot,
+            bank_id,
             last_entry_hash,
             entry_headers: Vec::new(),
             transactions: Slab::new(),
             account_locks: ThreadAwareAccountLocks::new(worker_count),
             pending_transaction_checks: VecDeque::new(),
+            pending_signature_verification_requests: VecDeque::new(),
+            pending_signature_verification_transactions: HashSet::new(),
+            in_flight_signature_verifications: 0,
             next_ready_transaction_index: 0,
             ready_transactions: VecDeque::new(),
             ready_scan_cursor: 0,
@@ -173,13 +181,23 @@ impl SchedulingState {
         }
     }
 
-    fn reset_for_slot(&mut self, slot: u64, last_entry_hash: Hash, worker_count: usize) {
+    fn reset_for_slot(
+        &mut self,
+        slot: u64,
+        bank_id: u64,
+        last_entry_hash: Hash,
+        worker_count: usize,
+    ) {
         self.slot = slot;
+        self.bank_id = bank_id;
         self.last_entry_hash = last_entry_hash;
         self.entry_headers.clear();
         self.transactions.clear();
         self.account_locks = ThreadAwareAccountLocks::new(worker_count);
         self.pending_transaction_checks.clear();
+        self.pending_signature_verification_requests.clear();
+        self.pending_signature_verification_transactions.clear();
+        self.in_flight_signature_verifications = 0;
         self.next_ready_transaction_index = 0;
         self.ready_transactions.clear();
         self.reset_ready_scan();
@@ -196,11 +214,17 @@ impl SchedulingState {
 
     fn clear_for_pool(&mut self) {
         self.slot = 0;
+        self.bank_id = 0;
         self.last_entry_hash = Hash::default();
         self.entry_headers = Vec::with_capacity(POOLED_ENTRY_HEADERS_CAPACITY);
         self.transactions = Slab::with_capacity(POOLED_SLOT_WORK_CAPACITY);
         self.account_locks = ThreadAwareAccountLocks::new(1);
         self.pending_transaction_checks = VecDeque::with_capacity(POOLED_SLOT_WORK_CAPACITY);
+        self.pending_signature_verification_requests =
+            VecDeque::with_capacity(POOLED_SLOT_WORK_CAPACITY);
+        self.pending_signature_verification_transactions =
+            HashSet::with_capacity(POOLED_SLOT_WORK_CAPACITY);
+        self.in_flight_signature_verifications = 0;
         self.next_ready_transaction_index = 0;
         self.ready_transactions = VecDeque::with_capacity(POOLED_SLOT_WORK_CAPACITY);
         self.ready_scan_cursor = 0;
@@ -534,9 +558,71 @@ impl SchedulingState {
     fn has_outstanding_work(&self) -> bool {
         self.in_flight_worker_messages != 0
             || self.in_flight_execution_messages != 0
+            || self.in_flight_signature_verifications != 0
             || self.entry_verification.pending_jobs != 0
             || !self.pending_transaction_checks.is_empty()
+            || !self.pending_signature_verification_requests.is_empty()
             || !self.ready_transactions.is_empty()
+    }
+
+    fn transaction_has_pending_signature_verification(&self, transaction_index: usize) -> bool {
+        self.pending_signature_verification_transactions
+            .contains(&transaction_index)
+    }
+
+    fn retain_executed_transaction_pending_signature_verification(
+        &mut self,
+        transaction_index: usize,
+        previous_transaction_state: TransactionState,
+    ) {
+        let TransactionState::InFlight {
+            transaction,
+            resolved_pubkeys,
+            check_response,
+            ..
+        } = previous_transaction_state
+        else {
+            panic!("executed transaction was not in-flight");
+        };
+        let transaction_state = self
+            .transactions
+            .get_mut(transaction_index)
+            .expect("executed transaction must exist");
+        assert!(
+            matches!(transaction_state, TransactionState::Executed),
+            "executed transaction retention must replace executed sentinel",
+        );
+        *transaction_state = TransactionState::ExecutedPendingSignatureVerification {
+            transaction,
+            resolved_pubkeys,
+            check_response,
+        };
+    }
+
+    fn finish_signature_verification(
+        &mut self,
+        transaction_index: usize,
+    ) -> Option<TransactionState> {
+        assert!(
+            self.pending_signature_verification_transactions
+                .remove(&transaction_index),
+            "signature verification result for untracked transaction",
+        );
+        let transaction_state = self
+            .transactions
+            .get_mut(transaction_index)
+            .expect("signature verification result for unknown transaction");
+        if !matches!(
+            transaction_state,
+            TransactionState::ExecutedPendingSignatureVerification { .. }
+        ) {
+            return None;
+        }
+
+        Some(core::mem::replace(
+            transaction_state,
+            TransactionState::Executed,
+        ))
     }
 
     fn start_work_timing(&mut self) {
@@ -1010,6 +1096,11 @@ struct PendingTransactionCheck {
     transaction_index: usize,
 }
 
+#[derive(Clone, Copy)]
+struct PendingSignatureVerificationRequest {
+    transaction_index: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TransactionCostMetadata {
     cost_model_flags: u8,
@@ -1064,6 +1155,11 @@ enum TransactionState {
         ingest_time: Instant,
         thread_id: ThreadId,
     },
+    ExecutedPendingSignatureVerification {
+        transaction: SanitizedTransactionView<TransactionPtr>,
+        resolved_pubkeys: Option<PubkeysPtr>,
+        check_response: CheckResponse,
+    },
     Executed,
     Transitioning,
 }
@@ -1074,7 +1170,12 @@ impl TransactionState {
     }
 
     fn is_in_flight_or_executed(&self) -> bool {
-        matches!(self, Self::InFlight { .. } | Self::Executed)
+        matches!(
+            self,
+            Self::InFlight { .. }
+                | Self::ExecutedPendingSignatureVerification { .. }
+                | Self::Executed
+        )
     }
 
     fn transaction_ptr(&self) -> &TransactionPtr {
@@ -1082,6 +1183,9 @@ impl TransactionState {
             Self::Pending { transaction, .. } => transaction,
             Self::Checked { transaction, .. } => transaction.inner_data(),
             Self::InFlight { transaction, .. } => transaction.inner_data(),
+            Self::ExecutedPendingSignatureVerification { transaction, .. } => {
+                transaction.inner_data()
+            }
             Self::Executed => panic!("transaction state is executed"),
             Self::Transitioning => panic!("transaction state is transitioning"),
         }
@@ -1091,6 +1195,9 @@ impl TransactionState {
         match self {
             Self::Checked { transaction, .. } | Self::InFlight { transaction, .. } => transaction,
             Self::Pending { .. } => panic!("transaction state is pending"),
+            Self::ExecutedPendingSignatureVerification { .. } => {
+                panic!("transaction state is executed")
+            }
             Self::Executed => panic!("transaction state is executed"),
             Self::Transitioning => panic!("transaction state is transitioning"),
         }
@@ -1107,6 +1214,9 @@ impl TransactionState {
                 .as_ref()
                 .map(PubkeysPtr::as_slice)
                 .unwrap_or_default(),
+            Self::ExecutedPendingSignatureVerification { .. } => {
+                panic!("transaction state is executed")
+            }
             Self::Pending { .. } => panic!("transaction state is pending"),
             Self::Executed => panic!("transaction state is executed"),
             Self::Transitioning => panic!("transaction state is transitioning"),
@@ -1123,6 +1233,9 @@ impl TransactionState {
                 scheduling_metadata,
                 ..
             } => scheduling_metadata,
+            Self::ExecutedPendingSignatureVerification { .. } => {
+                panic!("transaction state is executed")
+            }
             Self::Pending { .. } => panic!("transaction state is pending"),
             Self::Executed => panic!("transaction state is executed"),
             Self::Transitioning => panic!("transaction state is transitioning"),
@@ -1138,6 +1251,9 @@ impl TransactionState {
             Self::Pending { ingest_time, .. }
             | Self::Checked { ingest_time, .. }
             | Self::InFlight { ingest_time, .. } => *ingest_time,
+            Self::ExecutedPendingSignatureVerification { .. } => {
+                panic!("transaction state is executed")
+            }
             Self::Executed => panic!("transaction state is executed"),
             Self::Transitioning => panic!("transaction state is transitioning"),
         }
@@ -1229,8 +1345,14 @@ impl BlockVerificationScheduler {
             let ingress_count = self.service_ingress_queue(INGRESS_MESSAGE_LIMIT);
             let entry_verification_count =
                 self.service_entry_verification_results(ENTRY_VERIFICATION_RESULT_LIMIT);
+            let signature_verification_submission_count = self
+                .service_signature_verification_submissions(
+                    SIGNATURE_VERIFICATION_SUBMISSION_LIMIT,
+                );
             let signature_check_dispatch_count =
                 self.service_transaction_check_dispatches(SIGNATURE_CHECK_DISPATCH_LIMIT);
+            let signature_verification_result_count =
+                self.service_signature_verification_results(SIGNATURE_VERIFICATION_RESULT_LIMIT);
             let worker_response_count = self.service_worker_responses(WORKER_RESPONSE_LIMIT);
             let transaction_execution_dispatch_count = self
                 .service_transaction_execution_dispatches(
@@ -1241,7 +1363,9 @@ impl BlockVerificationScheduler {
             let terminal_cleanup_count = self.service_terminal_slots(TERMINAL_SLOT_CLEANUP_LIMIT);
             let should_sleep = ingress_count == 0
                 && entry_verification_count == 0
+                && signature_verification_submission_count == 0
                 && signature_check_dispatch_count == 0
+                && signature_verification_result_count == 0
                 && worker_response_count == 0
                 && transaction_execution_dispatch_count == 0
                 && terminal_cleanup_count == 0
@@ -1301,6 +1425,20 @@ impl BlockVerificationScheduler {
             tag,
             slot,
             transaction_index,
+        ));
+    }
+
+    fn emit_transaction_signatures_returned_event(
+        &self,
+        slot: u64,
+        transaction_index: usize,
+        verified: bool,
+    ) {
+        self.emit_event(ReplayEvent::transaction_signatures_returned(
+            0,
+            slot,
+            u64::try_from(transaction_index).expect("transaction index must fit in u64"),
+            verified,
         ));
     }
 
@@ -1478,16 +1616,18 @@ impl BlockVerificationScheduler {
 
     fn handle_bank_message(&mut self, message: ReplayBankMessage) {
         match message.kind {
-            replay_bank_message_kinds::BEGIN => {
-                self.handle_bank_begin(message.slot, Hash::new_from_array(message.last_entry_hash))
-            }
+            replay_bank_message_kinds::BEGIN => self.handle_bank_begin(
+                message.slot,
+                message.bank_id,
+                Hash::new_from_array(message.last_entry_hash),
+            ),
             replay_bank_message_kinds::COMPLETE => self.handle_bank_complete(message.slot),
             replay_bank_message_kinds::ABORT => self.handle_bank_abort(message.slot),
             kind => panic!("unknown replay bank message kind: {kind}"),
         }
     }
 
-    fn handle_bank_begin(&mut self, slot: u64, last_entry_hash: Hash) {
+    fn handle_bank_begin(&mut self, slot: u64, bank_id: u64, last_entry_hash: Hash) {
         assert!(
             !self.scheduling_states.contains_key(&slot),
             "slot already has scheduling state: {slot}",
@@ -1497,8 +1637,8 @@ impl BlockVerificationScheduler {
         let mut state = self
             .scheduling_state_pool
             .pop()
-            .unwrap_or_else(|| SchedulingState::new(slot, last_entry_hash, worker_count));
-        state.reset_for_slot(slot, last_entry_hash, worker_count);
+            .unwrap_or_else(|| SchedulingState::new(slot, bank_id, last_entry_hash, worker_count));
+        state.reset_for_slot(slot, bank_id, last_entry_hash, worker_count);
 
         let previous = self.scheduling_states.insert(slot, state);
         assert!(
@@ -1614,6 +1754,15 @@ impl BlockVerificationScheduler {
         state
             .pending_transaction_checks
             .push_back(PendingTransactionCheck { transaction_index });
+        state
+            .pending_signature_verification_requests
+            .push_back(PendingSignatureVerificationRequest { transaction_index });
+        assert!(
+            state
+                .pending_signature_verification_transactions
+                .insert(transaction_index),
+            "transaction index must be new to signature verification tracking",
+        );
         if let Some(signature) = signature {
             self.emit_transaction_ingested_event(slot, transaction_index, signature);
         }
@@ -1712,6 +1861,139 @@ impl BlockVerificationScheduler {
         }
 
         state.pending_transaction_checks.front().copied()
+    }
+
+    fn service_signature_verification_submissions(&mut self, max_submissions: usize) -> usize {
+        if max_submissions == 0 {
+            return 0;
+        }
+
+        let mut submitted = 0;
+        for slot_index in 0..self.slot_order.len() {
+            let slot = self.slot_order[slot_index];
+            while submitted < max_submissions
+                && self.has_pending_signature_verification_requests(slot)
+            {
+                let Some(pending_request) = self.pending_signature_verification_request(slot)
+                else {
+                    break;
+                };
+                let request = self.signature_verification_request(slot, pending_request);
+                if self
+                    .session
+                    .signature_verification_requests
+                    .try_write(request)
+                    .is_err()
+                {
+                    return submitted;
+                }
+
+                {
+                    let state = self.scheduling_state_mut(slot);
+                    state.pending_signature_verification_requests.pop_front();
+                    state.in_flight_signature_verifications += 1;
+                }
+                self.emit_transaction_event(
+                    replay_event_tags::TRANSACTION_SIGNATURES_SUBMITTED,
+                    slot,
+                    pending_request.transaction_index,
+                );
+                submitted += 1;
+            }
+            if submitted == max_submissions {
+                break;
+            }
+        }
+
+        submitted
+    }
+
+    fn has_pending_signature_verification_requests(&self, slot: u64) -> bool {
+        self.scheduling_states
+            .get(&slot)
+            .filter(|state| state.allows_transaction_processing())
+            .is_some_and(|state| !state.pending_signature_verification_requests.is_empty())
+    }
+
+    fn pending_signature_verification_request(
+        &self,
+        slot: u64,
+    ) -> Option<PendingSignatureVerificationRequest> {
+        let state = self.scheduling_states.get(&slot)?;
+        if !state.allows_transaction_processing() {
+            return None;
+        }
+
+        state
+            .pending_signature_verification_requests
+            .front()
+            .copied()
+    }
+
+    fn signature_verification_request(
+        &self,
+        slot: u64,
+        pending_request: PendingSignatureVerificationRequest,
+    ) -> SignatureVerificationRequest {
+        let state = self
+            .scheduling_states
+            .get(&slot)
+            .expect("signature verification dispatch for unknown slot");
+        let transaction = state
+            .transactions
+            .get(pending_request.transaction_index)
+            .expect("signature verification dispatch for unknown transaction");
+
+        SignatureVerificationRequest {
+            slot,
+            bank_id: state.bank_id,
+            transaction_index: pending_request.transaction_index,
+            transaction: unsafe {
+                transaction
+                    .transaction_ptr()
+                    .to_sharable_transaction_region(&self.session.allocator)
+            },
+        }
+    }
+
+    fn service_signature_verification_results(&mut self, max_results: usize) -> usize {
+        if max_results == 0 {
+            return 0;
+        }
+
+        let mut consumed = 0;
+        while consumed < max_results {
+            let Some(result) = self.session.signature_verification_results.try_read() else {
+                break;
+            };
+            consumed += 1;
+            self.handle_signature_verification_result(result);
+        }
+
+        consumed
+    }
+
+    fn handle_signature_verification_result(&mut self, result: SignatureVerificationResult) {
+        let slot = result.slot;
+        let transaction_state_to_free = {
+            let Some(state) = self.scheduling_states.get_mut(&slot) else {
+                return;
+            };
+            state.in_flight_signature_verifications = state
+                .in_flight_signature_verifications
+                .checked_sub(1)
+                .expect("signature verification result without in-flight verification");
+            state.finish_signature_verification(result.transaction_index)
+        };
+        if let Some(transaction_state_to_free) = transaction_state_to_free {
+            self.free_transaction_state_allocations(transaction_state_to_free);
+        }
+
+        let verified = result.verified();
+        self.emit_transaction_signatures_returned_event(slot, result.transaction_index, verified);
+        if !verified {
+            self.mark_slot_failed(slot, replay_block_status_reasons::INVALID_TRANSACTION);
+        }
     }
 
     fn insert_slot_order(&mut self, slot: u64) {
@@ -1973,7 +2255,17 @@ impl BlockVerificationScheduler {
         let previous_transaction_state =
             self.finish_worker_execution(worker_execution, Instant::now());
         let cost_units = previous_transaction_state.estimated_cost_units();
-        self.free_transaction_state_allocations(previous_transaction_state);
+        if self.transaction_has_pending_signature_verification(
+            worker_execution.slot,
+            worker_execution.transaction_index,
+        ) {
+            self.retain_executed_transaction_pending_signature_verification(
+                worker_execution,
+                previous_transaction_state,
+            );
+        } else {
+            self.free_transaction_state_allocations(previous_transaction_state);
+        }
         self.decrement_in_flight_execution_messages(worker_execution.thread_id, cost_units);
 
         if execution_response_is_invalid(&execution_response) {
@@ -2095,6 +2387,28 @@ impl BlockVerificationScheduler {
                 worker_execution.thread_id,
                 execution_complete_time,
             )
+    }
+
+    fn transaction_has_pending_signature_verification(
+        &self,
+        slot: u64,
+        transaction_index: usize,
+    ) -> bool {
+        self.scheduling_states.get(&slot).is_some_and(|state| {
+            state.transaction_has_pending_signature_verification(transaction_index)
+        })
+    }
+
+    fn retain_executed_transaction_pending_signature_verification(
+        &mut self,
+        worker_execution: PendingWorkerExecution,
+        previous_transaction_state: TransactionState,
+    ) {
+        self.scheduling_state_mut(worker_execution.slot)
+            .retain_executed_transaction_pending_signature_verification(
+                worker_execution.transaction_index,
+                previous_transaction_state,
+            );
     }
 
     fn record_successful_check(
@@ -2312,8 +2626,10 @@ impl BlockVerificationScheduler {
         }
         if state.in_flight_worker_messages != 0
             || state.in_flight_execution_messages != 0
+            || state.in_flight_signature_verifications != 0
             || state.entry_verification.pending_jobs != 0
             || !state.pending_transaction_checks.is_empty()
+            || !state.pending_signature_verification_requests.is_empty()
             || !state.ready_transactions.is_empty()
         {
             return None;
@@ -2447,6 +2763,11 @@ impl BlockVerificationScheduler {
                 resolved_pubkeys,
                 check_response,
                 ..
+            }
+            | TransactionState::ExecutedPendingSignatureVerification {
+                transaction,
+                resolved_pubkeys,
+                check_response,
             } => {
                 self.free_transaction_allocation(transaction.into_inner_data());
                 if let Some(resolved_pubkeys) = resolved_pubkeys {
@@ -2511,6 +2832,11 @@ impl BlockVerificationScheduler {
             Some(SlotTerminalStatus::Failed(_) | SlotTerminalStatus::Aborted) => {}
             previous_status => {
                 state.terminal_status = Some(SlotTerminalStatus::Failed(reason));
+                for pending_request in state.pending_signature_verification_requests.drain(..) {
+                    state
+                        .pending_signature_verification_transactions
+                        .remove(&pending_request.transaction_index);
+                }
                 state.pending_transaction_checks.clear();
                 state.ready_transactions.clear();
                 state.reset_ready_scan();
@@ -2529,6 +2855,11 @@ impl BlockVerificationScheduler {
             Some(SlotTerminalStatus::Failed(_) | SlotTerminalStatus::Aborted) => {}
             previous_status => {
                 state.terminal_status = Some(terminal_status);
+                for pending_request in state.pending_signature_verification_requests.drain(..) {
+                    state
+                        .pending_signature_verification_transactions
+                        .remove(&pending_request.transaction_index);
+                }
                 state.pending_transaction_checks.clear();
                 state.ready_transactions.clear();
                 state.reset_ready_scan();
@@ -2698,6 +3029,7 @@ mod tests {
                 bank: ReplayBankMessage {
                     kind,
                     slot,
+                    bank_id: slot,
                     last_entry_hash: [0; 32],
                 },
             },
@@ -2715,6 +3047,7 @@ mod tests {
                 bank: ReplayBankMessage {
                     kind: replay_bank_message_kinds::BEGIN,
                     slot,
+                    bank_id: slot,
                     last_entry_hash: last_entry_hash.to_bytes(),
                 },
             },
@@ -2811,6 +3144,25 @@ mod tests {
         }
 
         messages
+    }
+
+    fn queue_signature_verification_result(
+        scheduler: &BlockVerificationScheduler,
+        slot: u64,
+        transaction_index: usize,
+        verified: bool,
+    ) {
+        let producer = scheduler
+            .session
+            .signature_verification_results
+            .join_as_producer();
+        producer
+            .try_write(SignatureVerificationResult::new(
+                slot,
+                transaction_index,
+                verified,
+            ))
+            .expect("signature verification result queue should have capacity");
     }
 
     fn transaction_batch_regions(
@@ -3388,6 +3740,12 @@ mod tests {
                 .work_timing
                 .is_active()
         );
+        assert_eq!(
+            scheduler.service_signature_verification_submissions(1024),
+            1
+        );
+        queue_signature_verification_result(&scheduler, 42, 0, true);
+        assert_eq!(scheduler.service_signature_verification_results(1024), 1);
         wait_for_entry_verification(&mut scheduler, 42);
         assert_eq!(scheduler.service_transaction_check_dispatches(1024), 1);
         let check_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
@@ -3569,7 +3927,6 @@ mod tests {
             assert_eq!(
                 worker_message.flags,
                 pack_message_flags::CHECK
-                    | check_flags::VERIFY_SIGNATURES
                     | check_flags::LOAD_ADDRESS_LOOKUP_TABLES
                     | check_flags::ESTIMATE_COST
                     | check_flags::REPLAY,
@@ -4078,10 +4435,22 @@ mod tests {
         assert!(state.ready_transactions.is_empty());
         assert!(matches!(
             state.transactions.get(0).unwrap(),
-            TransactionState::Executed,
+            TransactionState::ExecutedPendingSignatureVerification { .. },
         ));
         assert_eq!(state.transaction_ingest_to_execution_latency.count, 1);
         assert!(state.transaction_ingest_to_execution_latency.min_ns() > 0);
+
+        assert_eq!(
+            scheduler.service_signature_verification_submissions(1024),
+            1
+        );
+        queue_signature_verification_result(&scheduler, 42, 0, true);
+        assert_eq!(scheduler.service_signature_verification_results(1024), 1);
+        let state = scheduler.scheduling_states.get(&42).unwrap();
+        assert!(matches!(
+            state.transactions.get(0).unwrap(),
+            TransactionState::Executed,
+        ));
     }
 
     #[test]
@@ -4397,6 +4766,12 @@ mod tests {
         );
 
         assert_eq!(scheduler.service_ingress_queue(4), 4);
+        assert_eq!(
+            scheduler.service_signature_verification_submissions(1024),
+            1
+        );
+        queue_signature_verification_result(&scheduler, 42, 0, true);
+        assert_eq!(scheduler.service_signature_verification_results(1024), 1);
         assert_eq!(scheduler.service_transaction_check_dispatches(1024), 1);
         let check_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
         queue_worker_check_response(
@@ -5853,6 +6228,12 @@ mod tests {
         );
 
         assert_eq!(scheduler.service_ingress_queue(4), 4);
+        assert_eq!(
+            scheduler.service_signature_verification_submissions(1024),
+            1
+        );
+        queue_signature_verification_result(&scheduler, 42, 0, true);
+        assert_eq!(scheduler.service_signature_verification_results(1024), 1);
         assert_eq!(scheduler.service_transaction_check_dispatches(1024), 1);
         let worker_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
         wait_for_entry_verification(&mut scheduler, 42);

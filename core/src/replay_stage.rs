@@ -2669,7 +2669,7 @@ impl ReplayStage {
                 .block_verification
                 .lock()
                 .unwrap();
-            if !block_verification.begin_slot(slot, replay_progress.last_entry) {
+            if !block_verification.begin_slot(bank.bank_id(), slot, replay_progress.last_entry) {
                 return Ok(());
             }
             for entry in &entries {
@@ -2694,7 +2694,7 @@ impl ReplayStage {
                     .block_verification
                     .lock()
                     .unwrap();
-                if !block_verification.begin_slot(slot, replay_progress.last_entry)
+                if !block_verification.begin_slot(bank.bank_id(), slot, replay_progress.last_entry)
                     || !block_verification.complete_slot(slot)
                 {
                     return Ok(());

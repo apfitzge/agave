@@ -128,6 +128,7 @@ impl<Tx: TransactionWithMeta> ConsumeWorker<Tx> {
                 skip_cost_tracking: false,
                 add_only_cost_tracking: false,
                 skip_poh_recording: false,
+                transactions_verified: true,
             },
         );
         self.metrics.update_for_consume(&output);
@@ -1437,6 +1438,7 @@ pub(crate) mod external {
                     // PoH recording is leader-only, so replay execution skips
                     // it.
                     skip_poh_recording: true,
+                    transactions_verified: false,
                 };
             }
 
@@ -1447,6 +1449,7 @@ pub(crate) mod external {
                 skip_cost_tracking: false,
                 add_only_cost_tracking: false,
                 skip_poh_recording: false,
+                transactions_verified: true,
             }
         }
 

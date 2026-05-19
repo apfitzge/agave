@@ -2036,7 +2036,7 @@ fn confirm_slot_entries(
         if let Some(block_verification) = block_verification {
             let mut replay_timer = Measure::start("replay_elapsed");
             let status = block_verification
-                .submit_entries_and_wait(bank.slot(), progress.last_entry, &entries)
+                .submit_entries_and_wait(bank.bank_id(), bank.slot(), progress.last_entry, &entries)
                 .unwrap_or(BlockVerificationSlotStatus::Unknown);
             block_verification_status_result(status)?;
             replay_timer.stop();

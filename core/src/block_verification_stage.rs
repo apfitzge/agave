@@ -2,11 +2,15 @@ pub use agave_block_verification_stage::session::{
     BlockVerificationSession, BlockVerificationSlotStatus, ReplayBlockVerification,
 };
 use {
-    crate::banking_stage::spawn_replay_block_verification_workers,
+    crate::{
+        banking_stage::spawn_replay_block_verification_workers,
+        block_verification_sigverify::spawn_replay_signature_verification_workers,
+    },
     agave_block_verification_stage::{
         scheduler::BlockVerificationScheduler,
         setup::{
-            BlockVerificationStageSessions, BlockVerificationStageSetupConfig, ReplayEventBroadcast,
+            BlockVerificationStageSessions, BlockVerificationStageSetupConfig,
+            ReplayEventBroadcast, SIGNATURE_VERIFICATION_WORKER_COUNT,
         },
     },
     log::warn,
@@ -127,9 +131,11 @@ impl BlockVerificationStage {
             block_verification_stage,
             replay_stage,
             workers,
+            signature_verification_workers,
         } = sessions;
 
-        let mut threads = Vec::with_capacity(worker_count.get() + 1);
+        let mut threads =
+            Vec::with_capacity(worker_count.get() + SIGNATURE_VERIFICATION_WORKER_COUNT + 1);
         let scheduler_exit = exit.clone();
         let scheduler_event_broadcast = event_broadcast.clone();
         threads.push(
@@ -147,15 +153,20 @@ impl BlockVerificationStage {
                 .unwrap(),
         );
         threads.extend(spawn_replay_block_verification_workers(
-            exit,
+            exit.clone(),
             workers,
             transaction_status_sender,
-            replay_vote_sender,
+            replay_vote_sender.clone(),
             prioritization_fee_cache,
             log_messages_bytes_limit,
             shared_leader_state,
             bank_forks,
             event_broadcast,
+        ));
+        threads.extend(spawn_replay_signature_verification_workers(
+            exit,
+            signature_verification_workers,
+            replay_vote_sender,
         ));
 
         Ok((
@@ -218,7 +229,10 @@ mod tests {
         .unwrap();
 
         assert!(ledger_path.path().join("agave_events.ipc").exists());
-        assert_eq!(block_verification_stage.thread_count(), 2);
+        assert_eq!(
+            block_verification_stage.thread_count(),
+            2 + SIGNATURE_VERIFICATION_WORKER_COUNT
+        );
         exit.store(true, Ordering::Relaxed);
         block_verification_stage.join().unwrap();
         poh_service.join().unwrap();
