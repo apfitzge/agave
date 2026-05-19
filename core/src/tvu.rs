@@ -6,7 +6,9 @@ use {
         admin_rpc_post_init::{KeyUpdaterType, KeyUpdaters},
         banking_trace::BankingTracer,
         block_creation_loop::ReplayHighestFrozen,
-        block_verification_stage::{BlockVerificationStage, ReplayBlockVerification},
+        block_verification_stage::{
+            BlockVerificationStage, BlockVerificationStageConfig, ReplayBlockVerification,
+        },
         bls_sigverify::bls_sigverifier::{self, SigVerifierChannels, SigVerifierContext},
         cluster_info_vote_listener::{
             DuplicateConfirmedSlotsReceiver, GossipVerifiedVoteHashReceiver,
@@ -494,14 +496,17 @@ impl Tvu {
 
         let (block_verification_stage, block_verification_session) = BlockVerificationStage::new(
             exit.clone(),
-            tvu_config.replay_transactions_threads,
-            tvu_config.replay_transactions_threads,
-            transaction_status_sender.clone(),
-            replay_vote_sender.clone(),
-            prioritization_fee_cache.clone(),
-            log_messages_bytes_limit,
-            poh_recorder.read().unwrap().shared_leader_state(),
-            bank_forks.clone(),
+            BlockVerificationStageConfig {
+                worker_count: tvu_config.replay_transactions_threads,
+                entry_verification_threads: tvu_config.replay_transactions_threads,
+                transaction_status_sender: transaction_status_sender.clone(),
+                replay_vote_sender: replay_vote_sender.clone(),
+                prioritization_fee_cache: prioritization_fee_cache.clone(),
+                log_messages_bytes_limit,
+                shared_leader_state: poh_recorder.read().unwrap().shared_leader_state(),
+                bank_forks: bank_forks.clone(),
+                event_ledger_path: Some(blockstore.ledger_path()),
+            },
         )?;
 
         let replay_senders = ReplaySenders {

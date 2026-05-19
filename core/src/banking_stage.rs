@@ -688,6 +688,7 @@ mod external {
                     allocator,
                     self.poh_recorder.read().unwrap().shared_leader_state(),
                     self.bank_forks.clone(),
+                    None,
                 );
 
                 worker_metrics.push(consume_worker.metrics_handle());
@@ -785,6 +786,7 @@ pub(crate) fn spawn_replay_block_verification_workers(
     log_messages_bytes_limit: Option<usize>,
     shared_leader_state: SharedLeaderState,
     bank_forks: Arc<RwLock<BankForks>>,
+    event_broadcast: Option<Arc<agave_block_verification_stage::setup::ReplayEventBroadcast>>,
 ) -> Vec<JoinHandle<()>> {
     workers
         .into_iter()
@@ -809,6 +811,7 @@ pub(crate) fn spawn_replay_block_verification_workers(
                 worker.allocator,
                 shared_leader_state.clone(),
                 bank_forks.clone(),
+                event_broadcast.clone(),
             );
 
             Builder::new()

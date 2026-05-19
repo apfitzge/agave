@@ -32,6 +32,7 @@ wincode = { workspace = true }
 [dev-dependencies]
 solana-message = { workspace = true, features = ["serde"] }
 solana-transaction = { workspace = true, features = ["serde", "wincode"] }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

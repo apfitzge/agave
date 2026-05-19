@@ -1,6 +1,12 @@
 use {
     rts_alloc::Allocator,
-    std::{ffi::CStr, fs::File, io, os::fd::FromRawFd},
+    std::{
+        ffi::CStr,
+        fs::{File, OpenOptions},
+        io,
+        os::fd::FromRawFd,
+        path::Path,
+    },
     thiserror::Error,
 };
 
@@ -85,6 +91,38 @@ pub fn create_queue_pair<T>(
     Ok((producer, consumer))
 }
 
+pub fn create_broadcast_producer_at_path<T>(
+    path: &Path,
+    capacity: usize,
+) -> Result<shaq::broadcast::Producer<T>, SharedMemoryError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    let minimum_file_size = shaq::broadcast::minimum_file_size::<T>(capacity);
+    let file_size = align_file_size(minimum_file_size, false);
+    file.set_len(file_size.try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "broadcast queue file size does not fit in u64",
+        )
+    })?)?;
+    let producer = unsafe { shaq::broadcast::Producer::create(&file, file_size) }?;
+
+    Ok(producer)
+}
+
+pub fn join_broadcast_consumer_at_path<T>(
+    path: &Path,
+) -> Result<shaq::broadcast::Consumer<T>, SharedMemoryError> {
+    let file = OpenOptions::new().read(true).write(true).open(path)?;
+    let consumer = unsafe { shaq::broadcast::Consumer::join(&file) }?;
+
+    Ok(consumer)
+}
+
 #[cfg(any(
     target_os = "linux",
     target_os = "l4re",
@@ -158,5 +196,34 @@ fn align_file_size(size: usize, huge: bool) -> usize {
     match huge {
         true => size.next_multiple_of(HUGE_PAGE_SIZE),
         false => size.next_multiple_of(REGULAR_PAGE_SIZE),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {super::*, core::sync::atomic::Ordering};
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[repr(C)]
+    struct TestBroadcastEvent {
+        value: u64,
+    }
+
+    #[test]
+    fn filesystem_broadcast_queue_round_trips_events() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("agave_events.ipc");
+        let producer = create_broadcast_producer_at_path::<TestBroadcastEvent>(&path, 8).unwrap();
+        let mut consumer = join_broadcast_consumer_at_path::<TestBroadcastEvent>(&path).unwrap();
+
+        producer
+            .try_write(TestBroadcastEvent { value: 42 }, Ordering::Relaxed)
+            .unwrap();
+
+        assert_eq!(
+            consumer.try_read(Ordering::Relaxed).unwrap(),
+            Some(TestBroadcastEvent { value: 42 }),
+        );
+        assert_eq!(consumer.try_read(Ordering::Relaxed).unwrap(), None);
     }
 }

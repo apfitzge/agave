@@ -3,7 +3,10 @@ use {
         entry_hash_verifier::{
             EntryHashVerificationResult, EntryHashVerificationTask, EntryHashVerifier,
         },
-        setup::{BlockVerificationStageSession, BlockVerificationStageWorkerSession},
+        setup::{
+            BlockVerificationStageSession, BlockVerificationStageWorkerSession,
+            ReplayEventBroadcast,
+        },
     },
     agave_scheduler_bindings::{
         EntryHeader, PackToWorkerMessage, ReplayBankMessage, ReplayBlockStatusMessage,
@@ -20,6 +23,10 @@ use {
     },
     agave_scheduling_utils::{
         pubkeys_ptr::PubkeysPtr,
+        replay_events::{
+            ReplayEvent, ReplayTransactionCheckMetadata as PendingWorkerCheck,
+            ReplayTransactionExecutionMetadata as PendingWorkerExecution, replay_event_tags,
+        },
         responses_region::{CheckResponsesPtr, ExecutionResponsesPtr},
         thread_aware_account_locks::{ThreadAwareAccountLocks, ThreadId, ThreadSet},
         transaction_ptr::{TransactionPtr, TransactionPtrBatch},
@@ -105,6 +112,7 @@ fn execution_response_is_invalid(response: &ExecutionResponse) -> bool {
 pub struct BlockVerificationScheduler {
     exit: Arc<AtomicBool>,
     session: BlockVerificationStageSession,
+    event_broadcast: Option<Arc<ReplayEventBroadcast>>,
     scheduling_states: HashMap<u64, SchedulingState>,
     slot_order: Vec<u64>,
     scheduling_state_pool: Vec<SchedulingState>,
@@ -226,7 +234,8 @@ impl SchedulingState {
         )
     }
 
-    fn promote_ready_transactions(&mut self) {
+    fn promote_ready_transactions(&mut self) -> std::ops::Range<usize> {
+        let promoted_start = self.next_ready_transaction_index;
         while self
             .transactions
             .get(self.next_ready_transaction_index)
@@ -236,6 +245,7 @@ impl SchedulingState {
                 .push_back(self.next_ready_transaction_index);
             self.next_ready_transaction_index += 1;
         }
+        promoted_start..self.next_ready_transaction_index
     }
 
     fn reset_ready_scan(&mut self) {
@@ -309,7 +319,7 @@ impl SchedulingState {
         dispatch_context: &mut ExecutionDispatchContext<'_>,
     ) -> ReadyTransactionDispatchResult {
         let slot = self.slot;
-        let thread_id = {
+        let (thread_id, worker_queue_len) = {
             let transaction = self
                 .transactions
                 .get(transaction_index)
@@ -331,6 +341,11 @@ impl SchedulingState {
                     &mut self.unschedulable_read_locks,
                     &mut self.unschedulable_write_locks,
                 );
+                dispatch_context.emit_transaction_event(
+                    replay_event_tags::TRANSACTION_SCHEDULING_SKIPPED,
+                    slot,
+                    transaction_index,
+                );
                 return ReadyTransactionDispatchResult::Deferred;
             }
 
@@ -341,21 +356,41 @@ impl SchedulingState {
                 &mut self.account_locks,
             );
             match dispatch_result {
-                ExecutionDispatchResult::Scheduled(thread_id) => thread_id,
+                ExecutionDispatchResult::Scheduled {
+                    thread_id,
+                    worker_queue_len,
+                } => (thread_id, worker_queue_len),
                 ExecutionDispatchResult::AccountConflict => {
                     transaction.record_unschedulable_locks(
                         &mut self.unschedulable_read_locks,
                         &mut self.unschedulable_write_locks,
                     );
+                    dispatch_context.emit_transaction_event(
+                        replay_event_tags::TRANSACTION_SCHEDULING_SKIPPED,
+                        slot,
+                        transaction_index,
+                    );
                     return ReadyTransactionDispatchResult::Deferred;
                 }
                 ExecutionDispatchResult::Unavailable => {
+                    dispatch_context.emit_transaction_event(
+                        replay_event_tags::TRANSACTION_SCHEDULING_SKIPPED,
+                        slot,
+                        transaction_index,
+                    );
                     return ReadyTransactionDispatchResult::Unavailable;
                 }
             }
         };
 
         self.move_checked_transaction_to_in_flight(transaction_index, thread_id);
+        dispatch_context.emit_transaction_worker_dispatch_event(
+            replay_event_tags::TRANSACTION_SCHEDULED_FOR_EXEC,
+            slot,
+            transaction_index,
+            thread_id,
+            worker_queue_len,
+        );
         ReadyTransactionDispatchResult::Scheduled
     }
 
@@ -561,6 +596,7 @@ struct ExecutionDispatchContext<'a> {
     in_flight_execution_messages: &'a mut usize,
     in_flight_executions_per_thread: &'a mut [usize],
     in_flight_execution_cost_units_per_thread: &'a mut [u64],
+    event_broadcast: Option<&'a ReplayEventBroadcast>,
 }
 
 #[derive(Default)]
@@ -654,11 +690,45 @@ enum ReadyTransactionDispatchResult {
 
 enum ExecutionDispatchResult {
     AccountConflict,
-    Scheduled(ThreadId),
+    Scheduled {
+        thread_id: ThreadId,
+        worker_queue_len: usize,
+    },
     Unavailable,
 }
 
 impl ExecutionDispatchContext<'_> {
+    fn emit_transaction_event(&self, tag: u64, slot: u64, transaction_index: usize) {
+        if let Some(event_broadcast) = self.event_broadcast {
+            event_broadcast.emit(ReplayEvent::transaction_event(
+                0,
+                tag,
+                slot,
+                u64::try_from(transaction_index).expect("transaction index must fit in u64"),
+            ));
+        }
+    }
+
+    fn emit_transaction_worker_dispatch_event(
+        &self,
+        tag: u64,
+        slot: u64,
+        transaction_index: usize,
+        worker_id: ThreadId,
+        worker_queue_len: usize,
+    ) {
+        if let Some(event_broadcast) = self.event_broadcast {
+            event_broadcast.emit(ReplayEvent::transaction_worker_dispatch_event(
+                0,
+                tag,
+                slot,
+                u64::try_from(transaction_index).expect("transaction index must fit in u64"),
+                u64::try_from(worker_id).expect("worker id must fit in u64"),
+                u64::try_from(worker_queue_len).expect("worker queue length must fit in u64"),
+            ));
+        }
+    }
+
     fn has_capacity(&self) -> bool {
         self.dispatch_capacity() != 0
     }
@@ -723,19 +793,34 @@ impl ExecutionDispatchContext<'_> {
             max_working_slot: slot,
             batch,
         };
-        if let Err(returned_message) = self.workers[thread_id].pack_to_worker.try_write(message) {
-            self.free_transaction_batch_allocation(returned_message.batch);
-            account_locks.unlock_accounts(
-                transaction.write_locks(),
-                transaction.read_locks(),
-                thread_id,
-            );
-            return ExecutionDispatchResult::Unavailable;
-        }
-        self.workers[thread_id].pack_to_worker.commit();
+        let write_result = {
+            let queue = &mut self.workers[thread_id].pack_to_worker;
+            match queue.try_write(message) {
+                Ok(()) => {
+                    queue.commit();
+                    Ok(queue.len())
+                }
+                Err(returned_message) => Err(returned_message.batch),
+            }
+        };
+        let worker_queue_len = match write_result {
+            Ok(worker_queue_len) => worker_queue_len,
+            Err(batch) => {
+                self.free_transaction_batch_allocation(batch);
+                account_locks.unlock_accounts(
+                    transaction.write_locks(),
+                    transaction.read_locks(),
+                    thread_id,
+                );
+                return ExecutionDispatchResult::Unavailable;
+            }
+        };
 
         self.increment_in_flight_execution_messages(thread_id, estimated_cost_units);
-        ExecutionDispatchResult::Scheduled(thread_id)
+        ExecutionDispatchResult::Scheduled {
+            thread_id,
+            worker_queue_len,
+        }
     }
 
     fn available_worker_threads(&mut self, estimated_cost_units: u64) -> ThreadSet {
@@ -923,21 +1008,6 @@ struct FinishedSlotStatus {
 #[derive(Clone, Copy)]
 struct PendingTransactionCheck {
     transaction_index: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(C)]
-struct PendingWorkerCheck {
-    slot: u64,
-    transaction_index: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(C)]
-struct PendingWorkerExecution {
-    slot: u64,
-    transaction_index: usize,
-    thread_id: ThreadId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1131,6 +1201,7 @@ impl BlockVerificationScheduler {
         exit: Arc<AtomicBool>,
         session: BlockVerificationStageSession,
         entry_verification_threads: NonZeroUsize,
+        event_broadcast: Option<Arc<ReplayEventBroadcast>>,
     ) -> Self {
         assert!(
             !session.workers.is_empty(),
@@ -1140,6 +1211,7 @@ impl BlockVerificationScheduler {
         Self {
             exit,
             session,
+            event_broadcast,
             scheduling_states: HashMap::new(),
             slot_order: Vec::new(),
             scheduling_state_pool: Vec::new(),
@@ -1167,14 +1239,15 @@ impl BlockVerificationScheduler {
                 );
             self.update_slot_work_timings(Instant::now());
             let terminal_cleanup_count = self.service_terminal_slots(TERMINAL_SLOT_CLEANUP_LIMIT);
-            if ingress_count == 0
+            let should_sleep = ingress_count == 0
                 && entry_verification_count == 0
                 && signature_check_dispatch_count == 0
                 && worker_response_count == 0
                 && transaction_execution_dispatch_count == 0
                 && terminal_cleanup_count == 0
-                && !self.has_in_flight_slots()
-            {
+                && !self.has_in_flight_slots();
+
+            if should_sleep {
                 thread::sleep(IDLE_SLEEP);
             }
         }
@@ -1182,6 +1255,87 @@ impl BlockVerificationScheduler {
 
     fn has_in_flight_slots(&self) -> bool {
         !self.scheduling_states.is_empty()
+    }
+
+    fn emit_event(&self, event: ReplayEvent) {
+        if let Some(event_broadcast) = &self.event_broadcast {
+            event_broadcast.emit(event);
+        }
+    }
+
+    fn emit_slot_event(&self, tag: u64, slot: u64) {
+        let event = match tag {
+            replay_event_tags::SLOT_BEGIN => ReplayEvent::slot_begin(0, slot),
+            replay_event_tags::SLOT_ABORT => ReplayEvent::slot_abort(0, slot),
+            replay_event_tags::SLOT_COMPLETE => ReplayEvent::slot_complete(0, slot),
+            _ => panic!("unsupported replay slot event tag: {tag}"),
+        };
+        self.emit_event(event);
+    }
+
+    fn emit_slot_failed_event(&self, slot: u64, reason: u16) {
+        self.emit_event(ReplayEvent::slot_failed(0, slot, reason));
+    }
+
+    fn emit_transaction_ingested_event(
+        &self,
+        slot: u64,
+        transaction_index: usize,
+        signature: [u8; 64],
+    ) {
+        let transaction_index =
+            u64::try_from(transaction_index).expect("transaction index must fit in u64");
+        self.emit_event(ReplayEvent::transaction_ingested(
+            0,
+            slot,
+            transaction_index,
+            signature,
+        ));
+    }
+
+    fn emit_transaction_event(&self, tag: u64, slot: u64, transaction_index: usize) {
+        let transaction_index =
+            u64::try_from(transaction_index).expect("transaction index must fit in u64");
+        self.emit_event(ReplayEvent::transaction_event(
+            0,
+            tag,
+            slot,
+            transaction_index,
+        ));
+    }
+
+    fn emit_transaction_worker_event(
+        &self,
+        tag: u64,
+        slot: u64,
+        transaction_index: usize,
+        worker_id: ThreadId,
+    ) {
+        self.emit_event(ReplayEvent::transaction_worker_event(
+            0,
+            tag,
+            slot,
+            u64::try_from(transaction_index).expect("transaction index must fit in u64"),
+            u64::try_from(worker_id).expect("worker id must fit in u64"),
+        ));
+    }
+
+    fn emit_transaction_worker_dispatch_event(
+        &self,
+        tag: u64,
+        slot: u64,
+        transaction_index: usize,
+        worker_id: ThreadId,
+        worker_queue_len: usize,
+    ) {
+        self.emit_event(ReplayEvent::transaction_worker_dispatch_event(
+            0,
+            tag,
+            slot,
+            u64::try_from(transaction_index).expect("transaction index must fit in u64"),
+            u64::try_from(worker_id).expect("worker id must fit in u64"),
+            u64::try_from(worker_queue_len).expect("worker queue length must fit in u64"),
+        ));
     }
 
     fn update_slot_work_timings(&mut self, now: Instant) {
@@ -1352,6 +1506,7 @@ impl BlockVerificationScheduler {
             "slot already has scheduling state: {slot}"
         );
         self.insert_slot_order(slot);
+        self.emit_slot_event(replay_event_tags::SLOT_BEGIN, slot);
     }
 
     fn handle_bank_complete(&mut self, slot: u64) {
@@ -1435,9 +1590,19 @@ impl BlockVerificationScheduler {
             TransactionPtr::from_sharable_transaction_region(&transaction, &self.session.allocator)
         };
 
+        let transaction_index = self
+            .scheduling_states
+            .get(&slot)
+            .expect("replay ingress received for unknown slot")
+            .transactions
+            .len();
+        let signature = self
+            .event_broadcast
+            .is_some()
+            .then(|| self.first_signature_bytes(&transaction));
+
         let state = self.scheduling_state_mut(slot);
         state.start_work_timing();
-        let transaction_index = state.transactions.len();
         let transaction_key = state.transactions.insert(TransactionState::Pending {
             transaction,
             ingest_time: Instant::now(),
@@ -1449,6 +1614,9 @@ impl BlockVerificationScheduler {
         state
             .pending_transaction_checks
             .push_back(PendingTransactionCheck { transaction_index });
+        if let Some(signature) = signature {
+            self.emit_transaction_ingested_event(slot, transaction_index, signature);
+        }
         true
     }
 
@@ -1473,7 +1641,8 @@ impl BlockVerificationScheduler {
                         continue;
                     }
 
-                    let Some(batch) = self.allocate_transaction_check_batch(slot, pending_check)
+                    let Some(batch) =
+                        self.allocate_transaction_check_batch(slot, pending_check, worker_index)
                     else {
                         return dispatched;
                     };
@@ -1483,18 +1652,36 @@ impl BlockVerificationScheduler {
                         max_working_slot: slot,
                         batch,
                     };
-                    if let Err(returned_message) = self.session.workers[worker_index]
-                        .pack_to_worker
-                        .try_write(message)
-                    {
-                        self.free_transaction_batch_allocation(returned_message.batch);
-                        return dispatched;
-                    }
-                    self.session.workers[worker_index].pack_to_worker.commit();
+                    let write_result = {
+                        let queue = &mut self.session.workers[worker_index].pack_to_worker;
+                        match queue.try_write(message) {
+                            Ok(()) => {
+                                queue.commit();
+                                Ok(queue.len())
+                            }
+                            Err(returned_message) => Err(returned_message.batch),
+                        }
+                    };
+                    let worker_queue_len = match write_result {
+                        Ok(worker_queue_len) => worker_queue_len,
+                        Err(batch) => {
+                            self.free_transaction_batch_allocation(batch);
+                            return dispatched;
+                        }
+                    };
 
-                    let state = self.scheduling_state_mut(slot);
-                    state.pending_transaction_checks.pop_front();
-                    state.in_flight_worker_messages += 1;
+                    {
+                        let state = self.scheduling_state_mut(slot);
+                        state.pending_transaction_checks.pop_front();
+                        state.in_flight_worker_messages += 1;
+                    }
+                    self.emit_transaction_worker_dispatch_event(
+                        replay_event_tags::TRANSACTION_SENT_FOR_CHECK,
+                        slot,
+                        pending_check.transaction_index,
+                        worker_index,
+                        worker_queue_len,
+                    );
                     dispatched += 1;
                     made_progress = true;
                 }
@@ -1559,6 +1746,7 @@ impl BlockVerificationScheduler {
         &self,
         slot: u64,
         pending_check: PendingTransactionCheck,
+        worker_index: usize,
     ) -> Option<SharableTransactionBatchRegion> {
         let ptr = self
             .session
@@ -1591,6 +1779,7 @@ impl BlockVerificationScheduler {
             meta_ptr.as_ptr().write(PendingWorkerCheck {
                 slot,
                 transaction_index: pending_check.transaction_index,
+                thread_id: worker_index,
             });
         }
 
@@ -1639,6 +1828,7 @@ impl BlockVerificationScheduler {
             in_flight_executions_per_thread: &mut self.in_flight_executions_per_thread,
             in_flight_execution_cost_units_per_thread: &mut self
                 .in_flight_execution_cost_units_per_thread,
+            event_broadcast: self.event_broadcast.as_deref(),
         };
         if !dispatch_context.has_capacity() {
             return 0;
@@ -1745,9 +1935,21 @@ impl BlockVerificationScheduler {
         self.free_transaction_batch_allocation(message.batch);
 
         if check_response_is_invalid(&check_response) {
+            self.emit_transaction_worker_event(
+                replay_event_tags::TRANSACTION_CHECK_FAILED,
+                slot,
+                worker_check.transaction_index,
+                worker_check.thread_id,
+            );
             self.free_check_response_allocations(check_response);
             self.mark_slot_failed(slot, replay_block_status_reasons::INVALID_TRANSACTION);
         } else {
+            self.emit_transaction_worker_event(
+                replay_event_tags::TRANSACTION_CHECK_PASSED,
+                slot,
+                worker_check.transaction_index,
+                worker_check.thread_id,
+            );
             self.record_successful_check(worker_check, check_response);
         }
 
@@ -1775,7 +1977,20 @@ impl BlockVerificationScheduler {
         self.decrement_in_flight_execution_messages(worker_execution.thread_id, cost_units);
 
         if execution_response_is_invalid(&execution_response) {
+            self.emit_transaction_worker_event(
+                replay_event_tags::TRANSACTION_EXEC_FAILED,
+                slot,
+                worker_execution.transaction_index,
+                worker_execution.thread_id,
+            );
             self.mark_slot_failed(slot, replay_block_status_reasons::INVALID_TRANSACTION);
+        } else {
+            self.emit_transaction_worker_event(
+                replay_event_tags::TRANSACTION_FINISHED_EXEC,
+                slot,
+                worker_execution.transaction_index,
+                worker_execution.thread_id,
+            );
         }
     }
 
@@ -1887,9 +2102,10 @@ impl BlockVerificationScheduler {
         worker_check: PendingWorkerCheck,
         mut check_response: CheckResponse,
     ) {
+        let slot = worker_check.slot;
         let should_retain = self
             .scheduling_states
-            .get(&worker_check.slot)
+            .get(&slot)
             .is_some_and(|state| state.allows_transaction_processing());
 
         if !should_retain {
@@ -1900,34 +2116,44 @@ impl BlockVerificationScheduler {
         let scheduling_metadata =
             TransactionSchedulingMetadata::from_check_response(&check_response);
         let resolved_pubkeys = self.take_resolved_pubkeys(&mut check_response);
-        let state = self.scheduling_state_mut(worker_check.slot);
-        let transaction_state = state
-            .transactions
-            .get_mut(worker_check.transaction_index)
-            .expect("successful check for unknown transaction");
-        let previous_transaction_state =
-            core::mem::replace(transaction_state, TransactionState::Transitioning);
-        let TransactionState::Pending {
-            transaction,
-            ingest_time,
-        } = previous_transaction_state
-        else {
-            panic!(
-                "successful check for transaction that was not pending: {}",
-                worker_check.transaction_index,
-            );
-        };
-        let transaction = SanitizedTransactionView::try_new_sanitized(transaction, true)
-            .expect("successful CHECK transaction failed scheduler parse");
-        *transaction_state = TransactionState::Checked {
-            transaction,
-            resolved_pubkeys,
-            scheduling_metadata,
-            check_response,
-            ingest_time,
+        let promoted_transactions = {
+            let state = self.scheduling_state_mut(slot);
+            let transaction_state = state
+                .transactions
+                .get_mut(worker_check.transaction_index)
+                .expect("successful check for unknown transaction");
+            let previous_transaction_state =
+                core::mem::replace(transaction_state, TransactionState::Transitioning);
+            let TransactionState::Pending {
+                transaction,
+                ingest_time,
+            } = previous_transaction_state
+            else {
+                panic!(
+                    "successful check for transaction that was not pending: {}",
+                    worker_check.transaction_index,
+                );
+            };
+            let transaction = SanitizedTransactionView::try_new_sanitized(transaction, true)
+                .expect("successful CHECK transaction failed scheduler parse");
+            *transaction_state = TransactionState::Checked {
+                transaction,
+                resolved_pubkeys,
+                scheduling_metadata,
+                check_response,
+                ingest_time,
+            };
+
+            state.promote_ready_transactions()
         };
 
-        state.promote_ready_transactions();
+        for transaction_index in promoted_transactions {
+            self.emit_transaction_event(
+                replay_event_tags::TRANSACTION_READY_FOR_SCHEDULING,
+                slot,
+                transaction_index,
+            );
+        }
     }
 
     fn take_resolved_pubkeys(&self, check_response: &mut CheckResponse) -> Option<PubkeysPtr> {
@@ -2030,6 +2256,21 @@ impl BlockVerificationScheduler {
             let ptr = self.session.allocator.ptr_from_offset(transaction.offset);
             core::slice::from_raw_parts(ptr.as_ptr(), transaction.length as usize)
         }
+    }
+
+    fn first_signature_bytes(&self, transaction: &TransactionPtr) -> [u8; 64] {
+        let Some(transaction_view) =
+            UnsanitizedTransactionView::try_new_unsanitized(transaction).ok()
+        else {
+            return [0; 64];
+        };
+        let Some(signature) = transaction_view.signatures().first() else {
+            return [0; 64];
+        };
+
+        let mut signature_bytes = [0; 64];
+        signature_bytes.copy_from_slice(signature.as_ref());
+        signature_bytes
     }
 
     fn is_slot_accepting_work(&self, slot: u64) -> bool {
@@ -2305,6 +2546,22 @@ impl BlockVerificationScheduler {
             .try_write(status.message)
             .expect("replay block status queue full");
         self.session.replay_block_status.commit();
+        self.emit_replay_block_status_event(status.message);
+    }
+
+    fn emit_replay_block_status_event(&self, message: ReplayBlockStatusMessage) {
+        match message.status {
+            replay_block_status_codes::SUCCESS => {
+                self.emit_slot_event(replay_event_tags::SLOT_COMPLETE, message.slot);
+            }
+            replay_block_status_codes::FAILED => {
+                self.emit_slot_failed_event(message.slot, message.reason);
+            }
+            replay_block_status_codes::ABORTED => {
+                self.emit_slot_event(replay_event_tags::SLOT_ABORT, message.slot);
+            }
+            status => panic!("unsupported replay block status code: {status}"),
+        }
     }
 }
 
@@ -2314,13 +2571,15 @@ mod tests {
         super::*,
         crate::setup::{
             BlockVerificationStageSessions, BlockVerificationStageSetupConfig,
-            BlockVerificationWorkerSession, ReplayStageSession,
+            BlockVerificationWorkerSession, ReplayEventBroadcast, ReplayStageSession,
         },
         agave_scheduler_bindings::{
             ReplayToPackMessage, ReplayToPackMessagePayload, worker_message_types::cost_model_flags,
         },
-        agave_scheduling_utils::responses_region::{
-            execution_responses_from_iter, resolve_responses_from_iter,
+        agave_scheduling_utils::{
+            replay_events::{ReplayEvent, replay_event_tags},
+            responses_region::{execution_responses_from_iter, resolve_responses_from_iter},
+            shared_memory,
         },
         solana_entry::entry as solana_entry,
         solana_message::{Message, MessageHeader, VersionedMessage},
@@ -2353,6 +2612,7 @@ mod tests {
             exit,
             sessions.block_verification_stage,
             NonZeroUsize::new(1).unwrap(),
+            None,
         );
 
         (scheduler, sessions.replay_stage)
@@ -2371,9 +2631,54 @@ mod tests {
             exit,
             sessions.block_verification_stage,
             NonZeroUsize::new(1).unwrap(),
+            None,
         );
 
         (scheduler, sessions.replay_stage, sessions.workers)
+    }
+
+    fn setup_scheduler_replay_stage_workers_and_events(
+        config: BlockVerificationStageSetupConfig,
+    ) -> (
+        BlockVerificationScheduler,
+        ReplayStageSession,
+        Vec<BlockVerificationWorkerSession>,
+        shaq::broadcast::Consumer<ReplayEvent>,
+        tempfile::TempDir,
+    ) {
+        let sessions = setup_sessions_with_config(config);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let event_broadcast = ReplayEventBroadcast::new(temp_dir.path()).unwrap();
+        let mut event_consumer =
+            shared_memory::join_broadcast_consumer_at_path(event_broadcast.path()).unwrap();
+        assert_eq!(event_consumer.try_read(Ordering::Relaxed).unwrap(), None);
+
+        let exit = Arc::new(AtomicBool::new(false));
+        let scheduler = BlockVerificationScheduler::new(
+            exit,
+            sessions.block_verification_stage,
+            NonZeroUsize::new(1).unwrap(),
+            Some(Arc::new(event_broadcast)),
+        );
+
+        (
+            scheduler,
+            sessions.replay_stage,
+            sessions.workers,
+            event_consumer,
+            temp_dir,
+        )
+    }
+
+    fn drain_replay_events(
+        event_consumer: &mut shaq::broadcast::Consumer<ReplayEvent>,
+    ) -> Vec<ReplayEvent> {
+        let mut events = Vec::new();
+        while let Some(event) = event_consumer.try_read(Ordering::Relaxed).unwrap() {
+            events.push(event);
+        }
+
+        events
     }
 
     fn write_replay_messages(
@@ -2911,6 +3216,7 @@ mod tests {
             exit.clone(),
             sessions.block_verification_stage,
             NonZeroUsize::new(1).unwrap(),
+            None,
         );
 
         exit.store(true, Ordering::Relaxed);
@@ -3275,6 +3581,7 @@ mod tests {
                 PendingWorkerCheck {
                     slot: 42,
                     transaction_index,
+                    thread_id: 0,
                 },
             );
             assert_eq!(
@@ -3343,6 +3650,7 @@ mod tests {
                     PendingWorkerCheck {
                         slot: 42,
                         transaction_index,
+                        thread_id: worker_index,
                     },
                 );
             }
@@ -3774,6 +4082,344 @@ mod tests {
         ));
         assert_eq!(state.transaction_ingest_to_execution_latency.count, 1);
         assert!(state.transaction_ingest_to_execution_latency.min_ns() > 0);
+    }
+
+    #[test]
+    fn replay_event_broadcast_records_transaction_lifecycle() {
+        let (mut scheduler, mut replay_stage, mut workers, mut event_consumer, _temp_dir) =
+            setup_scheduler_replay_stage_workers_and_events(BlockVerificationStageSetupConfig {
+                allocator_size: 64 * 1024 * 1024,
+                replay_to_pack_capacity: 8,
+                replay_block_status_capacity: 8,
+                worker_count: 1,
+                pack_to_worker_capacity: 8,
+                worker_to_pack_capacity: 8,
+            });
+        let transaction = allocate_minimal_transaction_region(&replay_stage.allocator, 1);
+        write_replay_messages(
+            &mut replay_stage,
+            [begin(42), entry(42, 1), transaction_message(transaction)],
+        );
+
+        assert_eq!(scheduler.service_ingress_queue(3), 3);
+        assert_eq!(scheduler.service_transaction_check_dispatches(1024), 1);
+        let check_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        queue_worker_check_response(
+            &mut workers[0],
+            check_message.batch,
+            successful_check_response(),
+        );
+        assert_eq!(scheduler.service_worker_responses(1), 1);
+        assert_eq!(scheduler.service_transaction_execution_dispatches(1, 1), 1);
+        let execution_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        queue_worker_execution_response(
+            &mut workers[0],
+            execution_message.batch,
+            successful_execution_response(),
+        );
+        assert_eq!(scheduler.service_worker_responses(1), 1);
+
+        let events = drain_replay_events(&mut event_consumer);
+        assert_eq!(
+            events.iter().map(|event| event.tag).collect::<Vec<_>>(),
+            [
+                replay_event_tags::SLOT_BEGIN,
+                replay_event_tags::TRANSACTION_INGESTED,
+                replay_event_tags::TRANSACTION_SENT_FOR_CHECK,
+                replay_event_tags::TRANSACTION_CHECK_PASSED,
+                replay_event_tags::TRANSACTION_READY_FOR_SCHEDULING,
+                replay_event_tags::TRANSACTION_SCHEDULED_FOR_EXEC,
+                replay_event_tags::TRANSACTION_FINISHED_EXEC,
+            ],
+        );
+        assert!(events.iter().all(|event| event.timestamp_ns != 0));
+        assert!(
+            events
+                .windows(2)
+                .all(|window| window[0].timestamp_ns <= window[1].timestamp_ns)
+        );
+
+        assert_eq!(events[0].slot(), 42);
+        assert_eq!(events[0].transaction_index(), None);
+        assert_eq!(events[0].signature(), None);
+
+        assert_eq!(events[1].slot(), 42);
+        assert_eq!(events[1].transaction_index(), Some(0));
+        assert_eq!(events[1].worker_id(), None);
+        assert_eq!(events[1].signature(), Some([1; SIGNATURE_BYTES]));
+
+        for event in &events[2..] {
+            assert_eq!(event.slot(), 42);
+            assert_eq!(event.transaction_index(), Some(0));
+            assert_eq!(event.signature(), None);
+        }
+        assert_eq!(events[2].worker_id(), Some(0));
+        assert_eq!(events[3].worker_id(), Some(0));
+        assert_eq!(events[4].worker_id(), None);
+        assert_eq!(events[5].worker_id(), Some(0));
+        assert_eq!(events[6].worker_id(), Some(0));
+        assert_eq!(events[2].worker_queue_len(), Some(1));
+        assert_eq!(events[5].worker_queue_len(), Some(1));
+        assert_eq!(events[3].worker_queue_len(), None);
+    }
+
+    #[test]
+    fn replay_event_broadcast_records_ready_queue_promotion() {
+        let (mut scheduler, mut replay_stage, mut workers, mut event_consumer, _temp_dir) =
+            setup_scheduler_replay_stage_workers_and_events(BlockVerificationStageSetupConfig {
+                allocator_size: 64 * 1024 * 1024,
+                replay_to_pack_capacity: 8,
+                replay_block_status_capacity: 8,
+                worker_count: 1,
+                pack_to_worker_capacity: 8,
+                worker_to_pack_capacity: 8,
+            });
+        let first_transaction = allocate_minimal_transaction_region(&replay_stage.allocator, 1);
+        let second_transaction = allocate_minimal_transaction_region(&replay_stage.allocator, 2);
+        write_replay_messages(
+            &mut replay_stage,
+            [
+                begin(42),
+                entry(42, 2),
+                transaction_message(first_transaction),
+                transaction_message(second_transaction),
+            ],
+        );
+
+        assert_eq!(scheduler.service_ingress_queue(4), 4);
+        assert_eq!(scheduler.service_transaction_check_dispatches(1024), 2);
+        let first_check = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        let second_check = read_pack_to_worker_message(&mut workers[0]).unwrap();
+
+        queue_worker_check_response(
+            &mut workers[0],
+            second_check.batch,
+            successful_check_response(),
+        );
+        assert_eq!(scheduler.service_worker_responses(1), 1);
+        queue_worker_check_response(
+            &mut workers[0],
+            first_check.batch,
+            successful_check_response(),
+        );
+        assert_eq!(scheduler.service_worker_responses(1), 1);
+
+        let events = drain_replay_events(&mut event_consumer);
+        let check_and_ready_events = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.tag,
+                    replay_event_tags::TRANSACTION_CHECK_PASSED
+                        | replay_event_tags::TRANSACTION_READY_FOR_SCHEDULING
+                )
+            })
+            .map(|event| (event.tag, event.transaction_index()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            check_and_ready_events,
+            [
+                (replay_event_tags::TRANSACTION_CHECK_PASSED, Some(1)),
+                (replay_event_tags::TRANSACTION_CHECK_PASSED, Some(0)),
+                (replay_event_tags::TRANSACTION_READY_FOR_SCHEDULING, Some(0),),
+                (replay_event_tags::TRANSACTION_READY_FOR_SCHEDULING, Some(1),),
+            ],
+        );
+    }
+
+    #[test]
+    fn replay_event_broadcast_records_scheduling_skip() {
+        let (mut scheduler, mut replay_stage, mut workers, mut event_consumer, _temp_dir) =
+            setup_scheduler_replay_stage_workers_and_events(BlockVerificationStageSetupConfig {
+                allocator_size: 64 * 1024 * 1024,
+                replay_to_pack_capacity: 8,
+                replay_block_status_capacity: 8,
+                worker_count: 1,
+                pack_to_worker_capacity: 8,
+                worker_to_pack_capacity: 8,
+            });
+        let account = Pubkey::new_unique();
+        let first_transaction =
+            allocate_minimal_transaction_region_with_account(&replay_stage.allocator, 1, account);
+        let second_transaction =
+            allocate_minimal_transaction_region_with_account(&replay_stage.allocator, 2, account);
+        write_replay_messages(
+            &mut replay_stage,
+            [
+                begin(42),
+                entry(42, 2),
+                transaction_message(first_transaction),
+                transaction_message(second_transaction),
+            ],
+        );
+
+        assert_eq!(scheduler.service_ingress_queue(4), 4);
+        assert_eq!(scheduler.service_transaction_check_dispatches(1024), 2);
+        let first_check = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        let second_check = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        queue_worker_check_response(
+            &mut workers[0],
+            first_check.batch,
+            successful_check_response_with_cost(MAX_OUTSTANDING_EXECUTION_COST_UNITS_PER_WORKER),
+        );
+        queue_worker_check_response(
+            &mut workers[0],
+            second_check.batch,
+            successful_check_response_with_cost(MAX_OUTSTANDING_EXECUTION_COST_UNITS_PER_WORKER),
+        );
+        assert_eq!(scheduler.service_worker_responses(2), 2);
+
+        assert_eq!(scheduler.service_transaction_execution_dispatches(2, 2), 1);
+
+        let events = drain_replay_events(&mut event_consumer);
+        let skipped_event = events
+            .iter()
+            .find(|event| event.tag == replay_event_tags::TRANSACTION_SCHEDULING_SKIPPED)
+            .expect("scheduling skip event should be emitted");
+        assert_eq!(skipped_event.slot(), 42);
+        assert_eq!(skipped_event.transaction_index(), Some(1));
+        assert_eq!(skipped_event.signature(), None);
+    }
+
+    #[test]
+    fn replay_event_broadcast_omits_execution_dispatch_events_without_ready_work() {
+        let (mut scheduler, mut replay_stage, _workers, mut event_consumer, _temp_dir) =
+            setup_scheduler_replay_stage_workers_and_events(BlockVerificationStageSetupConfig {
+                allocator_size: 64 * 1024 * 1024,
+                replay_to_pack_capacity: 8,
+                replay_block_status_capacity: 8,
+                worker_count: 1,
+                pack_to_worker_capacity: 8,
+                worker_to_pack_capacity: 8,
+            });
+        write_replay_messages(&mut replay_stage, [begin(42)]);
+
+        assert_eq!(scheduler.service_ingress_queue(1), 1);
+        assert_eq!(scheduler.service_transaction_execution_dispatches(1, 1), 0);
+
+        let events = drain_replay_events(&mut event_consumer);
+        assert_eq!(
+            events.iter().map(|event| event.tag).collect::<Vec<_>>(),
+            vec![replay_event_tags::SLOT_BEGIN],
+        );
+    }
+
+    #[test]
+    fn replay_event_broadcast_records_slot_abort() {
+        let (mut scheduler, mut replay_stage, _workers, mut event_consumer, _temp_dir) =
+            setup_scheduler_replay_stage_workers_and_events(BlockVerificationStageSetupConfig {
+                allocator_size: 64 * 1024 * 1024,
+                replay_to_pack_capacity: 8,
+                replay_block_status_capacity: 8,
+                worker_count: 1,
+                pack_to_worker_capacity: 8,
+                worker_to_pack_capacity: 8,
+            });
+        write_replay_messages(&mut replay_stage, [begin(42), abort(42)]);
+
+        assert_eq!(scheduler.service_ingress_queue(2), 2);
+        let events = drain_replay_events(&mut event_consumer);
+        assert_eq!(
+            events.iter().map(|event| event.tag).collect::<Vec<_>>(),
+            vec![replay_event_tags::SLOT_BEGIN],
+        );
+
+        assert_eq!(scheduler.service_terminal_slots(1), 1);
+
+        let events = drain_replay_events(&mut event_consumer);
+        assert_eq!(
+            events.iter().map(|event| event.tag).collect::<Vec<_>>(),
+            vec![replay_event_tags::SLOT_ABORT],
+        );
+        assert!(events.iter().all(|event| event.slot() == 42));
+        assert!(
+            events
+                .iter()
+                .all(|event| event.transaction_index().is_none())
+        );
+    }
+
+    #[test]
+    fn replay_event_broadcast_records_slot_complete() {
+        let (mut scheduler, mut replay_stage, _workers, mut event_consumer, _temp_dir) =
+            setup_scheduler_replay_stage_workers_and_events(BlockVerificationStageSetupConfig {
+                allocator_size: 64 * 1024 * 1024,
+                replay_to_pack_capacity: 8,
+                replay_block_status_capacity: 8,
+                worker_count: 1,
+                pack_to_worker_capacity: 8,
+                worker_to_pack_capacity: 8,
+            });
+        write_replay_messages(&mut replay_stage, [begin(42), complete(42)]);
+
+        assert_eq!(scheduler.service_ingress_queue(2), 2);
+        let events = drain_replay_events(&mut event_consumer);
+        assert_eq!(
+            events.iter().map(|event| event.tag).collect::<Vec<_>>(),
+            vec![replay_event_tags::SLOT_BEGIN],
+        );
+
+        assert_eq!(scheduler.service_terminal_slots(1), 1);
+
+        let events = drain_replay_events(&mut event_consumer);
+        assert_eq!(
+            events.iter().map(|event| event.tag).collect::<Vec<_>>(),
+            vec![replay_event_tags::SLOT_COMPLETE],
+        );
+        assert!(events.iter().all(|event| event.slot() == 42));
+        assert!(
+            events
+                .iter()
+                .all(|event| event.transaction_index().is_none())
+        );
+    }
+
+    #[test]
+    fn replay_event_broadcast_records_slot_failed() {
+        let (mut scheduler, mut replay_stage, mut workers, mut event_consumer, _temp_dir) =
+            setup_scheduler_replay_stage_workers_and_events(BlockVerificationStageSetupConfig {
+                allocator_size: 64 * 1024 * 1024,
+                replay_to_pack_capacity: 8,
+                replay_block_status_capacity: 8,
+                worker_count: 1,
+                pack_to_worker_capacity: 8,
+                worker_to_pack_capacity: 8,
+            });
+        let transaction = allocate_minimal_transaction_region(&replay_stage.allocator, 1);
+        write_replay_messages(
+            &mut replay_stage,
+            [
+                begin(42),
+                entry(42, 1),
+                transaction_message(transaction),
+                complete(42),
+            ],
+        );
+
+        assert_eq!(scheduler.service_ingress_queue(4), 4);
+        assert_eq!(scheduler.service_transaction_check_dispatches(1024), 1);
+        let check_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        queue_worker_check_response(
+            &mut workers[0],
+            check_message.batch,
+            signature_failed_check_response(),
+        );
+        assert_eq!(scheduler.service_worker_responses(1), 1);
+        wait_for_entry_verification(&mut scheduler, 42);
+        assert_eq!(scheduler.service_terminal_slots(1), 1);
+
+        let events = drain_replay_events(&mut event_consumer);
+        let failed_event = events
+            .iter()
+            .find(|event| event.tag == replay_event_tags::SLOT_FAILED)
+            .expect("slot failed event should be emitted");
+        assert_eq!(failed_event.slot(), 42);
+        assert_eq!(failed_event.transaction_index(), None);
+        assert_eq!(
+            failed_event.slot_failure_reason(),
+            Some(replay_block_status_reasons::INVALID_TRANSACTION),
+        );
+        assert_eq!(failed_event.signature(), None);
     }
 
     #[test]

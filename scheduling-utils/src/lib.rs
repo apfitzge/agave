@@ -8,6 +8,7 @@ pub mod bridge;
 #[cfg(unix)]
 pub mod handshake;
 pub mod pubkeys_ptr;
+pub mod replay_events;
 pub mod responses_region;
 #[cfg(unix)]
 pub mod shared_memory;

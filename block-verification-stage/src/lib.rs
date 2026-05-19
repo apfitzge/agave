@@ -4,6 +4,7 @@
 //! Block verification stage.
 
 mod entry_hash_verifier;
+mod replay_event_timestamp;
 
 pub mod scheduler;
 pub mod session;

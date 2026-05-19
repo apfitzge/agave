@@ -5104,7 +5104,7 @@ pub(crate) mod tests {
     use {
         super::*,
         crate::{
-            block_verification_stage::BlockVerificationStage,
+            block_verification_stage::{BlockVerificationStage, BlockVerificationStageConfig},
             commitment_service::AggregateCommitmentService,
             consensus::{
                 ThresholdDecision, Tower, VOTE_THRESHOLD_DEPTH,
@@ -5868,14 +5868,17 @@ pub(crate) mod tests {
             let (block_verification_stage, block_verification_session) =
                 BlockVerificationStage::new(
                     exit.clone(),
-                    worker_count,
-                    worker_count,
-                    None,
-                    replay_vote_sender.clone(),
-                    None,
-                    None,
-                    poh_recorder.read().unwrap().shared_leader_state(),
-                    bank_forks.clone(),
+                    BlockVerificationStageConfig {
+                        worker_count,
+                        entry_verification_threads: worker_count,
+                        transaction_status_sender: None,
+                        replay_vote_sender: replay_vote_sender.clone(),
+                        prioritization_fee_cache: None,
+                        log_messages_bytes_limit: None,
+                        shared_leader_state: poh_recorder.read().unwrap().shared_leader_state(),
+                        bank_forks: bank_forks.clone(),
+                        event_ledger_path: None,
+                    },
                 )
                 .unwrap();
             let context = ProcessActiveBanksContext::new_for_tests(

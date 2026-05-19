@@ -5,7 +5,9 @@ use {
     crate::banking_stage::spawn_replay_block_verification_workers,
     agave_block_verification_stage::{
         scheduler::BlockVerificationScheduler,
-        setup::{BlockVerificationStageSessions, BlockVerificationStageSetupConfig},
+        setup::{
+            BlockVerificationStageSessions, BlockVerificationStageSetupConfig, ReplayEventBroadcast,
+        },
     },
     log::warn,
     solana_ledger::blockstore_processor::TransactionStatusSender,
@@ -16,6 +18,7 @@ use {
     },
     std::{
         num::NonZeroUsize,
+        path::Path,
         sync::{
             Arc, RwLock,
             atomic::{AtomicBool, Ordering},
@@ -39,29 +42,24 @@ pub struct BlockVerificationRuntime {
     block_verification: ReplayBlockVerification,
 }
 
+pub struct BlockVerificationStageConfig<'a> {
+    pub worker_count: NonZeroUsize,
+    pub entry_verification_threads: NonZeroUsize,
+    pub transaction_status_sender: Option<TransactionStatusSender>,
+    pub replay_vote_sender: ReplayVoteSender,
+    pub prioritization_fee_cache: Option<Arc<PrioritizationFeeCache>>,
+    pub log_messages_bytes_limit: Option<usize>,
+    pub shared_leader_state: SharedLeaderState,
+    pub bank_forks: Arc<RwLock<BankForks>>,
+    pub event_ledger_path: Option<&'a Path>,
+}
+
 impl BlockVerificationRuntime {
     pub fn new(
         exit: Arc<AtomicBool>,
-        worker_count: NonZeroUsize,
-        entry_verification_threads: NonZeroUsize,
-        transaction_status_sender: Option<TransactionStatusSender>,
-        replay_vote_sender: ReplayVoteSender,
-        prioritization_fee_cache: Option<Arc<PrioritizationFeeCache>>,
-        log_messages_bytes_limit: Option<usize>,
-        shared_leader_state: SharedLeaderState,
-        bank_forks: Arc<RwLock<BankForks>>,
+        config: BlockVerificationStageConfig<'_>,
     ) -> Result<Self, String> {
-        let (stage, session) = BlockVerificationStage::new(
-            exit.clone(),
-            worker_count,
-            entry_verification_threads,
-            transaction_status_sender,
-            replay_vote_sender,
-            prioritization_fee_cache,
-            log_messages_bytes_limit,
-            shared_leader_state,
-            bank_forks,
-        )?;
+        let (stage, session) = BlockVerificationStage::new(exit.clone(), config)?;
         let block_verification = ReplayBlockVerification::new(session, exit);
 
         Ok(Self {
@@ -97,15 +95,24 @@ impl Drop for BlockVerificationRuntime {
 impl BlockVerificationStage {
     pub fn new(
         exit: Arc<AtomicBool>,
-        worker_count: NonZeroUsize,
-        entry_verification_threads: NonZeroUsize,
-        transaction_status_sender: Option<TransactionStatusSender>,
-        replay_vote_sender: ReplayVoteSender,
-        prioritization_fee_cache: Option<Arc<PrioritizationFeeCache>>,
-        log_messages_bytes_limit: Option<usize>,
-        shared_leader_state: SharedLeaderState,
-        bank_forks: Arc<RwLock<BankForks>>,
+        config: BlockVerificationStageConfig<'_>,
     ) -> Result<(Self, BlockVerificationSession), String> {
+        let BlockVerificationStageConfig {
+            worker_count,
+            entry_verification_threads,
+            transaction_status_sender,
+            replay_vote_sender,
+            prioritization_fee_cache,
+            log_messages_bytes_limit,
+            shared_leader_state,
+            bank_forks,
+            event_ledger_path,
+        } = config;
+        let event_broadcast = event_ledger_path
+            .map(ReplayEventBroadcast::new)
+            .transpose()
+            .map_err(|err| format!("failed to set up replay event broadcast: {err}"))?
+            .map(Arc::new);
         let sessions = BlockVerificationStageSessions::setup(BlockVerificationStageSetupConfig {
             allocator_size: ALLOCATOR_SIZE,
             replay_to_pack_capacity: REPLAY_TO_PACK_CAPACITY,
@@ -124,6 +131,7 @@ impl BlockVerificationStage {
 
         let mut threads = Vec::with_capacity(worker_count.get() + 1);
         let scheduler_exit = exit.clone();
+        let scheduler_event_broadcast = event_broadcast.clone();
         threads.push(
             Builder::new()
                 .name("solBlkVerif".to_string())
@@ -132,6 +140,7 @@ impl BlockVerificationStage {
                         scheduler_exit,
                         block_verification_stage,
                         entry_verification_threads,
+                        scheduler_event_broadcast,
                     )
                     .run();
                 })
@@ -146,6 +155,7 @@ impl BlockVerificationStage {
             log_messages_bytes_limit,
             shared_leader_state,
             bank_forks,
+            event_broadcast,
         ));
 
         Ok((
@@ -193,17 +203,21 @@ mod tests {
         let worker_count = NonZeroUsize::new(1).unwrap();
         let (block_verification_stage, _replay_stage) = BlockVerificationStage::new(
             exit.clone(),
-            worker_count,
-            worker_count,
-            None,
-            replay_vote_sender,
-            None,
-            None,
-            poh_recorder.read().unwrap().shared_leader_state(),
-            bank_forks,
+            BlockVerificationStageConfig {
+                worker_count,
+                entry_verification_threads: worker_count,
+                transaction_status_sender: None,
+                replay_vote_sender,
+                prioritization_fee_cache: None,
+                log_messages_bytes_limit: None,
+                shared_leader_state: poh_recorder.read().unwrap().shared_leader_state(),
+                bank_forks,
+                event_ledger_path: Some(ledger_path.path()),
+            },
         )
         .unwrap();
 
+        assert!(ledger_path.path().join("agave_events.ipc").exists());
         assert_eq!(block_verification_stage.thread_count(), 2);
         exit.store(true, Ordering::Relaxed);
         block_verification_stage.join().unwrap();

@@ -9,7 +9,7 @@ use {
         },
         banking_trace::{self, BankingTracer, TraceError},
         block_creation_loop::{BlockCreationLoop, BlockCreationLoopConfig, ReplayHighestFrozen},
-        block_verification_stage::BlockVerificationRuntime,
+        block_verification_stage::{BlockVerificationRuntime, BlockVerificationStageConfig},
         cluster_info_vote_listener::VoteTracker,
         completed_data_sets_service::CompletedDataSetsService,
         consensus::{
@@ -1073,14 +1073,17 @@ impl Validator {
         let block_verification_exit = Arc::new(AtomicBool::new(false));
         let block_verification_runtime = BlockVerificationRuntime::new(
             block_verification_exit,
-            config.replay_transactions_threads,
-            config.replay_transactions_threads,
-            transaction_status_sender.clone(),
-            replay_vote_sender.clone(),
-            prioritization_fee_cache.clone(),
-            config.runtime_config.log_messages_bytes_limit,
-            poh_recorder.read().unwrap().shared_leader_state(),
-            bank_forks.clone(),
+            BlockVerificationStageConfig {
+                worker_count: config.replay_transactions_threads,
+                entry_verification_threads: config.replay_transactions_threads,
+                transaction_status_sender: transaction_status_sender.clone(),
+                replay_vote_sender: replay_vote_sender.clone(),
+                prioritization_fee_cache: prioritization_fee_cache.clone(),
+                log_messages_bytes_limit: config.runtime_config.log_messages_bytes_limit,
+                shared_leader_state: poh_recorder.read().unwrap().shared_leader_state(),
+                bank_forks: bank_forks.clone(),
+                event_ledger_path: Some(ledger_path),
+            },
         )
         .map_err(ValidatorError::Other)?;
         let mut process_blockstore = ProcessBlockStore::new(

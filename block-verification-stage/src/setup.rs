@@ -1,14 +1,23 @@
 use {
+    crate::replay_event_timestamp::ReplayEventTimestampSource,
     agave_scheduler_bindings::{
         PackToWorkerMessage, ReplayBlockStatusMessage, ReplayToPackMessage, WorkerToPackMessage,
     },
-    agave_scheduling_utils::shared_memory::{self, SharedMemoryError},
+    agave_scheduling_utils::{
+        replay_events::{REPLAY_EVENTS_IPC_FILE, ReplayEvent},
+        shared_memory::{self, SharedMemoryError},
+    },
     rts_alloc::Allocator,
-    std::fs::File,
+    std::{
+        fs::File,
+        path::{Path, PathBuf},
+        sync::atomic::Ordering,
+    },
 };
 
 const SESSION_ALLOCATOR_HANDLES: usize = 2;
 const ALLOCATOR_SLAB_SIZE: u32 = 2 * 1024 * 1024;
+const REPLAY_EVENT_CAPACITY: usize = 1024 * 1024;
 
 const SHMEM_NAME: &std::ffi::CStr = c"agave-block-verification-stage";
 
@@ -56,6 +65,36 @@ pub struct BlockVerificationStageSessions {
     pub block_verification_stage: BlockVerificationStageSession,
     pub replay_stage: ReplayStageSession,
     pub workers: Vec<BlockVerificationWorkerSession>,
+}
+
+/// Locally created replay event broadcast.
+pub struct ReplayEventBroadcast {
+    path: PathBuf,
+    producer: shaq::broadcast::Producer<ReplayEvent>,
+    timestamp_source: ReplayEventTimestampSource,
+}
+
+impl ReplayEventBroadcast {
+    pub fn new(ledger_path: &Path) -> Result<Self, SharedMemoryError> {
+        let path = ledger_path.join(REPLAY_EVENTS_IPC_FILE);
+        let producer =
+            shared_memory::create_broadcast_producer_at_path(&path, REPLAY_EVENT_CAPACITY)?;
+
+        Ok(Self {
+            path,
+            producer,
+            timestamp_source: ReplayEventTimestampSource::new(),
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn emit(&self, mut event: ReplayEvent) {
+        event.timestamp_ns = self.timestamp_source.timestamp_ns();
+        let _ = self.producer.try_write(event, Ordering::Relaxed);
+    }
 }
 
 impl BlockVerificationStageSessions {
@@ -177,6 +216,24 @@ mod tests {
             pack_to_worker_capacity: 8,
             worker_to_pack_capacity: 8,
         })
+    }
+
+    #[test]
+    fn replay_event_broadcast_stamps_timestamp() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let event_broadcast = ReplayEventBroadcast::new(temp_dir.path()).unwrap();
+        let mut event_consumer: shaq::broadcast::Consumer<ReplayEvent> =
+            shared_memory::join_broadcast_consumer_at_path(event_broadcast.path()).unwrap();
+        assert_eq!(event_consumer.try_read(Ordering::Relaxed).unwrap(), None);
+
+        event_broadcast.emit(ReplayEvent::slot_begin(0, 42));
+        let event = event_consumer
+            .try_read(Ordering::Relaxed)
+            .unwrap()
+            .expect("replay event should be broadcast");
+
+        assert_ne!(event.timestamp_ns, 0);
+        assert_eq!(event.slot(), 42);
     }
 
     #[test]

@@ -82,6 +82,7 @@ dependencies = [
  "solana-pubkey 4.2.0",
  "solana-signature",
  "solana-transaction",
+ "tempfile",
  "wincode",
 ]
 
@@ -6613,9 +6614,8 @@ dependencies = [
 
 [[package]]
 name = "shaq"
-version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c34483a45b522d9b15cc1031536718acb3f2d94f7bc09d7156a3e8d173dfdffe"
+version = "3.0.0"
+source = "git+https://github.com/apfitzge/shaq?branch=shaqcast#1bc0c460084fded1245b2a4dd5f0bde7a14d5d2b"
 dependencies = [
  "libc",
  "windows-sys 0.59.0",

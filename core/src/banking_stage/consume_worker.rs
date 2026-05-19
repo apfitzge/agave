@@ -203,6 +203,10 @@ pub(crate) mod external {
         },
         agave_scheduling_utils::{
             error::transaction_error_to_not_included_reason,
+            replay_events::{
+                ReplayEvent, ReplayTransactionCheckMetadata, ReplayTransactionExecutionMetadata,
+                replay_event_tags,
+            },
             responses_region::{allocate_check_response_region, execution_responses_from_iter},
             transaction_ptr::{TransactionPtr, TransactionPtrBatch},
         },
@@ -234,10 +238,12 @@ pub(crate) mod external {
     }
 
     pub(crate) struct ExternalWorker {
+        id: u32,
         exit: Arc<AtomicBool>,
         consumer: Consumer,
         sender: shaq::spsc::Producer<WorkerToPackMessage>,
         allocator: rts_alloc::Allocator,
+        event_broadcast: Option<Arc<agave_block_verification_stage::setup::ReplayEventBroadcast>>,
 
         shared_leader_state: SharedLeaderState,
         bank_forks: Arc<RwLock<BankForks>>,
@@ -282,13 +288,18 @@ pub(crate) mod external {
             allocator: rts_alloc::Allocator,
             shared_leader_state: SharedLeaderState,
             bank_forks: Arc<RwLock<BankForks>>,
+            event_broadcast: Option<
+                Arc<agave_block_verification_stage::setup::ReplayEventBroadcast>,
+            >,
         ) -> Self {
             let sharable_banks = bank_forks.read().unwrap().sharable_banks();
             Self {
+                id,
                 exit,
                 consumer,
                 sender,
                 allocator,
+                event_broadcast,
                 shared_leader_state,
                 bank_forks,
                 sharable_banks,
@@ -361,12 +372,83 @@ pub(crate) mod external {
 
         fn send_response_message(
             &mut self,
+            source_message: &PackToWorkerMessage,
             response: WorkerToPackMessage,
         ) -> Result<(), ExternalConsumeWorkerError> {
             self.sender.sync();
             self.sender
                 .try_write(response)
-                .map_err(|_| ExternalConsumeWorkerError::SenderDisconnected)
+                .map_err(|_| ExternalConsumeWorkerError::SenderDisconnected)?;
+            self.emit_replay_worker_response_event(source_message, &response);
+            Ok(())
+        }
+
+        fn emit_replay_worker_response_event(
+            &self,
+            source_message: &PackToWorkerMessage,
+            response: &WorkerToPackMessage,
+        ) {
+            if response.processed_code != processed_codes::PROCESSED {
+                return;
+            }
+
+            let tag = match response.responses.tag {
+                agave_scheduler_bindings::worker_message_types::CHECK_RESPONSE => {
+                    replay_event_tags::TRANSACTION_WORKER_CHECK_COMPLETED
+                }
+                agave_scheduler_bindings::worker_message_types::EXECUTION_RESPONSE => {
+                    replay_event_tags::TRANSACTION_WORKER_EXECUTION_COMPLETED
+                }
+                _ => return,
+            };
+            self.emit_replay_worker_transaction_event(tag, source_message);
+        }
+
+        fn emit_replay_worker_transaction_event(&self, tag: u64, message: &PackToWorkerMessage) {
+            let Some(event_broadcast) = self.event_broadcast.as_ref() else {
+                return;
+            };
+
+            if Self::is_replay_check_message(message) {
+                let batch = unsafe {
+                    // SAFETY: Replay check messages are allocated by the replay
+                    // scheduler with `ReplayTransactionCheckMetadata`.
+                    TransactionPtrBatch::<ReplayTransactionCheckMetadata>::from_sharable_transaction_batch_region(
+                        &message.batch,
+                        &self.allocator,
+                    )
+                };
+                for (_, metadata) in batch.iter() {
+                    event_broadcast.emit(ReplayEvent::transaction_worker_event(
+                        0,
+                        tag,
+                        metadata.slot,
+                        u64::try_from(metadata.transaction_index)
+                            .expect("transaction index must fit in u64"),
+                        u64::from(self.id),
+                    ));
+                }
+            } else if Self::is_replay_message(message) {
+                let batch = unsafe {
+                    // SAFETY: Replay execution messages are allocated by the
+                    // replay scheduler with
+                    // `ReplayTransactionExecutionMetadata`.
+                    TransactionPtrBatch::<ReplayTransactionExecutionMetadata>::from_sharable_transaction_batch_region(
+                        &message.batch,
+                        &self.allocator,
+                    )
+                };
+                for (_, metadata) in batch.iter() {
+                    event_broadcast.emit(ReplayEvent::transaction_worker_event(
+                        0,
+                        tag,
+                        metadata.slot,
+                        u64::try_from(metadata.transaction_index)
+                            .expect("transaction index must fit in u64"),
+                        u64::from(self.id),
+                    ));
+                }
+            }
         }
 
         /// Return true if fetching a bank for execution timed out.
@@ -388,6 +470,10 @@ pub(crate) mod external {
                 .count_metrics
                 .num_messages_processed
                 .fetch_add(1, Ordering::Relaxed);
+            self.emit_replay_worker_transaction_event(
+                replay_event_tags::TRANSACTION_WORKER_PICKED_UP,
+                message,
+            );
 
             if message.flags & pack_message_flags::EXECUTE != 0 {
                 self.execute_batch(message, should_drain_executes)
@@ -425,6 +511,10 @@ pub(crate) mod external {
                         .map(|()| false);
                 }
             };
+            self.emit_replay_worker_transaction_event(
+                replay_event_tags::TRANSACTION_WORKER_EXECUTION_BANK_ACQUIRED,
+                message,
+            );
 
             // SAFETY: Assumption that external scheduler does not pass messages with batch regions
             //         not pointing to valid regions in the allocator.
@@ -436,6 +526,10 @@ pub(crate) mod external {
             };
             let (translation_results, transactions, max_ages) =
                 Self::translate_transaction_batch(&batch, &bank);
+            self.emit_replay_worker_transaction_event(
+                replay_event_tags::TRANSACTION_WORKER_EXECUTION_TRANSLATED,
+                message,
+            );
 
             // Enforce all or nothing on translation_results.
             let execution_flags = Self::execution_flags_from_message_flags(message.flags);
@@ -453,6 +547,10 @@ pub(crate) mod external {
                 &transactions,
                 &max_ages,
                 execution_flags,
+            );
+            self.emit_replay_worker_transaction_event(
+                replay_event_tags::TRANSACTION_WORKER_EXECUTION_PROCESSED,
+                message,
             );
 
             self.metrics.update_for_consume(&output);
@@ -472,6 +570,10 @@ pub(crate) mod external {
                     )
                     .map(|()| true);
             };
+            self.emit_replay_worker_transaction_event(
+                replay_event_tags::TRANSACTION_WORKER_EXECUTION_COMMIT_RESULTS_READY,
+                message,
+            );
 
             self.send_execution_response(
                 message,
@@ -551,6 +653,10 @@ pub(crate) mod external {
                     );
                 }
             };
+            self.emit_replay_worker_transaction_event(
+                replay_event_tags::TRANSACTION_WORKER_CHECK_BANK_ACQUIRED,
+                message,
+            );
 
             // SAFETY: Assumption that external scheduler does not pass messages with batch regions
             //         not pointing to valid regions in the allocator.
@@ -577,6 +683,10 @@ pub(crate) mod external {
                     responses_ptr,
                 )
             };
+            self.emit_replay_worker_transaction_event(
+                replay_event_tags::TRANSACTION_WORKER_CHECK_PARSED,
+                message,
+            );
 
             // Verify transaction signatures if requested.
             if message.flags & check_flags::VERIFY_SIGNATURES != 0 {
@@ -584,6 +694,10 @@ pub(crate) mod external {
                     &parsing_results,
                     &parsed_transactions,
                     response_slice,
+                );
+                self.emit_replay_worker_transaction_event(
+                    replay_event_tags::TRANSACTION_WORKER_CHECK_SIGNATURES_COMPLETE,
+                    message,
                 );
             }
 
@@ -594,6 +708,10 @@ pub(crate) mod external {
                     &parsed_transactions,
                     response_slice,
                     &working_bank,
+                );
+                self.emit_replay_worker_transaction_event(
+                    replay_event_tags::TRANSACTION_WORKER_CHECK_FEE_PAYER_BALANCE_COMPLETE,
+                    message,
                 );
             }
 
@@ -608,6 +726,10 @@ pub(crate) mod external {
                 &parse_and_resolve_bank,
                 message.flags & check_flags::ESTIMATE_COST != 0,
             );
+            self.emit_replay_worker_transaction_event(
+                replay_event_tags::TRANSACTION_WORKER_CHECK_RESOLVED,
+                message,
+            );
 
             if message.flags & check_flags::LOAD_ADDRESS_LOOKUP_TABLES != 0 {
                 self.check_resolve_pubkeys(
@@ -617,6 +739,10 @@ pub(crate) mod external {
                     &max_ages,
                     response_slice,
                 )?;
+                self.emit_replay_worker_transaction_event(
+                    replay_event_tags::TRANSACTION_WORKER_CHECK_ADDRESS_TABLES_COMPLETE,
+                    message,
+                );
             }
 
             if message.flags & check_flags::STATUS_CHECKS != 0 {
@@ -626,6 +752,10 @@ pub(crate) mod external {
                     response_slice,
                     &working_bank,
                 );
+                self.emit_replay_worker_transaction_event(
+                    replay_event_tags::TRANSACTION_WORKER_CHECK_STATUS_COMPLETE,
+                    message,
+                );
             }
 
             let response = WorkerToPackMessage {
@@ -634,7 +764,7 @@ pub(crate) mod external {
                 responses,
             };
 
-            self.send_response_message(response)?;
+            self.send_response_message(message, response)?;
 
             Ok(())
         }
@@ -682,7 +812,7 @@ pub(crate) mod external {
                 responses,
             };
 
-            self.send_response_message(response)?;
+            self.send_response_message(message, response)?;
 
             Ok(())
         }
@@ -763,7 +893,7 @@ pub(crate) mod external {
 
             // Should de-allocate the memory, but this is a non-recoverable
             // error and so it's not needed.
-            self.send_response_message(response_message)?;
+            self.send_response_message(message, response_message)?;
 
             Ok(())
         }
@@ -870,7 +1000,7 @@ pub(crate) mod external {
                 },
             };
 
-            self.send_response_message(response)?;
+            self.send_response_message(message, response)?;
 
             Ok(())
         }
@@ -1369,11 +1499,13 @@ pub(crate) mod external {
         use {
             super::*,
             crate::banking_stage::{committer::Committer, tests::create_slow_genesis_config},
+            agave_block_verification_stage::setup::ReplayEventBroadcast,
             agave_scheduler_bindings::{SharableTransactionBatchRegion, worker_message_types},
             agave_scheduling_utils::{
                 handshake::{ClientLogon, client, server::Server},
                 pubkeys_ptr::PubkeysPtr,
                 responses_region::{CheckResponsesPtr, ExecutionResponsesPtr},
+                shared_memory,
             },
             crossbeam_channel::unbounded,
             solana_account::AccountSharedData,
@@ -1553,6 +1685,72 @@ pub(crate) mod external {
                 }
             }
 
+            fn allocate_batch_with_metadata<M: Copy>(
+                &self,
+                transactions: &[(Vec<u8>, M)],
+            ) -> SharedBatch {
+                assert!(transactions.len() <= MAX_TRANSACTIONS_PER_MESSAGE);
+
+                let batch_ptr = self
+                    .allocator
+                    .allocate(TransactionPtrBatch::<M>::TRANSACTION_META_END as u32)
+                    .unwrap();
+                // SAFETY: `batch_ptr` came from this allocator immediately above, so translating
+                // it back to an offset in the same allocator is valid.
+                let batch_offset = unsafe { self.allocator.offset(batch_ptr) };
+                let tx_ptr =
+                    batch_ptr.cast::<agave_scheduler_bindings::SharableTransactionRegion>();
+                // SAFETY: `batch_ptr` points to an allocation sized with
+                // `TransactionPtrBatch::<M>::TRANSACTION_META_END`, and
+                // `TRANSACTION_META_START` is the aligned offset for `M`.
+                let meta_ptr = unsafe {
+                    batch_ptr
+                        .byte_add(TransactionPtrBatch::<M>::TRANSACTION_META_START)
+                        .cast::<M>()
+                };
+
+                let mut sharable_transactions = Vec::with_capacity(transactions.len());
+                for (index, (transaction, metadata)) in transactions.iter().enumerate() {
+                    let tx_allocation = self
+                        .allocator
+                        .allocate(transaction.len().try_into().unwrap())
+                        .unwrap();
+                    unsafe {
+                        // SAFETY: `tx_allocation` points to a fresh allocation of exactly
+                        // `transaction.len()` bytes, and `transaction.as_ptr()` is readable for
+                        // that same length. The regions do not overlap.
+                        std::ptr::copy_nonoverlapping(
+                            transaction.as_ptr(),
+                            tx_allocation.as_ptr(),
+                            transaction.len(),
+                        );
+                    }
+                    let tx_region = agave_scheduler_bindings::SharableTransactionRegion {
+                        // SAFETY: `tx_allocation` came from this allocator immediately above, so
+                        // translating it back to an offset in the same allocator is valid.
+                        offset: unsafe { self.allocator.offset(tx_allocation) },
+                        length: transaction.len().try_into().unwrap(),
+                    };
+                    unsafe {
+                        // SAFETY: the batch allocation is sized for
+                        // `TransactionPtrBatch::<M>::TRANSACTION_META_END`, which includes space
+                        // for up to `MAX_TRANSACTIONS_PER_MESSAGE` transaction headers and
+                        // metadata entries. The assert above guarantees `index` is in-bounds.
+                        tx_ptr.add(index).write(tx_region);
+                        meta_ptr.add(index).write(*metadata);
+                    };
+                    sharable_transactions.push(tx_region);
+                }
+
+                SharedBatch {
+                    region: SharableTransactionBatchRegion {
+                        num_transactions: transactions.len().try_into().unwrap(),
+                        transactions_offset: batch_offset,
+                    },
+                    transactions: sharable_transactions,
+                }
+            }
+
             fn free_batch(&self, batch: SharedBatch) {
                 for tx in batch.transactions {
                     unsafe {
@@ -1571,6 +1769,30 @@ pub(crate) mod external {
                     );
                 }
             }
+        }
+
+        fn install_replay_event_broadcast(
+            worker: &mut ExternalWorker,
+        ) -> (shaq::broadcast::Consumer<ReplayEvent>, tempfile::TempDir) {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let event_broadcast = ReplayEventBroadcast::new(temp_dir.path()).unwrap();
+            let mut event_consumer =
+                shared_memory::join_broadcast_consumer_at_path(event_broadcast.path()).unwrap();
+            assert_eq!(event_consumer.try_read(Ordering::Relaxed).unwrap(), None);
+
+            worker.event_broadcast = Some(Arc::new(event_broadcast));
+
+            (event_consumer, temp_dir)
+        }
+
+        fn drain_replay_events(
+            event_consumer: &mut shaq::broadcast::Consumer<ReplayEvent>,
+        ) -> Vec<ReplayEvent> {
+            let mut events = Vec::new();
+            while let Some(event) = event_consumer.try_read(Ordering::Relaxed).unwrap() {
+                events.push(event);
+            }
+            events
         }
 
         fn store_address_lookup_table(
@@ -1631,6 +1853,7 @@ pub(crate) mod external {
                 agave_worker.allocator,
                 shared_leader_state.clone(),
                 bank_forks.clone(),
+                None,
             );
 
             ExternalTestFrame {
@@ -2605,6 +2828,57 @@ pub(crate) mod external {
         }
 
         #[test]
+        fn test_run_check_replay_emits_worker_events() {
+            let mut test_frame = setup_external_test_frame();
+            let (mut event_consumer, _temp_dir) =
+                install_replay_event_broadcast(&mut test_frame.worker);
+            let slot = test_frame.bank.slot();
+            let transaction_index = 17;
+            let batch = test_frame.allocate_batch_with_metadata(&[(
+                test_serialized_transaction(test_frame.bank.confirmed_last_blockhash()),
+                ReplayTransactionCheckMetadata {
+                    slot,
+                    transaction_index,
+                    thread_id: 0,
+                },
+            )]);
+
+            test_frame.send_message(PackToWorkerMessage {
+                flags: pack_message_flags::CHECK
+                    | check_flags::VERIFY_SIGNATURES
+                    | check_flags::REPLAY,
+                max_working_slot: slot,
+                batch: batch.region,
+            });
+            test_frame.iterate().unwrap();
+            let response = test_frame.recv_response();
+            assert_eq!(response.processed_code, processed_codes::PROCESSED);
+            let responses = test_frame.check_responses(&response.responses);
+            assert_eq!(responses.len(), 1);
+
+            let events = drain_replay_events(&mut event_consumer);
+            assert_eq!(
+                events.iter().map(|event| event.tag).collect::<Vec<_>>(),
+                [
+                    replay_event_tags::TRANSACTION_WORKER_PICKED_UP,
+                    replay_event_tags::TRANSACTION_WORKER_CHECK_BANK_ACQUIRED,
+                    replay_event_tags::TRANSACTION_WORKER_CHECK_PARSED,
+                    replay_event_tags::TRANSACTION_WORKER_CHECK_SIGNATURES_COMPLETE,
+                    replay_event_tags::TRANSACTION_WORKER_CHECK_RESOLVED,
+                    replay_event_tags::TRANSACTION_WORKER_CHECK_COMPLETED,
+                ]
+            );
+            for event in events {
+                assert_ne!(event.timestamp_ns, 0);
+                assert_eq!(event.slot(), slot);
+                assert_eq!(event.transaction_index(), Some(transaction_index as u64));
+                assert_eq!(event.worker_id(), Some(0));
+            }
+
+            test_frame.free_batch(batch);
+        }
+
+        #[test]
         fn test_run_check_replay_resolve_uses_replay_bank() {
             let mut test_frame = setup_external_test_frame();
 
@@ -2898,6 +3172,63 @@ pub(crate) mod external {
         }
 
         #[test]
+        fn test_run_execute_replay_emits_worker_events() {
+            let mut test_frame = setup_external_test_frame();
+            let (mut event_consumer, _temp_dir) =
+                install_replay_event_broadcast(&mut test_frame.worker);
+            let slot = test_frame.bank.slot();
+            let transaction_index = 23;
+            let recipient = Pubkey::new_unique();
+            let batch = test_frame.allocate_batch_with_metadata(&[(
+                wincode::serialize(&transfer(
+                    &test_frame.mint_keypair,
+                    &recipient,
+                    1,
+                    test_frame.bank.confirmed_last_blockhash(),
+                ))
+                .unwrap(),
+                ReplayTransactionExecutionMetadata {
+                    slot,
+                    transaction_index,
+                    thread_id: 0,
+                },
+            )]);
+
+            test_frame.send_message(PackToWorkerMessage {
+                flags: pack_message_flags::EXECUTE | execution_flags::REPLAY,
+                max_working_slot: slot,
+                batch: batch.region,
+            });
+            test_frame.iterate().unwrap();
+            let response = test_frame.recv_response();
+            assert_eq!(response.processed_code, processed_codes::PROCESSED);
+            let responses = test_frame.execution_responses(&response.responses);
+            assert_eq!(responses.len(), 1);
+            assert_eq!(responses[0].not_included_reason, not_included_reasons::NONE);
+
+            let events = drain_replay_events(&mut event_consumer);
+            assert_eq!(
+                events.iter().map(|event| event.tag).collect::<Vec<_>>(),
+                [
+                    replay_event_tags::TRANSACTION_WORKER_PICKED_UP,
+                    replay_event_tags::TRANSACTION_WORKER_EXECUTION_BANK_ACQUIRED,
+                    replay_event_tags::TRANSACTION_WORKER_EXECUTION_TRANSLATED,
+                    replay_event_tags::TRANSACTION_WORKER_EXECUTION_PROCESSED,
+                    replay_event_tags::TRANSACTION_WORKER_EXECUTION_COMMIT_RESULTS_READY,
+                    replay_event_tags::TRANSACTION_WORKER_EXECUTION_COMPLETED,
+                ]
+            );
+            for event in events {
+                assert_ne!(event.timestamp_ns, 0);
+                assert_eq!(event.slot(), slot);
+                assert_eq!(event.transaction_index(), Some(transaction_index as u64));
+                assert_eq!(event.worker_id(), Some(0));
+            }
+
+            test_frame.free_batch(batch);
+        }
+
+        #[test]
         fn test_run_execute_replay_missing_bank() {
             let mut test_frame = setup_external_test_frame();
 
@@ -3087,7 +3418,7 @@ fn active_leader_state(
 
 const STARTING_SLEEP_DURATION: Duration = Duration::from_micros(250);
 const MAX_SLEEP_DURATION: Duration = Duration::from_millis(1);
-const IDLE_SLEEP_THRESHOLD: Duration = Duration::from_millis(400);
+const IDLE_SLEEP_THRESHOLD: Duration = Duration::from_millis(10);
 
 /// Sleeps for the specified time. Returns the next sleep duration to use.
 fn backoff(idle_duration: Duration, sleep_duration: &Duration) -> Duration {
