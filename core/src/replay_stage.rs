@@ -2606,11 +2606,6 @@ impl ReplayStage {
         replay_progress: &mut ConfirmationProgress,
     ) -> result::Result<(), BlockstoreProcessorError> {
         let slot = bank.slot();
-        process_active_banks_context
-            .block_verification
-            .lock()
-            .unwrap()
-            .clean_remote_free_lists();
         if bank.is_complete() {
             return Ok(());
         }
@@ -2629,6 +2624,12 @@ impl ReplayStage {
             }
             load_result
         }?;
+
+        process_active_banks_context
+            .block_verification
+            .lock()
+            .unwrap()
+            .clean_remote_free_lists();
 
         let (entries, num_shreds, slot_full) = slot_entries_load_result;
         let num_entries = entries.len();
