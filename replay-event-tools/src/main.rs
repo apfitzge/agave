@@ -337,30 +337,6 @@ fn snapshot(
     selected_transaction: Option<u64>,
 ) -> UiSnapshot {
     let store = store.lock().unwrap();
-    let slots = store
-        .slot_ids()
-        .into_iter()
-        .filter_map(|slot| {
-            let slot_record = store.slot(slot)?;
-            let active_sessions = slot_active_sessions(slot_record);
-            let active_duration_ns = active_sessions_total_duration_ns(
-                &active_sessions,
-                slot_latest_timestamp_ns(slot_record),
-            );
-            Some(SlotSummary {
-                slot,
-                transaction_count: slot_record.transactions.len(),
-                duration_ns: slot_record.duration_ns(),
-                active_duration_ns,
-                active_session_count: active_sessions.len(),
-                active_pending_transactions: active_sessions_pending_transactions(
-                    &active_sessions,
-                ),
-                status: slot_record.status(),
-            })
-        })
-        .collect::<Vec<_>>();
-
     let selected_slot = selected_slot
         .and_then(|slot| store.slot(slot))
         .map(|slot_record| {
@@ -410,6 +386,28 @@ fn snapshot(
                 selected_transaction,
             }
         });
+    let slots = store
+        .slot_ids()
+        .into_iter()
+        .filter_map(|slot| {
+            let slot_record = store.slot(slot)?;
+            let selected_slot_summary = selected_slot
+                .as_ref()
+                .filter(|selected_slot| selected_slot.slot == slot);
+            Some(SlotSummary {
+                slot,
+                transaction_count: slot_record.transactions.len(),
+                duration_ns: slot_record.duration_ns(),
+                active_duration_ns: selected_slot_summary
+                    .and_then(|selected_slot| selected_slot.active_duration_ns),
+                active_session_count: selected_slot_summary
+                    .map_or(0, |selected_slot| selected_slot.active_sessions.len()),
+                active_pending_transactions: selected_slot_summary
+                    .map_or(0, |selected_slot| selected_slot.active_pending_transactions),
+                status: slot_record.status(),
+            })
+        })
+        .collect::<Vec<_>>();
 
     UiSnapshot {
         received_events: stats.received_events.load(Ordering::Relaxed),
