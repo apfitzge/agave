@@ -62,6 +62,7 @@ struct App {
     worker_filter: Option<u64>,
     worker_timeline_kind: WorkerTimelineKind,
     focus: FocusPane,
+    maximized_pane: Option<FocusPane>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -76,8 +77,15 @@ enum FocusPane {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum WorkerTimelineKind {
     #[default]
-    Replay,
+    Execution,
+    Check,
     SignatureVerification,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplayWorkerStage {
+    Check,
+    Execution,
 }
 
 struct UiSnapshot {
@@ -107,6 +115,7 @@ struct SelectedSlot {
     active_sessions: Vec<ActiveSessionSummary>,
     slot_events: Vec<TimelineEvent>,
     worker_events: Vec<WorkerTimelineEvent>,
+    check_worker_events: Vec<WorkerTimelineEvent>,
     signature_verification_worker_events: Vec<WorkerTimelineEvent>,
     transactions: Vec<TransactionSummary>,
     selected_transaction: Option<TransactionTimeline>,
@@ -377,7 +386,8 @@ fn snapshot(
                 active_pending_transactions,
                 active_sessions,
                 slot_events: slot_timeline(slot_record),
-                worker_events: worker_timeline(slot_record, WorkerTimelineKind::Replay),
+                worker_events: worker_timeline(slot_record, WorkerTimelineKind::Execution),
+                check_worker_events: worker_timeline(slot_record, WorkerTimelineKind::Check),
                 signature_verification_worker_events: worker_timeline(
                     slot_record,
                     WorkerTimelineKind::SignatureVerification,
@@ -743,9 +753,19 @@ fn worker_timeline(
         .or_else(|| {
             slot.transactions
                 .values()
-                .flat_map(|transaction| transaction.events.iter())
-                .filter(|event| worker_event_id(event, worker_timeline_kind).is_some())
-                .map(|event| event.timestamp_ns)
+                .flat_map(|transaction| {
+                    transaction.events.iter().enumerate().filter_map(
+                        move |(event_index, event)| {
+                            worker_event_id(
+                                &transaction.events,
+                                event_index,
+                                event,
+                                worker_timeline_kind,
+                            )
+                            .map(|_| event.timestamp_ns)
+                        },
+                    )
+                })
                 .min()
         })
         .unwrap_or_default();
@@ -753,28 +773,110 @@ fn worker_timeline(
         .transactions
         .values()
         .flat_map(|transaction| {
-            transaction.events.iter().filter_map(move |event| {
-                let worker_id = worker_event_id(event, worker_timeline_kind)?;
-                let transaction_index = event.transaction_index()?;
-                Some(WorkerTimelineEvent {
-                    delta_ns: event.timestamp_ns.saturating_sub(base_timestamp_ns),
-                    timestamp_ns: event.timestamp_ns,
-                    worker_id,
-                    transaction_index,
-                    name: event_name(event.tag),
-                    detail: worker_timeline_event_detail(event),
+            transaction
+                .events
+                .iter()
+                .enumerate()
+                .filter_map(move |(event_index, event)| {
+                    let worker_id = worker_event_id(
+                        &transaction.events,
+                        event_index,
+                        event,
+                        worker_timeline_kind,
+                    )?;
+                    let transaction_index = event.transaction_index()?;
+                    Some(WorkerTimelineEvent {
+                        delta_ns: event.timestamp_ns.saturating_sub(base_timestamp_ns),
+                        timestamp_ns: event.timestamp_ns,
+                        worker_id,
+                        transaction_index,
+                        name: event_name(event.tag),
+                        detail: worker_timeline_event_detail(event),
+                    })
                 })
-            })
         })
         .collect::<Vec<_>>();
     events.sort_by_key(|event| (event.timestamp_ns, event.worker_id, event.transaction_index));
     events
 }
 
-fn worker_event_id(event: &ReplayEvent, worker_timeline_kind: WorkerTimelineKind) -> Option<u64> {
+fn worker_event_id(
+    transaction_events: &[ReplayEvent],
+    event_index: usize,
+    event: &ReplayEvent,
+    worker_timeline_kind: WorkerTimelineKind,
+) -> Option<u64> {
     match worker_timeline_kind {
-        WorkerTimelineKind::Replay => event.worker_id(),
+        WorkerTimelineKind::Execution => {
+            (replay_worker_stage(transaction_events, event_index)? == ReplayWorkerStage::Execution)
+                .then(|| event.worker_id())
+                .flatten()
+        }
+        WorkerTimelineKind::Check => {
+            (replay_worker_stage(transaction_events, event_index)? == ReplayWorkerStage::Check)
+                .then(|| event.worker_id())
+                .flatten()
+        }
         WorkerTimelineKind::SignatureVerification => event.signature_verification_worker_id(),
+    }
+}
+
+fn replay_worker_stage(
+    transaction_events: &[ReplayEvent],
+    event_index: usize,
+) -> Option<ReplayWorkerStage> {
+    let event = transaction_events.get(event_index)?;
+    replay_worker_stage_for_tag(event.tag).or_else(|| {
+        (event.tag == replay_event_tags::TRANSACTION_WORKER_PICKED_UP)
+            .then(|| replay_worker_pickup_stage(transaction_events, event_index))?
+    })
+}
+
+fn replay_worker_pickup_stage(
+    transaction_events: &[ReplayEvent],
+    event_index: usize,
+) -> Option<ReplayWorkerStage> {
+    transaction_events
+        .iter()
+        .skip(event_index.saturating_add(1))
+        .find_map(|event| replay_worker_stage_for_tag(event.tag))
+        .or_else(|| {
+            transaction_events[..event_index]
+                .iter()
+                .rev()
+                .find_map(|event| match event.tag {
+                    replay_event_tags::TRANSACTION_SCHEDULED_FOR_EXEC => {
+                        Some(ReplayWorkerStage::Execution)
+                    }
+                    replay_event_tags::TRANSACTION_SENT_FOR_CHECK => Some(ReplayWorkerStage::Check),
+                    _ => None,
+                })
+        })
+}
+
+fn replay_worker_stage_for_tag(tag: u64) -> Option<ReplayWorkerStage> {
+    match tag {
+        replay_event_tags::TRANSACTION_CHECK_FAILED
+        | replay_event_tags::TRANSACTION_CHECK_PASSED
+        | replay_event_tags::TRANSACTION_WORKER_CHECK_COMPLETED
+        | replay_event_tags::TRANSACTION_WORKER_CHECK_BANK_ACQUIRED
+        | replay_event_tags::TRANSACTION_WORKER_CHECK_PARSED
+        | replay_event_tags::TRANSACTION_WORKER_CHECK_SIGNATURES_COMPLETE
+        | replay_event_tags::TRANSACTION_WORKER_CHECK_FEE_PAYER_BALANCE_COMPLETE
+        | replay_event_tags::TRANSACTION_WORKER_CHECK_RESOLVED
+        | replay_event_tags::TRANSACTION_WORKER_CHECK_ADDRESS_TABLES_COMPLETE
+        | replay_event_tags::TRANSACTION_WORKER_CHECK_STATUS_COMPLETE => Some(ReplayWorkerStage::Check),
+        replay_event_tags::TRANSACTION_SCHEDULED_FOR_EXEC
+        | replay_event_tags::TRANSACTION_FINISHED_EXEC
+        | replay_event_tags::TRANSACTION_EXEC_FAILED
+        | replay_event_tags::TRANSACTION_WORKER_EXECUTION_COMPLETED
+        | replay_event_tags::TRANSACTION_WORKER_EXECUTION_BANK_ACQUIRED
+        | replay_event_tags::TRANSACTION_WORKER_EXECUTION_TRANSLATED
+        | replay_event_tags::TRANSACTION_WORKER_EXECUTION_PROCESSED
+        | replay_event_tags::TRANSACTION_WORKER_EXECUTION_COMMIT_RESULTS_READY => {
+            Some(ReplayWorkerStage::Execution)
+        }
+        _ => None,
     }
 }
 
@@ -857,6 +959,7 @@ fn handle_key(app: &mut App, key: KeyEvent, snapshot: &UiSnapshot) -> bool {
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
         KeyCode::Char('q') => return true,
+        KeyCode::Char('m' | 'M') if key.modifiers.is_empty() => app.toggle_maximized_pane(),
         KeyCode::Char('a' | 'A') if key.modifiers.is_empty() && app.clear_worker_filter() => {}
         KeyCode::Char('v' | 'V') if key.modifiers.is_empty() => {
             app.toggle_worker_timeline_kind()
@@ -864,6 +967,7 @@ fn handle_key(app: &mut App, key: KeyEvent, snapshot: &UiSnapshot) -> bool {
         KeyCode::Char(value) if key.modifiers.is_empty() && app.push_worker_filter_digit(value) => {
         }
         KeyCode::Backspace if app.pop_worker_filter_digit() => {}
+        KeyCode::Esc if app.restore_maximized_pane() => {}
         KeyCode::Esc | KeyCode::Backspace | KeyCode::Left => app.move_back(),
         KeyCode::Enter | KeyCode::Right => app.move_forward(snapshot),
         KeyCode::Tab => app.next_focus(snapshot),
@@ -880,6 +984,25 @@ fn handle_key(app: &mut App, key: KeyEvent, snapshot: &UiSnapshot) -> bool {
 }
 
 impl App {
+    fn set_focus(&mut self, focus: FocusPane) {
+        self.focus = focus;
+        if self.maximized_pane.is_some() {
+            self.maximized_pane = Some(focus);
+        }
+    }
+
+    fn toggle_maximized_pane(&mut self) {
+        self.maximized_pane = if self.maximized_pane.is_some() {
+            None
+        } else {
+            Some(self.focus)
+        };
+    }
+
+    fn restore_maximized_pane(&mut self) -> bool {
+        self.maximized_pane.take().is_some()
+    }
+
     fn set_selected_slot(&mut self, selected_slot: Option<u64>) -> bool {
         let changed = self.selected_slot != selected_slot;
         self.selected_slot = selected_slot;
@@ -942,8 +1065,9 @@ impl App {
         }
 
         self.worker_timeline_kind = match self.worker_timeline_kind {
-            WorkerTimelineKind::Replay => WorkerTimelineKind::SignatureVerification,
-            WorkerTimelineKind::SignatureVerification => WorkerTimelineKind::Replay,
+            WorkerTimelineKind::Execution => WorkerTimelineKind::Check,
+            WorkerTimelineKind::Check => WorkerTimelineKind::SignatureVerification,
+            WorkerTimelineKind::SignatureVerification => WorkerTimelineKind::Execution,
         };
         self.worker_timeline_scroll = 0;
     }
@@ -1010,16 +1134,17 @@ impl App {
     }
 
     fn move_back(&mut self) {
-        self.focus = match self.focus {
+        let focus = match self.focus {
             FocusPane::Slots => FocusPane::Slots,
             FocusPane::Transactions => FocusPane::Slots,
             FocusPane::TxTimeline => FocusPane::Transactions,
             FocusPane::WorkerTimeline => FocusPane::TxTimeline,
         };
+        self.set_focus(focus);
     }
 
     fn move_forward(&mut self, snapshot: &UiSnapshot) {
-        self.focus = match self.focus {
+        let focus = match self.focus {
             FocusPane::Slots => FocusPane::Transactions,
             FocusPane::Transactions if snapshot.selected_transaction().is_some() => {
                 FocusPane::TxTimeline
@@ -1031,24 +1156,27 @@ impl App {
             FocusPane::TxTimeline => FocusPane::WorkerTimeline,
             FocusPane::WorkerTimeline => self.focus,
         };
+        self.set_focus(focus);
     }
 
     fn next_focus(&mut self, _snapshot: &UiSnapshot) {
-        self.focus = match self.focus {
+        let focus = match self.focus {
             FocusPane::Slots => FocusPane::Transactions,
             FocusPane::Transactions => FocusPane::TxTimeline,
             FocusPane::TxTimeline => FocusPane::WorkerTimeline,
             FocusPane::WorkerTimeline => FocusPane::Slots,
         };
+        self.set_focus(focus);
     }
 
     fn previous_focus(&mut self) {
-        self.focus = match self.focus {
+        let focus = match self.focus {
             FocusPane::Slots => FocusPane::WorkerTimeline,
             FocusPane::Transactions => FocusPane::Slots,
             FocusPane::TxTimeline => FocusPane::Transactions,
             FocusPane::WorkerTimeline => FocusPane::TxTimeline,
         };
+        self.set_focus(focus);
     }
 
     fn move_home(&mut self, snapshot: &UiSnapshot) {
@@ -1256,7 +1384,8 @@ impl UiSnapshot {
 impl SelectedSlot {
     fn worker_events(&self, worker_timeline_kind: WorkerTimelineKind) -> &[WorkerTimelineEvent] {
         match worker_timeline_kind {
-            WorkerTimelineKind::Replay => &self.worker_events,
+            WorkerTimelineKind::Execution => &self.worker_events,
+            WorkerTimelineKind::Check => &self.check_worker_events,
             WorkerTimelineKind::SignatureVerification => &self.signature_verification_worker_events,
         }
     }
@@ -1276,7 +1405,8 @@ impl FocusPane {
 impl WorkerTimelineKind {
     fn label(self) -> &'static str {
         match self {
-            WorkerTimelineKind::Replay => "worker",
+            WorkerTimelineKind::Execution => "exec",
+            WorkerTimelineKind::Check => "check",
             WorkerTimelineKind::SignatureVerification => "sigverify",
         }
     }
@@ -1323,6 +1453,12 @@ fn draw_ui(frame: &mut Frame<'_>, app: &App, snapshot: &UiSnapshot) {
         .split(details[1]);
 
     render_header(frame, layout[0], app, snapshot);
+    if let Some(maximized_pane) = app.maximized_pane {
+        render_pane(frame, layout[1], maximized_pane, app, snapshot);
+        render_footer(frame, layout[2]);
+        return;
+    }
+
     render_slots(frame, body[0], app, snapshot);
     render_transactions(frame, details[0], app, snapshot);
     render_tx_timeline(frame, timelines[0], app, snapshot);
@@ -1330,23 +1466,43 @@ fn draw_ui(frame: &mut Frame<'_>, app: &App, snapshot: &UiSnapshot) {
     render_footer(frame, layout[2]);
 }
 
+fn render_pane(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    pane: FocusPane,
+    app: &App,
+    snapshot: &UiSnapshot,
+) {
+    match pane {
+        FocusPane::Slots => render_slots(frame, area, app, snapshot),
+        FocusPane::Transactions => render_transactions(frame, area, app, snapshot),
+        FocusPane::TxTimeline => render_tx_timeline(frame, area, app, snapshot),
+        FocusPane::WorkerTimeline => render_worker_timeline(frame, area, app, snapshot),
+    }
+}
+
 fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App, snapshot: &UiSnapshot) {
     let selected_slot = app
         .selected_slot
         .map(|slot| slot.to_string())
         .unwrap_or_else(|| "-".to_string());
+    let maximized = app
+        .maximized_pane
+        .map(|pane| format!(" maximized={}", pane.name()))
+        .unwrap_or_default();
     let line = Line::from(vec![
         Span::styled(
             "Replay events",
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!(
-            "  received={} skipped={} retained={} selected_slot={} focus={}",
+            "  received={} skipped={} retained={} selected_slot={} focus={}{}",
             snapshot.received_events,
             snapshot.skipped_events,
             snapshot.slots.len(),
             selected_slot,
-            app.focus.name()
+            app.focus.name(),
+            maximized,
         )),
     ]);
     frame.render_widget(
@@ -1771,7 +1927,8 @@ fn worker_timeline_title(
     worker_timeline_kind: WorkerTimelineKind,
 ) -> String {
     let title = match worker_timeline_kind {
-        WorkerTimelineKind::Replay => "Worker Timeline",
+        WorkerTimelineKind::Execution => "Exec Timeline",
+        WorkerTimelineKind::Check => "Check Timeline",
         WorkerTimelineKind::SignatureVerification => "Sigverify Timeline",
     };
     match worker_filter {
@@ -1836,7 +1993,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(
         Paragraph::new(
             "Up/Down select  Enter/Right open  Esc/Left back  Tab pane  Home/End jump  PgUp/PgDn \
-             page  Worker pane: digits filter, a all, v toggle SV  q quit",
+             page  m maximize  Worker pane: digits filter, a all, v view  q quit",
         )
         .block(Block::default().borders(Borders::ALL)),
         area,
@@ -2040,6 +2197,31 @@ mod tests {
     }
 
     #[test]
+    fn maximized_pane_toggles_and_tracks_focus_changes() {
+        let snapshot = snapshot_with_transactions(&[7]);
+        let mut app = App {
+            focus: FocusPane::Transactions,
+            ..App::default()
+        };
+
+        app.toggle_maximized_pane();
+        assert_eq!(app.maximized_pane, Some(FocusPane::Transactions));
+
+        app.next_focus(&snapshot);
+        assert_eq!(app.focus, FocusPane::TxTimeline);
+        assert_eq!(app.maximized_pane, Some(FocusPane::TxTimeline));
+
+        assert!(app.restore_maximized_pane());
+        assert_eq!(app.maximized_pane, None);
+        assert!(!app.restore_maximized_pane());
+
+        app.toggle_maximized_pane();
+        assert_eq!(app.maximized_pane, Some(FocusPane::TxTimeline));
+        app.toggle_maximized_pane();
+        assert_eq!(app.maximized_pane, None);
+    }
+
+    #[test]
     fn page_keys_scroll_tx_timeline_only_when_tx_timeline_is_focused() {
         let snapshot = snapshot_with_transactions(&[7]);
         let mut app = App {
@@ -2091,23 +2273,25 @@ mod tests {
     }
 
     #[test]
-    fn worker_timeline_toggle_switches_to_signature_verification_workers() {
+    fn worker_timeline_toggle_cycles_worker_views() {
         let mut app = App {
             focus: FocusPane::WorkerTimeline,
             worker_timeline_scroll: 9,
             ..App::default()
         };
 
-        assert_eq!(app.worker_timeline_kind, WorkerTimelineKind::Replay);
+        assert_eq!(app.worker_timeline_kind, WorkerTimelineKind::Execution);
+        app.toggle_worker_timeline_kind();
+        assert_eq!(app.worker_timeline_kind, WorkerTimelineKind::Check);
+        assert_eq!(app.worker_timeline_scroll, 0);
+
         app.toggle_worker_timeline_kind();
         assert_eq!(
             app.worker_timeline_kind,
             WorkerTimelineKind::SignatureVerification
         );
-        assert_eq!(app.worker_timeline_scroll, 0);
-
         app.toggle_worker_timeline_kind();
-        assert_eq!(app.worker_timeline_kind, WorkerTimelineKind::Replay);
+        assert_eq!(app.worker_timeline_kind, WorkerTimelineKind::Execution);
     }
 
     #[test]
@@ -2158,7 +2342,7 @@ mod tests {
         let rendered = rendered_lines(worker_timeline_lines(
             &snapshot,
             Some(3),
-            WorkerTimelineKind::Replay,
+            WorkerTimelineKind::Execution,
         ));
 
         assert!(rendered.iter().any(|line| line.contains("worker=3")));
@@ -2196,6 +2380,38 @@ mod tests {
         assert!(rendered.iter().any(|line| line.contains("mode=sigverify")));
         assert!(rendered.iter().any(|line| line.contains("sigverify-worker")));
         assert!(!rendered.iter().any(|line| line.contains("regular-worker")));
+    }
+
+    #[test]
+    fn worker_timeline_lines_can_show_check_workers() {
+        let mut snapshot = snapshot_with_transactions(&[]);
+        let slot = snapshot.selected_slot.as_mut().unwrap();
+        slot.worker_events = vec![WorkerTimelineEvent {
+            delta_ns: 0,
+            timestamp_ns: 10,
+            worker_id: 3,
+            transaction_index: 7,
+            name: "exec-worker",
+            detail: String::new(),
+        }];
+        slot.check_worker_events = vec![WorkerTimelineEvent {
+            delta_ns: 1,
+            timestamp_ns: 11,
+            worker_id: 4,
+            transaction_index: 8,
+            name: "check-worker",
+            detail: String::new(),
+        }];
+
+        let rendered = rendered_lines(worker_timeline_lines(
+            &snapshot,
+            None,
+            WorkerTimelineKind::Check,
+        ));
+
+        assert!(rendered.iter().any(|line| line.contains("mode=check")));
+        assert!(rendered.iter().any(|line| line.contains("check-worker")));
+        assert!(!rendered.iter().any(|line| line.contains("exec-worker")));
     }
 
     #[test]
@@ -2601,6 +2817,7 @@ mod tests {
             }],
             slot_events: Vec::new(),
             worker_events: Vec::new(),
+            check_worker_events: Vec::new(),
             signature_verification_worker_events: Vec::new(),
             transactions: vec![
                 TransactionSummary {
@@ -2700,7 +2917,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_timeline_shows_worker_transaction_events() {
+    fn worker_timeline_shows_execution_worker_events() {
         let slot = store::SlotRecord {
             slot: 42,
             slot_events: vec![ReplayEvent::slot_begin(10, 42)],
@@ -2710,10 +2927,25 @@ mod tests {
                     index: 7,
                     signature: Some("signature-7".to_string()),
                     events: vec![
-                        ReplayEvent::transaction_sent_for_check(20, 42, 7, 4),
+                        ReplayEvent::transaction_worker_dispatch_event(
+                            20,
+                            replay_event_tags::TRANSACTION_SCHEDULED_FOR_EXEC,
+                            42,
+                            7,
+                            3,
+                            1,
+                            0,
+                        ),
                         ReplayEvent::transaction_worker_event(
                             30,
                             replay_event_tags::TRANSACTION_WORKER_PICKED_UP,
+                            42,
+                            7,
+                            3,
+                        ),
+                        ReplayEvent::transaction_worker_event(
+                            40,
+                            replay_event_tags::TRANSACTION_WORKER_EXECUTION_COMPLETED,
                             42,
                             7,
                             3,
@@ -2722,14 +2954,54 @@ mod tests {
                 },
             )]),
         };
-        let timeline = worker_timeline(&slot, WorkerTimelineKind::Replay);
+        let timeline = worker_timeline(&slot, WorkerTimelineKind::Execution);
 
-        assert_eq!(timeline.len(), 1);
-        assert_eq!(timeline[0].delta_ns, 20);
+        assert_eq!(timeline.len(), 3);
+        assert_eq!(timeline[0].delta_ns, 10);
+        assert_eq!(timeline[0].worker_id, 3);
+        assert_eq!(timeline[0].transaction_index, 7);
+        assert_eq!(timeline[0].name, "tx-scheduled-for-exec");
+        assert_eq!(timeline[1].name, "tx-worker-picked-up");
+        assert_eq!(timeline[2].name, "tx-worker-execution-completed");
+    }
+
+    #[test]
+    fn worker_timeline_shows_check_worker_events() {
+        let slot = store::SlotRecord {
+            slot: 42,
+            slot_events: vec![ReplayEvent::slot_begin(10, 42)],
+            transactions: std::collections::BTreeMap::from([(
+                7,
+                TransactionRecord {
+                    index: 7,
+                    signature: Some("signature-7".to_string()),
+                    events: vec![
+                        ReplayEvent::transaction_worker_event(
+                            20,
+                            replay_event_tags::TRANSACTION_WORKER_PICKED_UP,
+                            42,
+                            7,
+                            3,
+                        ),
+                        ReplayEvent::transaction_worker_event(
+                            30,
+                            replay_event_tags::TRANSACTION_WORKER_CHECK_COMPLETED,
+                            42,
+                            7,
+                            3,
+                        ),
+                    ],
+                },
+            )]),
+        };
+        let timeline = worker_timeline(&slot, WorkerTimelineKind::Check);
+
+        assert_eq!(timeline.len(), 2);
+        assert_eq!(timeline[0].delta_ns, 10);
         assert_eq!(timeline[0].worker_id, 3);
         assert_eq!(timeline[0].transaction_index, 7);
         assert_eq!(timeline[0].name, "tx-worker-picked-up");
-        assert_eq!(timeline[0].detail, "");
+        assert_eq!(timeline[1].name, "tx-worker-check-completed");
     }
 
     #[test]
@@ -2836,6 +3108,7 @@ mod tests {
                 active_sessions: Vec::new(),
                 slot_events: Vec::new(),
                 worker_events: Vec::new(),
+                check_worker_events: Vec::new(),
                 signature_verification_worker_events: Vec::new(),
                 transactions: indices
                     .iter()
