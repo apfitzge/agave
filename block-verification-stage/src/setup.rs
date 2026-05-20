@@ -1,5 +1,5 @@
 use {
-    crate::replay_event_timestamp::ReplayEventTimestampSource,
+    crate::replay_event_timestamp::replay_event_timestamp_ns,
     agave_scheduler_bindings::{
         PackToWorkerMessage, ReplayBlockStatusMessage, ReplayToPackMessage,
         SharableTransactionRegion, WorkerToPackMessage,
@@ -116,7 +116,6 @@ pub struct BlockVerificationStageSessions {
 pub struct ReplayEventBroadcast {
     path: PathBuf,
     producer: shaq::broadcast::Producer<ReplayEvent>,
-    timestamp_source: ReplayEventTimestampSource,
 }
 
 impl ReplayEventBroadcast {
@@ -125,11 +124,7 @@ impl ReplayEventBroadcast {
         let producer =
             shared_memory::create_broadcast_producer_at_path(&path, REPLAY_EVENT_CAPACITY)?;
 
-        Ok(Self {
-            path,
-            producer,
-            timestamp_source: ReplayEventTimestampSource::new(),
-        })
+        Ok(Self { path, producer })
     }
 
     pub fn path(&self) -> &Path {
@@ -137,7 +132,7 @@ impl ReplayEventBroadcast {
     }
 
     pub fn emit(&self, mut event: ReplayEvent) {
-        event.timestamp_ns = self.timestamp_source.timestamp_ns();
+        event.timestamp_ns = replay_event_timestamp_ns();
         let _ = self.producer.try_write(event, Ordering::Relaxed);
     }
 }

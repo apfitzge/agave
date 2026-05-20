@@ -70,6 +70,7 @@ dependencies = [
  "agave-scheduling-utils",
  "agave-transaction-view",
  "crossbeam-channel",
+ "libc",
  "log",
  "rts-alloc",
  "shaq",
