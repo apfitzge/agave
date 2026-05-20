@@ -161,12 +161,13 @@ impl BlockVerificationStage {
             log_messages_bytes_limit,
             shared_leader_state,
             bank_forks,
-            event_broadcast,
+            event_broadcast.clone(),
         ));
         threads.extend(spawn_replay_signature_verification_workers(
             exit,
             signature_verification_workers,
             replay_vote_sender,
+            event_broadcast,
         ));
 
         Ok((

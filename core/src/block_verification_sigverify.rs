@@ -1,9 +1,12 @@
 use {
     agave_block_verification_stage::setup::{
-        SignatureVerificationRequest, SignatureVerificationResult,
+        ReplayEventBroadcast, SignatureVerificationRequest, SignatureVerificationResult,
         SignatureVerificationWorkerSession,
     },
-    agave_scheduling_utils::transaction_ptr::TransactionPtr,
+    agave_scheduling_utils::{
+        replay_events::{ReplayEvent, replay_event_tags},
+        transaction_ptr::TransactionPtr,
+    },
     agave_transaction_view::{
         transaction_version::TransactionVersion, transaction_view::UnsanitizedTransactionView,
     },
@@ -27,6 +30,7 @@ pub(crate) fn spawn_replay_signature_verification_workers(
     exit: Arc<AtomicBool>,
     workers: Vec<SignatureVerificationWorkerSession>,
     replay_vote_sender: ReplayVoteSender,
+    event_broadcast: Option<Arc<ReplayEventBroadcast>>,
 ) -> Vec<JoinHandle<()>> {
     workers
         .into_iter()
@@ -34,10 +38,17 @@ pub(crate) fn spawn_replay_signature_verification_workers(
         .map(|(worker_id, worker)| {
             let exit = exit.clone();
             let replay_vote_sender = replay_vote_sender.clone();
+            let event_broadcast = event_broadcast.clone();
             Builder::new()
                 .name(format!("solBvSigvr{worker_id:02}"))
                 .spawn(move || {
-                    run_signature_verification_worker(exit, worker, replay_vote_sender);
+                    run_signature_verification_worker(
+                        exit,
+                        worker,
+                        worker_id,
+                        replay_vote_sender,
+                        event_broadcast,
+                    );
                 })
                 .unwrap()
         })
@@ -47,7 +58,9 @@ pub(crate) fn spawn_replay_signature_verification_workers(
 fn run_signature_verification_worker(
     exit: Arc<AtomicBool>,
     worker: SignatureVerificationWorkerSession,
+    worker_id: usize,
     replay_vote_sender: ReplayVoteSender,
+    event_broadcast: Option<Arc<ReplayEventBroadcast>>,
 ) {
     let mut sleep_duration = STARTING_SLEEP_DURATION;
     let mut did_work = false;
@@ -66,19 +79,35 @@ fn run_signature_verification_worker(
 
         did_work = true;
         sleep_duration = STARTING_SLEEP_DURATION;
-        let verified = verify_transaction_signatures(&worker, request, &replay_vote_sender);
+        emit_signature_verification_worker_event(
+            event_broadcast.as_deref(),
+            replay_event_tags::TRANSACTION_SIGNATURE_VERIFICATION_WORKER_PICKED_UP,
+            worker_id,
+            request,
+        );
+        let verified = verify_transaction_signatures(
+            &worker,
+            worker_id,
+            request,
+            &replay_vote_sender,
+            event_broadcast.as_deref(),
+        );
         send_result(
             &exit,
             &worker,
+            worker_id,
             SignatureVerificationResult::new(request.slot, request.transaction_index, verified),
+            event_broadcast.as_deref(),
         );
     }
 }
 
 fn verify_transaction_signatures(
     worker: &SignatureVerificationWorkerSession,
+    worker_id: usize,
     request: SignatureVerificationRequest,
     replay_vote_sender: &ReplayVoteSender,
+    event_broadcast: Option<&ReplayEventBroadcast>,
 ) -> bool {
     let transaction = unsafe {
         // SAFETY: The scheduler only submits transaction regions backed by
@@ -89,8 +118,23 @@ fn verify_transaction_signatures(
     let Ok(view) = UnsanitizedTransactionView::try_new_unsanitized(transaction) else {
         return false;
     };
+    emit_signature_verification_worker_event(
+        event_broadcast,
+        replay_event_tags::TRANSACTION_SIGNATURE_VERIFICATION_WORKER_PARSED,
+        worker_id,
+        request,
+    );
 
-    if !verify_signatures(&view) {
+    let verified = verify_signatures(&view);
+    emit_signature_verification_worker_result_event(
+        event_broadcast,
+        replay_event_tags::TRANSACTION_SIGNATURE_VERIFICATION_WORKER_SIGNATURES_COMPLETE,
+        worker_id,
+        request.slot,
+        request.transaction_index,
+        verified,
+    );
+    if !verified {
         return false;
     }
 
@@ -105,6 +149,51 @@ fn verify_transaction_signatures(
     }
 
     true
+}
+
+fn emit_signature_verification_worker_event(
+    event_broadcast: Option<&ReplayEventBroadcast>,
+    tag: u64,
+    worker_id: usize,
+    request: SignatureVerificationRequest,
+) {
+    let Some(event_broadcast) = event_broadcast else {
+        return;
+    };
+
+    event_broadcast.emit(
+        ReplayEvent::transaction_signature_verification_worker_event(
+            0,
+            tag,
+            request.slot,
+            u64::try_from(request.transaction_index).expect("transaction index must fit in u64"),
+            u64::try_from(worker_id).expect("worker id must fit in u64"),
+        ),
+    );
+}
+
+fn emit_signature_verification_worker_result_event(
+    event_broadcast: Option<&ReplayEventBroadcast>,
+    tag: u64,
+    worker_id: usize,
+    slot: u64,
+    transaction_index: usize,
+    verified: bool,
+) {
+    let Some(event_broadcast) = event_broadcast else {
+        return;
+    };
+
+    event_broadcast.emit(
+        ReplayEvent::transaction_signature_verification_worker_result_event(
+            0,
+            tag,
+            slot,
+            u64::try_from(transaction_index).expect("transaction index must fit in u64"),
+            u64::try_from(worker_id).expect("worker id must fit in u64"),
+            verified,
+        ),
+    );
 }
 
 fn verify_signatures(view: &UnsanitizedTransactionView<TransactionPtr>) -> bool {
@@ -136,13 +225,28 @@ fn is_simple_vote_transaction(view: &UnsanitizedTransactionView<TransactionPtr>)
 fn send_result(
     exit: &AtomicBool,
     worker: &SignatureVerificationWorkerSession,
+    worker_id: usize,
     mut result: SignatureVerificationResult,
+    event_broadcast: Option<&ReplayEventBroadcast>,
 ) {
     let mut sleep_duration = STARTING_SLEEP_DURATION;
     let mut last_full_time = Instant::now();
+    let slot = result.slot;
+    let transaction_index = result.transaction_index;
+    let verified = result.verified();
     while !exit.load(Ordering::Relaxed) {
         match worker.results.try_write(result) {
-            Ok(()) => return,
+            Ok(()) => {
+                emit_signature_verification_worker_result_event(
+                    event_broadcast,
+                    replay_event_tags::TRANSACTION_SIGNATURE_VERIFICATION_WORKER_RESULT_SENT,
+                    worker_id,
+                    slot,
+                    transaction_index,
+                    verified,
+                );
+                return;
+            }
             Err(returned_result) => {
                 result = returned_result;
                 sleep_duration = backoff(last_full_time.elapsed(), sleep_duration);

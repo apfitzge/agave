@@ -201,6 +201,18 @@ impl TransactionRecord {
                         Some("sigverified")
                     }
                 }
+                replay_event_tags::TRANSACTION_SIGNATURE_VERIFICATION_WORKER_RESULT_SENT => {
+                    Some("sigverify-result-sent")
+                }
+                replay_event_tags::TRANSACTION_SIGNATURE_VERIFICATION_WORKER_SIGNATURES_COMPLETE => {
+                    Some("sigverify-worker-done")
+                }
+                replay_event_tags::TRANSACTION_SIGNATURE_VERIFICATION_WORKER_PARSED => {
+                    Some("sigverify-worker-parsed")
+                }
+                replay_event_tags::TRANSACTION_SIGNATURE_VERIFICATION_WORKER_PICKED_UP => {
+                    Some("sigverify-worker-picked-up")
+                }
                 replay_event_tags::TRANSACTION_SIGNATURES_SUBMITTED => Some("sigverifying"),
                 replay_event_tags::TRANSACTION_WORKER_CHECK_COMPLETED => Some("worker-check-done"),
                 replay_event_tags::TRANSACTION_WORKER_CHECK_STATUS_COMPLETE => {
@@ -273,6 +285,18 @@ pub(crate) fn event_name(tag: u64) -> &'static str {
         replay_event_tags::TRANSACTION_CHECK_PASSED => "tx-check-passed",
         replay_event_tags::TRANSACTION_SIGNATURES_SUBMITTED => "tx-signatures-submitted",
         replay_event_tags::TRANSACTION_SIGNATURES_RETURNED => "tx-signatures-returned",
+        replay_event_tags::TRANSACTION_SIGNATURE_VERIFICATION_WORKER_PICKED_UP => {
+            "tx-sigverify-worker-picked-up"
+        }
+        replay_event_tags::TRANSACTION_SIGNATURE_VERIFICATION_WORKER_PARSED => {
+            "tx-sigverify-worker-parsed"
+        }
+        replay_event_tags::TRANSACTION_SIGNATURE_VERIFICATION_WORKER_SIGNATURES_COMPLETE => {
+            "tx-sigverify-worker-signatures-complete"
+        }
+        replay_event_tags::TRANSACTION_SIGNATURE_VERIFICATION_WORKER_RESULT_SENT => {
+            "tx-sigverify-worker-result-sent"
+        }
         replay_event_tags::TRANSACTION_READY_FOR_SCHEDULING => "tx-ready-for-scheduling",
         replay_event_tags::TRANSACTION_WORKER_PICKED_UP => "tx-worker-picked-up",
         replay_event_tags::TRANSACTION_WORKER_CHECK_COMPLETED => "tx-worker-check-completed",

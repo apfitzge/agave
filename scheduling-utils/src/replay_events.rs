@@ -11,6 +11,8 @@ pub const REPLAY_EVENTS_IPC_FILE: &str = "agave_events.ipc";
 /// Worker dispatch transaction events also include `worker_queue_len: u64`.
 /// Signature verification submission events also include
 /// `signature_verification_queue_len: u64`.
+/// Signature verification worker transaction events reuse the signature bytes as:
+/// `signature_verification_worker_id: u64`.
 pub const REPLAY_EVENT_PAYLOAD_BYTES: usize = 80;
 
 use crate::thread_aware_account_locks::ThreadId;
@@ -135,6 +137,22 @@ pub mod replay_event_tags {
     ///
     /// Payload includes `worker_id: u64`.
     pub const TRANSACTION_WORKER_EXECUTION_COMMIT_RESULTS_READY: u64 = 28;
+    /// Signature verification worker began processing a transaction.
+    ///
+    /// Payload includes `signature_verification_worker_id: u64`.
+    pub const TRANSACTION_SIGNATURE_VERIFICATION_WORKER_PICKED_UP: u64 = 29;
+    /// Signature verification worker parsed the transaction.
+    ///
+    /// Payload includes `signature_verification_worker_id: u64`.
+    pub const TRANSACTION_SIGNATURE_VERIFICATION_WORKER_PARSED: u64 = 30;
+    /// Signature verification worker completed signature checks.
+    ///
+    /// Payload includes `signature_verification_worker_id: u64` and `verified: u64`.
+    pub const TRANSACTION_SIGNATURE_VERIFICATION_WORKER_SIGNATURES_COMPLETE: u64 = 31;
+    /// Signature verification worker sent the verification result.
+    ///
+    /// Payload includes `signature_verification_worker_id: u64` and `verified: u64`.
+    pub const TRANSACTION_SIGNATURE_VERIFICATION_WORKER_RESULT_SENT: u64 = 32;
     /// Transaction could not currently be scheduled.
     pub const TRANSACTION_SCHEDULING_SKIPPED: u64 = 6;
     /// Transaction was sent to a worker for execution.
@@ -165,6 +183,9 @@ const WORKER_ID_OFFSET: usize = SIGNATURE_OFFSET;
 const WORKER_QUEUE_LENGTH_OFFSET: usize = WORKER_ID_OFFSET + core::mem::size_of::<u64>();
 const SIGNATURE_VERIFICATION_QUEUE_LENGTH_OFFSET: usize = SIGNATURE_OFFSET;
 const SIGNATURE_VERIFICATION_RESULT_OFFSET: usize = SIGNATURE_OFFSET;
+const SIGNATURE_VERIFICATION_WORKER_ID_OFFSET: usize = SIGNATURE_OFFSET;
+const SIGNATURE_VERIFICATION_WORKER_RESULT_OFFSET: usize =
+    SIGNATURE_VERIFICATION_WORKER_ID_OFFSET + core::mem::size_of::<u64>();
 
 impl ReplayEvent {
     pub fn slot_begin(timestamp_ns: u64, slot: u64) -> Self {
@@ -277,6 +298,45 @@ impl ReplayEvent {
         event
     }
 
+    pub fn transaction_signature_verification_worker_event(
+        timestamp_ns: u64,
+        tag: u64,
+        slot: u64,
+        transaction_index: u64,
+        signature_verification_worker_id: u64,
+    ) -> Self {
+        debug_assert!(is_transaction_signature_verification_worker_event_tag(tag));
+        let mut event = Self::transaction_event(timestamp_ns, tag, slot, transaction_index);
+        event.write_u64(
+            SIGNATURE_VERIFICATION_WORKER_ID_OFFSET,
+            signature_verification_worker_id,
+        );
+        event
+    }
+
+    pub fn transaction_signature_verification_worker_result_event(
+        timestamp_ns: u64,
+        tag: u64,
+        slot: u64,
+        transaction_index: u64,
+        signature_verification_worker_id: u64,
+        verified: bool,
+    ) -> Self {
+        debug_assert!(is_transaction_signature_verification_worker_result_event_tag(tag));
+        let mut event = Self::transaction_signature_verification_worker_event(
+            timestamp_ns,
+            tag,
+            slot,
+            transaction_index,
+            signature_verification_worker_id,
+        );
+        event.write_u64(
+            SIGNATURE_VERIFICATION_WORKER_RESULT_OFFSET,
+            u64::from(verified),
+        );
+        event
+    }
+
     pub fn slot(&self) -> u64 {
         self.read_u64(SLOT_OFFSET)
     }
@@ -306,6 +366,11 @@ impl ReplayEvent {
             .then(|| self.read_u64(WORKER_QUEUE_LENGTH_OFFSET))
     }
 
+    pub fn signature_verification_worker_id(&self) -> Option<u64> {
+        is_transaction_signature_verification_worker_event_tag(self.tag)
+            .then(|| self.read_u64(SIGNATURE_VERIFICATION_WORKER_ID_OFFSET))
+    }
+
     pub fn signature(&self) -> Option<[u8; 64]> {
         if self.tag != replay_event_tags::TRANSACTION_INGESTED {
             return None;
@@ -330,6 +395,14 @@ impl ReplayEvent {
         }
 
         Some(self.read_u64(SIGNATURE_VERIFICATION_QUEUE_LENGTH_OFFSET))
+    }
+
+    pub fn signature_verification_worker_result(&self) -> Option<bool> {
+        if !is_transaction_signature_verification_worker_result_event_tag(self.tag) {
+            return None;
+        }
+
+        Some(self.read_u64(SIGNATURE_VERIFICATION_WORKER_RESULT_OFFSET) != 0)
     }
 
     fn slot_event(timestamp_ns: u64, tag: u64, slot: u64) -> Self {
@@ -395,6 +468,24 @@ pub const fn is_transaction_worker_dispatch_event_tag(tag: u64) -> bool {
     )
 }
 
+pub const fn is_transaction_signature_verification_worker_event_tag(tag: u64) -> bool {
+    matches!(
+        tag,
+        replay_event_tags::TRANSACTION_SIGNATURE_VERIFICATION_WORKER_PICKED_UP
+            | replay_event_tags::TRANSACTION_SIGNATURE_VERIFICATION_WORKER_PARSED
+            | replay_event_tags::TRANSACTION_SIGNATURE_VERIFICATION_WORKER_SIGNATURES_COMPLETE
+            | replay_event_tags::TRANSACTION_SIGNATURE_VERIFICATION_WORKER_RESULT_SENT
+    )
+}
+
+pub const fn is_transaction_signature_verification_worker_result_event_tag(tag: u64) -> bool {
+    matches!(
+        tag,
+        replay_event_tags::TRANSACTION_SIGNATURE_VERIFICATION_WORKER_SIGNATURES_COMPLETE
+            | replay_event_tags::TRANSACTION_SIGNATURE_VERIFICATION_WORKER_RESULT_SENT
+    )
+}
+
 pub const fn is_slot_event_tag(tag: u64) -> bool {
     matches!(
         tag,
@@ -429,6 +520,10 @@ pub const fn is_transaction_event_tag(tag: u64) -> bool {
             | replay_event_tags::TRANSACTION_WORKER_EXECUTION_TRANSLATED
             | replay_event_tags::TRANSACTION_WORKER_EXECUTION_PROCESSED
             | replay_event_tags::TRANSACTION_WORKER_EXECUTION_COMMIT_RESULTS_READY
+            | replay_event_tags::TRANSACTION_SIGNATURE_VERIFICATION_WORKER_PICKED_UP
+            | replay_event_tags::TRANSACTION_SIGNATURE_VERIFICATION_WORKER_PARSED
+            | replay_event_tags::TRANSACTION_SIGNATURE_VERIFICATION_WORKER_SIGNATURES_COMPLETE
+            | replay_event_tags::TRANSACTION_SIGNATURE_VERIFICATION_WORKER_RESULT_SENT
             | replay_event_tags::TRANSACTION_SCHEDULING_SKIPPED
             | replay_event_tags::TRANSACTION_SCHEDULED_FOR_EXEC
             | replay_event_tags::TRANSACTION_FINISHED_EXEC
@@ -526,6 +621,7 @@ mod tests {
             assert_eq!(event.slot(), 2);
             assert_eq!(event.transaction_index(), Some(3));
             assert_eq!(event.worker_id(), Some(4));
+            assert_eq!(event.signature_verification_worker_id(), None);
             let expected_worker_queue_len =
                 is_transaction_worker_dispatch_event_tag(tag).then_some(0);
             assert_eq!(event.worker_queue_len(), expected_worker_queue_len);
@@ -545,6 +641,43 @@ mod tests {
             assert_eq!(event.transaction_index(), Some(3));
             assert_eq!(event.worker_id(), Some(4));
             assert_eq!(event.worker_queue_len(), Some(5));
+            assert_eq!(event.signature(), None);
+        }
+    }
+
+    #[test]
+    fn transaction_signature_verification_worker_events_carry_worker_id() {
+        for tag in [
+            replay_event_tags::TRANSACTION_SIGNATURE_VERIFICATION_WORKER_PICKED_UP,
+            replay_event_tags::TRANSACTION_SIGNATURE_VERIFICATION_WORKER_PARSED,
+        ] {
+            let event =
+                ReplayEvent::transaction_signature_verification_worker_event(1, tag, 2, 3, 4);
+
+            assert_eq!(event.slot(), 2);
+            assert_eq!(event.transaction_index(), Some(3));
+            assert_eq!(event.worker_id(), None);
+            assert_eq!(event.signature_verification_worker_id(), Some(4));
+            assert_eq!(event.signature_verification_worker_result(), None);
+            assert_eq!(event.signature(), None);
+        }
+    }
+
+    #[test]
+    fn transaction_signature_verification_worker_result_events_carry_result() {
+        for tag in [
+            replay_event_tags::TRANSACTION_SIGNATURE_VERIFICATION_WORKER_SIGNATURES_COMPLETE,
+            replay_event_tags::TRANSACTION_SIGNATURE_VERIFICATION_WORKER_RESULT_SENT,
+        ] {
+            let event = ReplayEvent::transaction_signature_verification_worker_result_event(
+                1, tag, 2, 3, 4, true,
+            );
+
+            assert_eq!(event.slot(), 2);
+            assert_eq!(event.transaction_index(), Some(3));
+            assert_eq!(event.worker_id(), None);
+            assert_eq!(event.signature_verification_worker_id(), Some(4));
+            assert_eq!(event.signature_verification_worker_result(), Some(true));
             assert_eq!(event.signature(), None);
         }
     }
