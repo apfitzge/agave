@@ -8,6 +8,7 @@ use {
 pub(crate) struct EventStore {
     max_slots: usize,
     slots: BTreeMap<u64, SlotRecord>,
+    active_slots: BTreeMap<u64, ActiveSlotTracker>,
 }
 
 pub(crate) struct SlotRecord {
@@ -22,18 +23,43 @@ pub(crate) struct TransactionRecord {
     pub(crate) events: Vec<ReplayEvent>,
 }
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ActiveSlotStats {
+    pub(crate) active_duration_ns: Option<u64>,
+    pub(crate) session_count: usize,
+    pub(crate) pending_transactions: usize,
+}
+
+#[derive(Default)]
+struct ActiveSlotTracker {
+    session_count: usize,
+    closed_duration_ns: u64,
+    open_session_start_timestamp_ns: Option<u64>,
+    latest_timestamp_ns: Option<u64>,
+    pending_transactions: usize,
+    transactions: BTreeMap<u64, ActiveTransactionTracker>,
+}
+
+#[derive(Default)]
+struct ActiveTransactionTracker {
+    started: bool,
+    stopped: bool,
+}
+
 impl EventStore {
     pub(crate) fn new(max_slots: usize) -> Self {
         assert!(max_slots > 0, "must retain at least one slot");
         Self {
             max_slots,
             slots: BTreeMap::new(),
+            active_slots: BTreeMap::new(),
         }
     }
 
     pub(crate) fn apply_event(&mut self, event: ReplayEvent) {
         let slot = event.slot();
         let slot_record = if event.tag == replay_event_tags::SLOT_BEGIN {
+            self.active_slots.entry(slot).or_default();
             self.slots
                 .entry(slot)
                 .or_insert_with(|| SlotRecord::new(slot))
@@ -43,8 +69,14 @@ impl EventStore {
             };
             slot_record
         };
+        self.active_slots
+            .entry(slot)
+            .or_default()
+            .record_timestamp(event.timestamp_ns);
 
         if is_transaction_event_tag(event.tag) {
+            let event_tag = event.tag;
+            let event_timestamp_ns = event.timestamp_ns;
             let transaction_index = event
                 .transaction_index()
                 .expect("transaction event must carry transaction index");
@@ -59,6 +91,16 @@ impl EventStore {
             }
 
             transaction.events.push(event);
+            let terminal_timestamp_ns = transaction.terminal_timestamp_ns();
+            self.active_slots
+                .get_mut(&slot)
+                .expect("active slot tracker must exist for retained slot")
+                .record_transaction_event(
+                    transaction_index,
+                    event_tag,
+                    event_timestamp_ns,
+                    terminal_timestamp_ns,
+                );
         } else if is_slot_event_tag(event.tag) {
             slot_record.slot_events.push(event);
         }
@@ -74,12 +116,20 @@ impl EventStore {
         self.slots.get(&slot)
     }
 
+    pub(crate) fn active_slot_stats(&self, slot: u64) -> ActiveSlotStats {
+        self.active_slots
+            .get(&slot)
+            .map(ActiveSlotTracker::stats)
+            .unwrap_or_default()
+    }
+
     fn prune_old_slots(&mut self) {
         while self.slots.len() > self.max_slots {
             let Some(slot) = self.slots.keys().next().copied() else {
                 break;
             };
             self.slots.remove(&slot);
+            self.active_slots.remove(&slot);
         }
     }
 }
@@ -302,6 +352,79 @@ impl TransactionRecord {
     }
 }
 
+impl ActiveSlotTracker {
+    fn record_timestamp(&mut self, timestamp_ns: u64) {
+        self.latest_timestamp_ns = Some(
+            self.latest_timestamp_ns
+                .map_or(timestamp_ns, |latest| latest.max(timestamp_ns)),
+        );
+    }
+
+    fn record_transaction_event(
+        &mut self,
+        transaction_index: u64,
+        event_tag: u64,
+        event_timestamp_ns: u64,
+        terminal_timestamp_ns: Option<u64>,
+    ) {
+        let transaction = self.transactions.entry(transaction_index).or_default();
+        let should_start = event_tag == replay_event_tags::TRANSACTION_INGESTED
+            && !transaction.started;
+        if should_start {
+            transaction.started = true;
+        }
+
+        let should_stop =
+            transaction.started && !transaction.stopped && terminal_timestamp_ns.is_some();
+        if should_stop {
+            transaction.stopped = true;
+        }
+
+        if should_start {
+            self.record_transaction_start(event_timestamp_ns);
+        }
+        if should_stop {
+            self.record_transaction_stop(terminal_timestamp_ns.unwrap());
+        }
+    }
+
+    fn record_transaction_start(&mut self, timestamp_ns: u64) {
+        if self.pending_transactions == 0 {
+            self.open_session_start_timestamp_ns = Some(timestamp_ns);
+            self.session_count = self.session_count.saturating_add(1);
+        }
+        self.pending_transactions = self.pending_transactions.saturating_add(1);
+    }
+
+    fn record_transaction_stop(&mut self, timestamp_ns: u64) {
+        self.pending_transactions = self.pending_transactions.saturating_sub(1);
+        if self.pending_transactions == 0 {
+            if let Some(start_timestamp_ns) = self.open_session_start_timestamp_ns.take() {
+                self.closed_duration_ns = self
+                    .closed_duration_ns
+                    .saturating_add(timestamp_ns.saturating_sub(start_timestamp_ns));
+            }
+        }
+    }
+
+    fn stats(&self) -> ActiveSlotStats {
+        if self.session_count == 0 {
+            return ActiveSlotStats::default();
+        }
+
+        let open_duration_ns = self
+            .open_session_start_timestamp_ns
+            .zip(self.latest_timestamp_ns)
+            .map(|(start, latest)| latest.saturating_sub(start))
+            .unwrap_or_default();
+        ActiveSlotStats {
+            active_duration_ns: Some(self.closed_duration_ns.saturating_add(open_duration_ns)),
+            session_count: self.session_count,
+            pending_transactions: self.pending_transactions,
+        }
+    }
+}
+
 pub(crate) fn signature_string(signature: &[u8; 64]) -> String {
     bs58::encode(signature).into_string()
 }
@@ -472,6 +595,7 @@ mod tests {
 
         assert_eq!(store.slot_ids(), [11, 12]);
         assert!(store.slot(10).is_none());
+        assert_eq!(store.active_slot_stats(10).session_count, 0);
     }
 
     #[test]
@@ -503,5 +627,58 @@ mod tests {
         store.apply_event(ReplayEvent::slot_complete(30, 42));
 
         assert_eq!(store.slot(42).unwrap().duration_ns(), Some(20));
+    }
+
+    #[test]
+    fn active_slot_stats_track_closed_and_open_sessions() {
+        let mut store = EventStore::new(4);
+
+        store.apply_event(ReplayEvent::slot_begin(1, 42));
+        store.apply_event(ReplayEvent::transaction_ingested(10, 42, 0, [1; 64]));
+        store.apply_event(ReplayEvent::transaction_event(
+            50,
+            replay_event_tags::TRANSACTION_FINISHED_EXEC,
+            42,
+            0,
+        ));
+        store.apply_event(ReplayEvent::transaction_ingested(70, 42, 1, [2; 64]));
+        store.apply_event(ReplayEvent::transaction_event(
+            90,
+            replay_event_tags::TRANSACTION_SENT_FOR_CHECK,
+            42,
+            1,
+        ));
+
+        let stats = store.active_slot_stats(42);
+        assert_eq!(stats.session_count, 2);
+        assert_eq!(stats.pending_transactions, 1);
+        assert_eq!(stats.active_duration_ns, Some(60));
+    }
+
+    #[test]
+    fn active_slot_stats_wait_for_signature_verification_after_execution() {
+        let mut store = EventStore::new(4);
+
+        store.apply_event(ReplayEvent::slot_begin(1, 42));
+        store.apply_event(ReplayEvent::transaction_ingested(10, 42, 0, [1; 64]));
+        store.apply_event(ReplayEvent::transaction_signatures_submitted(12, 42, 0, 1));
+        store.apply_event(ReplayEvent::transaction_event(
+            30,
+            replay_event_tags::TRANSACTION_FINISHED_EXEC,
+            42,
+            0,
+        ));
+        let stats = store.active_slot_stats(42);
+        assert_eq!(stats.session_count, 1);
+        assert_eq!(stats.pending_transactions, 1);
+        assert_eq!(stats.active_duration_ns, Some(20));
+
+        store.apply_event(ReplayEvent::transaction_signatures_returned(
+            50, 42, 0, true,
+        ));
+        let stats = store.active_slot_stats(42);
+        assert_eq!(stats.session_count, 1);
+        assert_eq!(stats.pending_transactions, 0);
+        assert_eq!(stats.active_duration_ns, Some(40));
     }
 }

@@ -391,6 +391,7 @@ fn snapshot(
         .into_iter()
         .filter_map(|slot| {
             let slot_record = store.slot(slot)?;
+            let active_stats = store.active_slot_stats(slot);
             let selected_slot_summary = selected_slot
                 .as_ref()
                 .filter(|selected_slot| selected_slot.slot == slot);
@@ -399,11 +400,16 @@ fn snapshot(
                 transaction_count: slot_record.transactions.len(),
                 duration_ns: slot_record.duration_ns(),
                 active_duration_ns: selected_slot_summary
-                    .and_then(|selected_slot| selected_slot.active_duration_ns),
-                active_session_count: selected_slot_summary
-                    .map_or(0, |selected_slot| selected_slot.active_sessions.len()),
-                active_pending_transactions: selected_slot_summary
-                    .map_or(0, |selected_slot| selected_slot.active_pending_transactions),
+                    .and_then(|selected_slot| selected_slot.active_duration_ns)
+                    .or(active_stats.active_duration_ns),
+                active_session_count: selected_slot_summary.map_or(
+                    active_stats.session_count,
+                    |selected_slot| selected_slot.active_sessions.len(),
+                ),
+                active_pending_transactions: selected_slot_summary.map_or(
+                    active_stats.pending_transactions,
+                    |selected_slot| selected_slot.active_pending_transactions,
+                ),
                 status: slot_record.status(),
             })
         })
@@ -786,6 +792,13 @@ fn timeline_event_detail(event: &ReplayEvent) -> String {
     if let Some(worker_queue_len) = event.worker_queue_len() {
         details.push(format!("queue_len={worker_queue_len}"));
     }
+    if let Some(unscheduled_ready_transactions_ahead) =
+        event.unscheduled_ready_transactions_ahead()
+    {
+        details.push(format!(
+            "unscheduled_ready_ahead={unscheduled_ready_transactions_ahead}"
+        ));
+    }
     if let Some(signature_verification_queue_len) = event.signature_verification_queue_len() {
         details.push(format!("queue_len={signature_verification_queue_len}"));
     }
@@ -817,6 +830,13 @@ fn worker_timeline_event_detail(event: &ReplayEvent) -> String {
     }
     if let Some(worker_queue_len) = event.worker_queue_len() {
         details.push(format!("queue_len={worker_queue_len}"));
+    }
+    if let Some(unscheduled_ready_transactions_ahead) =
+        event.unscheduled_ready_transactions_ahead()
+    {
+        details.push(format!(
+            "unscheduled_ready_ahead={unscheduled_ready_transactions_ahead}"
+        ));
     }
     if let Some(estimated_cost_units) = event.estimated_cost_units() {
         details.push(format!("estimated_cost_units={estimated_cost_units}"));
@@ -1899,6 +1919,34 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_uses_aggregate_active_stats_for_unselected_slots() {
+        let mut event_store = EventStore::new(4);
+        event_store.apply_event(ReplayEvent::slot_begin(1, 41));
+        event_store.apply_event(ReplayEvent::transaction_ingested(10, 41, 0, [1; 64]));
+        event_store.apply_event(ReplayEvent::transaction_event(
+            50,
+            replay_event_tags::TRANSACTION_FINISHED_EXEC,
+            41,
+            0,
+        ));
+        event_store.apply_event(ReplayEvent::slot_begin(60, 42));
+        event_store.apply_event(ReplayEvent::transaction_ingested(70, 42, 0, [2; 64]));
+        let store = Arc::new(Mutex::new(event_store));
+        let stats = ReaderStats::default();
+
+        let snapshot = snapshot(&store, &stats, Some(42), None);
+
+        let unselected_slot = snapshot
+            .slots
+            .iter()
+            .find(|slot| slot.slot == 41)
+            .expect("unselected slot must be present");
+        assert_eq!(unselected_slot.active_duration_ns, Some(40));
+        assert_eq!(unselected_slot.active_session_count, 1);
+        assert_eq!(unselected_slot.active_pending_transactions, 0);
+    }
+
+    #[test]
     fn sync_transactions_replaces_missing_selection_with_current_row() {
         let mut app = App {
             selected_slot: Some(42),
@@ -2275,6 +2323,42 @@ mod tests {
     }
 
     #[test]
+    fn transaction_timeline_includes_unscheduled_ready_transactions_ahead() {
+        let transaction = TransactionRecord {
+            index: 7,
+            signature: Some("signature-7".to_string()),
+            events: vec![
+                ReplayEvent::transaction_ingested(10, 42, 7, [1; 64]),
+                ReplayEvent::transaction_scheduling_skipped(20, 42, 7, 3),
+                ReplayEvent::transaction_worker_dispatch_event(
+                    30,
+                    replay_event_tags::TRANSACTION_SCHEDULED_FOR_EXEC,
+                    42,
+                    7,
+                    1,
+                    2,
+                    4,
+                ),
+            ],
+        };
+
+        let timeline = transaction_timeline(42, Some(0), &transaction);
+        let skipped = timeline
+            .events
+            .iter()
+            .find(|event| event.name == "tx-scheduling-skipped")
+            .unwrap();
+        let scheduled = timeline
+            .events
+            .iter()
+            .find(|event| event.name == "tx-scheduled-for-exec")
+            .unwrap();
+
+        assert!(skipped.detail.contains("unscheduled_ready_ahead=3"));
+        assert!(scheduled.detail.contains("unscheduled_ready_ahead=4"));
+    }
+
+    #[test]
     fn transaction_timeline_includes_signature_verification_queue_len() {
         let transaction = TransactionRecord {
             index: 7,
@@ -2333,12 +2417,7 @@ mod tests {
                 ),
                 ReplayEvent::transaction_check_passed(150, 42, 7, 3, 123),
                 ReplayEvent::transaction_ready_for_scheduling(180, 42, 7, 8),
-                ReplayEvent::transaction_event(
-                    190,
-                    replay_event_tags::TRANSACTION_SCHEDULING_SKIPPED,
-                    42,
-                    7,
-                ),
+                ReplayEvent::transaction_scheduling_skipped(190, 42, 7, 2),
                 ReplayEvent::transaction_worker_dispatch_event(
                     220,
                     replay_event_tags::TRANSACTION_SCHEDULED_FOR_EXEC,
@@ -2346,6 +2425,7 @@ mod tests {
                     7,
                     3,
                     5,
+                    1,
                 ),
                 ReplayEvent::transaction_worker_event(
                     250,

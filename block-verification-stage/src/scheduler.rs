@@ -167,6 +167,7 @@ struct SchedulingState {
     next_ready_transaction_index: usize,
     ready_transactions: VecDeque<usize>,
     ready_scan_cursor: usize,
+    unscheduled_ready_transactions_before_cursor: usize,
     unschedulable_read_locks: PubkeyHashSet,
     unschedulable_write_locks: PubkeyHashSet,
     ingress_complete: bool,
@@ -198,6 +199,7 @@ impl SchedulingState {
             next_ready_transaction_index: 0,
             ready_transactions: VecDeque::new(),
             ready_scan_cursor: 0,
+            unscheduled_ready_transactions_before_cursor: 0,
             unschedulable_read_locks: PubkeyHashSet::with_hasher(PubkeyHasherBuilder::default()),
             unschedulable_write_locks: PubkeyHashSet::with_hasher(PubkeyHasherBuilder::default()),
             ingress_complete: false,
@@ -276,6 +278,7 @@ impl SchedulingState {
         self.ready_transactions.clear();
         reserve_vec_deque_capacity(&mut self.ready_transactions, POOLED_SLOT_WORK_CAPACITY);
         self.ready_scan_cursor = 0;
+        self.unscheduled_ready_transactions_before_cursor = 0;
         self.unschedulable_read_locks.clear();
         reserve_hash_set_capacity(
             &mut self.unschedulable_read_locks,
@@ -326,6 +329,7 @@ impl SchedulingState {
 
     fn reset_ready_scan(&mut self) {
         self.ready_scan_cursor = 0;
+        self.unscheduled_ready_transactions_before_cursor = 0;
         self.unschedulable_read_locks.clear();
         self.unschedulable_write_locks.clear();
     }
@@ -375,9 +379,17 @@ impl SchedulingState {
                 .ready_transactions
                 .get(self.ready_scan_cursor)
                 .expect("ready transaction index must be in-bounds");
-            match self.try_dispatch_ready_transaction(transaction_index, dispatch_context) {
+            let unscheduled_ready_transactions_ahead =
+                self.unscheduled_ready_transactions_before_cursor;
+            let dispatch_result = self.try_dispatch_ready_transaction(
+                transaction_index,
+                unscheduled_ready_transactions_ahead,
+                dispatch_context,
+            );
+            match dispatch_result {
                 ReadyTransactionDispatchResult::AlreadyScheduled => {}
                 ReadyTransactionDispatchResult::Deferred => {
+                    self.unscheduled_ready_transactions_before_cursor += 1;
                     counts.scanned += 1;
                 }
                 ReadyTransactionDispatchResult::Unavailable => {
@@ -400,6 +412,7 @@ impl SchedulingState {
     fn try_dispatch_ready_transaction(
         &mut self,
         transaction_index: usize,
+        unscheduled_ready_transactions_ahead: usize,
         dispatch_context: &mut ExecutionDispatchContext<'_>,
     ) -> ReadyTransactionDispatchResult {
         let slot = self.slot;
@@ -425,10 +438,10 @@ impl SchedulingState {
                     &mut self.unschedulable_read_locks,
                     &mut self.unschedulable_write_locks,
                 );
-                dispatch_context.emit_transaction_event(
-                    replay_event_tags::TRANSACTION_SCHEDULING_SKIPPED,
+                dispatch_context.emit_transaction_scheduling_skipped_event(
                     slot,
                     transaction_index,
+                    unscheduled_ready_transactions_ahead,
                 );
                 return ReadyTransactionDispatchResult::Deferred;
             }
@@ -449,18 +462,18 @@ impl SchedulingState {
                         &mut self.unschedulable_read_locks,
                         &mut self.unschedulable_write_locks,
                     );
-                    dispatch_context.emit_transaction_event(
-                        replay_event_tags::TRANSACTION_SCHEDULING_SKIPPED,
+                    dispatch_context.emit_transaction_scheduling_skipped_event(
                         slot,
                         transaction_index,
+                        unscheduled_ready_transactions_ahead,
                     );
                     return ReadyTransactionDispatchResult::Deferred;
                 }
                 ExecutionDispatchResult::Unavailable => {
-                    dispatch_context.emit_transaction_event(
-                        replay_event_tags::TRANSACTION_SCHEDULING_SKIPPED,
+                    dispatch_context.emit_transaction_scheduling_skipped_event(
                         slot,
                         transaction_index,
+                        unscheduled_ready_transactions_ahead,
                     );
                     return ReadyTransactionDispatchResult::Unavailable;
                 }
@@ -475,6 +488,7 @@ impl SchedulingState {
             transaction_index,
             thread_id,
             worker_queue_len,
+            unscheduled_ready_transactions_ahead,
         );
         ReadyTransactionDispatchResult::Scheduled
     }
@@ -498,6 +512,9 @@ impl SchedulingState {
             .ready_scan_cursor
             .saturating_sub(pruned)
             .min(self.ready_transactions.len());
+        self.unscheduled_ready_transactions_before_cursor = self
+            .unscheduled_ready_transactions_before_cursor
+            .min(self.ready_scan_cursor);
         if self.ready_transactions.is_empty() {
             self.reset_ready_scan();
         }
@@ -862,13 +879,19 @@ enum ExecutionDispatchResult {
 }
 
 impl ExecutionDispatchContext<'_> {
-    fn emit_transaction_event(&self, tag: u64, slot: u64, transaction_index: usize) {
+    fn emit_transaction_scheduling_skipped_event(
+        &self,
+        slot: u64,
+        transaction_index: usize,
+        unscheduled_ready_transactions_ahead: usize,
+    ) {
         if let Some(event_broadcast) = self.event_broadcast {
-            event_broadcast.emit(ReplayEvent::transaction_event(
+            event_broadcast.emit(ReplayEvent::transaction_scheduling_skipped(
                 0,
-                tag,
                 slot,
                 u64::try_from(transaction_index).expect("transaction index must fit in u64"),
+                u64::try_from(unscheduled_ready_transactions_ahead)
+                    .expect("unscheduled ready transaction count must fit in u64"),
             ));
         }
     }
@@ -880,6 +903,7 @@ impl ExecutionDispatchContext<'_> {
         transaction_index: usize,
         worker_id: ThreadId,
         worker_queue_len: usize,
+        unscheduled_ready_transactions_ahead: usize,
     ) {
         if let Some(event_broadcast) = self.event_broadcast {
             event_broadcast.emit(ReplayEvent::transaction_worker_dispatch_event(
@@ -889,6 +913,8 @@ impl ExecutionDispatchContext<'_> {
                 u64::try_from(transaction_index).expect("transaction index must fit in u64"),
                 u64::try_from(worker_id).expect("worker id must fit in u64"),
                 u64::try_from(worker_queue_len).expect("worker queue length must fit in u64"),
+                u64::try_from(unscheduled_ready_transactions_ahead)
+                    .expect("unscheduled ready transaction count must fit in u64"),
             ));
         }
     }
@@ -4714,6 +4740,7 @@ mod tests {
         assert_eq!(events[2].check_queue_len(), Some(1));
         assert_eq!(events[2].worker_queue_len(), None);
         assert_eq!(events[5].worker_queue_len(), Some(1));
+        assert_eq!(events[5].unscheduled_ready_transactions_ahead(), Some(0));
         assert_eq!(events[3].worker_queue_len(), None);
         assert_eq!(events[3].estimated_cost_units(), Some(123));
         assert_eq!(events[4].ready_released_by_transaction_index(), Some(0));
@@ -4849,6 +4876,10 @@ mod tests {
             .expect("scheduling skip event should be emitted");
         assert_eq!(skipped_event.slot(), 42);
         assert_eq!(skipped_event.transaction_index(), Some(1));
+        assert_eq!(
+            skipped_event.unscheduled_ready_transactions_ahead(),
+            Some(0)
+        );
         assert_eq!(skipped_event.signature(), None);
     }
 

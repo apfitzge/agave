@@ -13,6 +13,10 @@ pub const REPLAY_EVENTS_IPC_FILE: &str = "agave_events.ipc";
 /// Worker dispatch transaction events also include `worker_queue_len: u64`.
 /// Check-passed transaction events also include `estimated_cost_units: u64`.
 /// Execution result transaction events also include `cost_units: u64`.
+/// Scheduling-skipped transaction events reuse the signature bytes as:
+/// `unscheduled_ready_transactions_ahead: u64`.
+/// Worker dispatch transaction events also include
+/// `unscheduled_ready_transactions_ahead: u64`.
 /// Signature verification submission events also include
 /// `signature_verification_queue_len: u64`.
 /// Signature verification worker transaction events reuse the signature bytes as:
@@ -162,10 +166,13 @@ pub mod replay_event_tags {
     /// Payload includes `signature_verification_worker_id: u64` and `verified: u64`.
     pub const TRANSACTION_SIGNATURE_VERIFICATION_WORKER_RESULT_SENT: u64 = 32;
     /// Transaction could not currently be scheduled.
+    ///
+    /// Payload includes `unscheduled_ready_transactions_ahead: u64`.
     pub const TRANSACTION_SCHEDULING_SKIPPED: u64 = 6;
     /// Transaction was sent to a worker for execution.
     ///
-    /// Payload includes `worker_id: u64`.
+    /// Payload includes `worker_id: u64`, `worker_queue_len: u64`, and
+    /// `unscheduled_ready_transactions_ahead: u64`.
     pub const TRANSACTION_SCHEDULED_FOR_EXEC: u64 = 7;
     /// Worker execution response completed.
     ///
@@ -190,6 +197,9 @@ const SIGNATURE_OFFSET: usize = TRANSACTION_INDEX_OFFSET + core::mem::size_of::<
 const CHECK_QUEUE_LENGTH_OFFSET: usize = SIGNATURE_OFFSET;
 const WORKER_ID_OFFSET: usize = SIGNATURE_OFFSET;
 const WORKER_QUEUE_LENGTH_OFFSET: usize = WORKER_ID_OFFSET + core::mem::size_of::<u64>();
+const SCHEDULING_SKIPPED_UNSCHEDULED_READY_AHEAD_OFFSET: usize = SIGNATURE_OFFSET;
+const WORKER_DISPATCH_UNSCHEDULED_READY_AHEAD_OFFSET: usize =
+    WORKER_QUEUE_LENGTH_OFFSET + core::mem::size_of::<u64>();
 const ESTIMATED_COST_UNITS_OFFSET: usize = WORKER_QUEUE_LENGTH_OFFSET;
 const COST_UNITS_OFFSET: usize = WORKER_QUEUE_LENGTH_OFFSET;
 const SIGNATURE_VERIFICATION_QUEUE_LENGTH_OFFSET: usize = SIGNATURE_OFFSET;
@@ -282,6 +292,25 @@ impl ReplayEvent {
         event
     }
 
+    pub fn transaction_scheduling_skipped(
+        timestamp_ns: u64,
+        slot: u64,
+        transaction_index: u64,
+        unscheduled_ready_transactions_ahead: u64,
+    ) -> Self {
+        let mut event = Self::transaction_event(
+            timestamp_ns,
+            replay_event_tags::TRANSACTION_SCHEDULING_SKIPPED,
+            slot,
+            transaction_index,
+        );
+        event.write_u64(
+            SCHEDULING_SKIPPED_UNSCHEDULED_READY_AHEAD_OFFSET,
+            unscheduled_ready_transactions_ahead,
+        );
+        event
+    }
+
     pub fn transaction_signatures_returned(
         timestamp_ns: u64,
         slot: u64,
@@ -370,11 +399,16 @@ impl ReplayEvent {
         transaction_index: u64,
         worker_id: u64,
         worker_queue_len: u64,
+        unscheduled_ready_transactions_ahead: u64,
     ) -> Self {
         debug_assert!(is_transaction_worker_dispatch_event_tag(tag));
         let mut event =
             Self::transaction_worker_event(timestamp_ns, tag, slot, transaction_index, worker_id);
         event.write_u64(WORKER_QUEUE_LENGTH_OFFSET, worker_queue_len);
+        event.write_u64(
+            WORKER_DISPATCH_UNSCHEDULED_READY_AHEAD_OFFSET,
+            unscheduled_ready_transactions_ahead,
+        );
         event
     }
 
@@ -506,6 +540,18 @@ impl ReplayEvent {
         }
 
         Some(self.read_u64(READY_RELEASED_BY_TRANSACTION_INDEX_OFFSET))
+    }
+
+    pub fn unscheduled_ready_transactions_ahead(&self) -> Option<u64> {
+        match self.tag {
+            replay_event_tags::TRANSACTION_SCHEDULING_SKIPPED => {
+                Some(self.read_u64(SCHEDULING_SKIPPED_UNSCHEDULED_READY_AHEAD_OFFSET))
+            }
+            replay_event_tags::TRANSACTION_SCHEDULED_FOR_EXEC => {
+                Some(self.read_u64(WORKER_DISPATCH_UNSCHEDULED_READY_AHEAD_OFFSET))
+            }
+            _ => None,
+        }
     }
 
     fn slot_event(timestamp_ns: u64, tag: u64, slot: u64) -> Self {
@@ -709,6 +755,17 @@ mod tests {
     }
 
     #[test]
+    fn transaction_scheduling_skipped_carries_unscheduled_ready_transactions_ahead() {
+        let event = ReplayEvent::transaction_scheduling_skipped(1, 2, 3, 4);
+
+        assert_eq!(event.slot(), 2);
+        assert_eq!(event.transaction_index(), Some(3));
+        assert_eq!(event.unscheduled_ready_transactions_ahead(), Some(4));
+        assert_eq!(event.worker_id(), None);
+        assert_eq!(event.signature(), None);
+    }
+
+    #[test]
     fn transaction_sent_for_check_carries_check_queue_len() {
         let event = ReplayEvent::transaction_sent_for_check(1, 2, 3, 4);
 
@@ -752,12 +809,19 @@ mod tests {
             let expected_worker_queue_len =
                 is_transaction_worker_dispatch_event_tag(tag).then_some(0);
             assert_eq!(event.worker_queue_len(), expected_worker_queue_len);
+            let expected_unscheduled_ready_transactions_ahead =
+                is_transaction_worker_dispatch_event_tag(tag).then_some(0);
+            assert_eq!(
+                event.unscheduled_ready_transactions_ahead(),
+                expected_unscheduled_ready_transactions_ahead
+            );
             assert_eq!(event.signature(), None);
         }
     }
 
     #[test]
-    fn transaction_worker_dispatch_events_carry_queue_len() {
+    fn transaction_worker_dispatch_events_carry_queue_len_and_unscheduled_ready_transactions_ahead()
+    {
         let event = ReplayEvent::transaction_worker_dispatch_event(
             1,
             replay_event_tags::TRANSACTION_SCHEDULED_FOR_EXEC,
@@ -765,12 +829,14 @@ mod tests {
             3,
             4,
             5,
+            6,
         );
 
         assert_eq!(event.slot(), 2);
         assert_eq!(event.transaction_index(), Some(3));
         assert_eq!(event.worker_id(), Some(4));
         assert_eq!(event.worker_queue_len(), Some(5));
+        assert_eq!(event.unscheduled_ready_transactions_ahead(), Some(6));
         assert_eq!(event.signature(), None);
     }
 
