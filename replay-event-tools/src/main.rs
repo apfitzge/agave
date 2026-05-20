@@ -470,6 +470,9 @@ fn timeline_event_detail(event: &ReplayEvent) -> String {
     if let Some(worker_queue_len) = event.worker_queue_len() {
         details.push(format!("queue_len={worker_queue_len}"));
     }
+    if let Some(signature_verification_queue_len) = event.signature_verification_queue_len() {
+        details.push(format!("queue_len={signature_verification_queue_len}"));
+    }
     if let Some(verified) = event.signature_verification_result() {
         details.push(format!("verified={verified}"));
     }
@@ -1663,6 +1666,27 @@ mod tests {
 
         assert!(sent_for_check.detail.contains("worker=3"));
         assert!(sent_for_check.detail.contains("queue_len=4"));
+    }
+
+    #[test]
+    fn transaction_timeline_includes_signature_verification_queue_len() {
+        let transaction = TransactionRecord {
+            index: 7,
+            signature: Some("signature-7".to_string()),
+            events: vec![
+                ReplayEvent::transaction_ingested(10, 42, 7, [1; 64]),
+                ReplayEvent::transaction_signatures_submitted(20, 42, 7, 4),
+            ],
+        };
+
+        let timeline = transaction_timeline(42, Some(0), &transaction);
+        let submitted = timeline
+            .events
+            .iter()
+            .find(|event| event.name == "tx-signatures-submitted")
+            .unwrap();
+
+        assert!(submitted.detail.contains("queue_len=4"));
     }
 
     #[test]
