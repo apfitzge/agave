@@ -777,6 +777,7 @@ struct ExecutionDispatchContext<'a> {
     in_flight_execution_messages: &'a mut usize,
     in_flight_executions_per_thread: &'a mut [usize],
     in_flight_execution_cost_units_per_thread: &'a mut [u64],
+    available_execution_threads: ThreadSet,
     event_broadcast: Option<&'a ReplayEventBroadcast>,
 }
 
@@ -944,15 +945,14 @@ impl ExecutionDispatchContext<'_> {
         }
 
         let estimated_cost_units = transaction.estimated_cost_units();
-        let available_threads = self.available_worker_threads(estimated_cost_units);
-        if available_threads.is_empty() {
+        if self.available_execution_threads.is_empty() {
             return ExecutionDispatchResult::Unavailable;
         }
 
         let Ok(thread_id) = account_locks.try_lock_accounts(
             transaction.write_locks(),
             transaction.read_locks(),
-            available_threads,
+            self.available_execution_threads,
             |thread_set| {
                 select_execution_thread(
                     thread_set,
@@ -996,6 +996,7 @@ impl ExecutionDispatchContext<'_> {
         let worker_queue_len = match write_result {
             Ok(worker_queue_len) => worker_queue_len,
             Err(batch) => {
+                self.available_execution_threads.remove(thread_id);
                 self.free_transaction_batch_allocation(batch);
                 account_locks.unlock_accounts(
                     transaction.write_locks(),
@@ -1007,20 +1008,20 @@ impl ExecutionDispatchContext<'_> {
         };
 
         self.increment_in_flight_execution_messages(thread_id, estimated_cost_units);
+        self.remove_worker_if_unavailable_after_dispatch(thread_id, worker_queue_len);
         ExecutionDispatchResult::Scheduled {
             thread_id,
             worker_queue_len,
         }
     }
 
-    fn available_worker_threads(&mut self, estimated_cost_units: u64) -> ThreadSet {
+    fn refresh_available_execution_threads(&mut self) {
         let mut available_threads = ThreadSet::none();
         for worker_index in 0..self.workers.len() {
             let in_flight_execution_count = self.in_flight_executions_per_thread[worker_index];
             let has_cost_capacity = Self::worker_has_cost_capacity(
                 in_flight_execution_count,
                 self.in_flight_execution_cost_units_per_thread[worker_index],
-                estimated_cost_units,
             );
             let queue = &mut self.workers[worker_index].pack_to_worker;
             queue.sync();
@@ -1032,17 +1033,32 @@ impl ExecutionDispatchContext<'_> {
             }
         }
 
-        available_threads
+        self.available_execution_threads = available_threads;
+    }
+
+    fn remove_worker_if_unavailable_after_dispatch(
+        &mut self,
+        thread_id: ThreadId,
+        worker_queue_len: usize,
+    ) {
+        let in_flight_execution_count = self.in_flight_executions_per_thread[thread_id];
+        if worker_queue_len >= self.workers[thread_id].pack_to_worker.capacity()
+            || in_flight_execution_count >= MAX_OUTSTANDING_EXECUTIONS_PER_WORKER
+            || !Self::worker_has_cost_capacity(
+                in_flight_execution_count,
+                self.in_flight_execution_cost_units_per_thread[thread_id],
+            )
+        {
+            self.available_execution_threads.remove(thread_id);
+        }
     }
 
     fn worker_has_cost_capacity(
         in_flight_execution_count: usize,
         in_flight_cost_units: u64,
-        estimated_cost_units: u64,
     ) -> bool {
         in_flight_execution_count == 0
-            || in_flight_cost_units.saturating_add(estimated_cost_units)
-                <= MAX_OUTSTANDING_EXECUTION_COST_UNITS_PER_WORKER
+            || in_flight_cost_units < MAX_OUTSTANDING_EXECUTION_COST_UNITS_PER_WORKER
     }
 
     fn increment_in_flight_execution_messages(&mut self, thread_id: ThreadId, cost_units: u64) {
@@ -2217,11 +2233,13 @@ impl BlockVerificationScheduler {
             in_flight_executions_per_thread: &mut self.in_flight_executions_per_thread,
             in_flight_execution_cost_units_per_thread: &mut self
                 .in_flight_execution_cost_units_per_thread,
+            available_execution_threads: ThreadSet::none(),
             event_broadcast: self.event_broadcast.as_deref(),
         };
         if !dispatch_context.has_capacity() {
             return 0;
         }
+        dispatch_context.refresh_available_execution_threads();
 
         let mut counts = ExecutionDispatchCounts::default();
         for state in self.scheduling_states.values_mut() {
@@ -5436,6 +5454,22 @@ mod tests {
 
         let state = scheduler.scheduling_states.get(&42).unwrap();
         assert!(state.ready_transactions.iter().copied().eq(2..3));
+    }
+
+    #[test]
+    fn worker_execution_cost_limit_allows_one_transaction_over_cap() {
+        assert!(ExecutionDispatchContext::worker_has_cost_capacity(
+            1,
+            MAX_OUTSTANDING_EXECUTION_COST_UNITS_PER_WORKER - 1,
+        ));
+        assert!(!ExecutionDispatchContext::worker_has_cost_capacity(
+            2,
+            MAX_OUTSTANDING_EXECUTION_COST_UNITS_PER_WORKER,
+        ));
+        assert!(ExecutionDispatchContext::worker_has_cost_capacity(
+            0,
+            MAX_OUTSTANDING_EXECUTION_COST_UNITS_PER_WORKER,
+        ));
     }
 
     #[test]
