@@ -13,6 +13,7 @@ pub mod banking_simulation;
 pub mod banking_stage;
 pub mod banking_trace;
 mod block_creation_loop;
+mod block_verification_check;
 mod block_verification_sigverify;
 pub mod block_verification_stage;
 pub mod bls_sigverify;

@@ -613,6 +613,9 @@ fn timeline_event_detail(event: &ReplayEvent) -> String {
     if let Some(worker_id) = event.signature_verification_worker_id() {
         details.push(format!("sigverify_worker={worker_id}"));
     }
+    if let Some(check_queue_len) = event.check_queue_len() {
+        details.push(format!("queue_len={check_queue_len}"));
+    }
     if let Some(worker_queue_len) = event.worker_queue_len() {
         details.push(format!("queue_len={worker_queue_len}"));
     }
@@ -642,6 +645,9 @@ fn timeline_event_detail(event: &ReplayEvent) -> String {
 
 fn worker_timeline_event_detail(event: &ReplayEvent) -> String {
     let mut details = Vec::new();
+    if let Some(check_queue_len) = event.check_queue_len() {
+        details.push(format!("queue_len={check_queue_len}"));
+    }
     if let Some(worker_queue_len) = event.worker_queue_len() {
         details.push(format!("queue_len={worker_queue_len}"));
     }
@@ -1981,14 +1987,7 @@ mod tests {
             signature: Some("signature-7".to_string()),
             events: vec![
                 ReplayEvent::transaction_ingested(10, 42, 7, [1; 64]),
-                ReplayEvent::transaction_worker_dispatch_event(
-                    20,
-                    replay_event_tags::TRANSACTION_SENT_FOR_CHECK,
-                    42,
-                    7,
-                    3,
-                    4,
-                ),
+                ReplayEvent::transaction_sent_for_check(20, 42, 7, 4),
                 ReplayEvent::transaction_worker_event(
                     40,
                     replay_event_tags::TRANSACTION_WORKER_PICKED_UP,
@@ -2013,7 +2012,6 @@ mod tests {
             .find(|event| event.name == "tx-sent-for-check")
             .unwrap();
 
-        assert!(sent_for_check.detail.contains("worker=3"));
         assert!(sent_for_check.detail.contains("queue_len=4"));
     }
 
@@ -2066,14 +2064,7 @@ mod tests {
             signature: Some("signature-7".to_string()),
             events: vec![
                 ReplayEvent::transaction_ingested(105, 42, 7, [1; 64]),
-                ReplayEvent::transaction_worker_dispatch_event(
-                    110,
-                    replay_event_tags::TRANSACTION_SENT_FOR_CHECK,
-                    42,
-                    7,
-                    3,
-                    4,
-                ),
+                ReplayEvent::transaction_sent_for_check(110, 42, 7, 4),
                 ReplayEvent::transaction_worker_event(
                     130,
                     replay_event_tags::TRANSACTION_WORKER_PICKED_UP,
@@ -2190,7 +2181,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_timeline_shows_worker_transaction_and_queue_len() {
+    fn worker_timeline_shows_worker_transaction_events() {
         let slot = store::SlotRecord {
             slot: 42,
             slot_events: vec![ReplayEvent::slot_begin(10, 42)],
@@ -2200,14 +2191,7 @@ mod tests {
                     index: 7,
                     signature: Some("signature-7".to_string()),
                     events: vec![
-                        ReplayEvent::transaction_worker_dispatch_event(
-                            20,
-                            replay_event_tags::TRANSACTION_SENT_FOR_CHECK,
-                            42,
-                            7,
-                            3,
-                            4,
-                        ),
+                        ReplayEvent::transaction_sent_for_check(20, 42, 7, 4),
                         ReplayEvent::transaction_worker_event(
                             30,
                             replay_event_tags::TRANSACTION_WORKER_PICKED_UP,
@@ -2221,12 +2205,12 @@ mod tests {
         };
         let timeline = worker_timeline(&slot, WorkerTimelineKind::Replay);
 
-        assert_eq!(timeline.len(), 2);
-        assert_eq!(timeline[0].delta_ns, 10);
+        assert_eq!(timeline.len(), 1);
+        assert_eq!(timeline[0].delta_ns, 20);
         assert_eq!(timeline[0].worker_id, 3);
         assert_eq!(timeline[0].transaction_index, 7);
-        assert_eq!(timeline[0].name, "tx-sent-for-check");
-        assert_eq!(timeline[0].detail, "queue_len=4");
+        assert_eq!(timeline[0].name, "tx-worker-picked-up");
+        assert_eq!(timeline[0].detail, "");
     }
 
     #[test]

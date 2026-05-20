@@ -4,12 +4,13 @@ pub use agave_block_verification_stage::session::{
 use {
     crate::{
         banking_stage::spawn_replay_block_verification_workers,
+        block_verification_check::spawn_replay_check_workers,
         block_verification_sigverify::spawn_replay_signature_verification_workers,
     },
     agave_block_verification_stage::{
         scheduler::BlockVerificationScheduler,
         setup::{
-            BlockVerificationStageSessions, BlockVerificationStageSetupConfig,
+            BlockVerificationStageSessions, BlockVerificationStageSetupConfig, CHECK_WORKER_COUNT,
             ReplayEventBroadcast, SIGNATURE_VERIFICATION_WORKER_COUNT,
         },
     },
@@ -131,11 +132,13 @@ impl BlockVerificationStage {
             block_verification_stage,
             replay_stage,
             workers,
+            check_workers,
             signature_verification_workers,
         } = sessions;
 
-        let mut threads =
-            Vec::with_capacity(worker_count.get() + SIGNATURE_VERIFICATION_WORKER_COUNT + 1);
+        let mut threads = Vec::with_capacity(
+            worker_count.get() + CHECK_WORKER_COUNT + SIGNATURE_VERIFICATION_WORKER_COUNT + 1,
+        );
         let scheduler_exit = exit.clone();
         let scheduler_event_broadcast = event_broadcast.clone();
         threads.push(
@@ -160,6 +163,12 @@ impl BlockVerificationStage {
             prioritization_fee_cache,
             log_messages_bytes_limit,
             shared_leader_state,
+            bank_forks.clone(),
+            event_broadcast.clone(),
+        ));
+        threads.extend(spawn_replay_check_workers(
+            exit.clone(),
+            check_workers,
             bank_forks,
             event_broadcast.clone(),
         ));
@@ -232,7 +241,7 @@ mod tests {
         assert!(ledger_path.path().join("agave_events.ipc").exists());
         assert_eq!(
             block_verification_stage.thread_count(),
-            2 + SIGNATURE_VERIFICATION_WORKER_COUNT
+            2 + CHECK_WORKER_COUNT + SIGNATURE_VERIFICATION_WORKER_COUNT
         );
         exit.store(true, Ordering::Relaxed);
         block_verification_stage.join().unwrap();

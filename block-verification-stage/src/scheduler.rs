@@ -4,7 +4,7 @@ use {
             EntryHashVerificationResult, EntryHashVerificationTask, EntryHashVerifier,
         },
         setup::{
-            BlockVerificationStageSession, BlockVerificationStageWorkerSession,
+            BlockVerificationStageSession, BlockVerificationStageWorkerSession, CheckWorkerResult,
             ReplayEventBroadcast, SignatureVerificationRequest, SignatureVerificationResult,
         },
     },
@@ -56,6 +56,7 @@ const ENTRY_VERIFICATION_RESULT_LIMIT: usize = 128;
 const SIGNATURE_VERIFICATION_SUBMISSION_LIMIT: usize = 128;
 const SIGNATURE_VERIFICATION_RESULT_LIMIT: usize = 128;
 const SIGNATURE_CHECK_DISPATCH_LIMIT: usize = 128;
+const TRANSACTION_CHECK_RESULT_LIMIT: usize = 128;
 const TRANSACTION_EXECUTION_DISPATCH_LIMIT: usize = 128;
 const TRANSACTION_EXECUTION_SCAN_LIMIT: usize = 128;
 const MAX_OUTSTANDING_EXECUTIONS_PER_WORKER: usize = 128;
@@ -146,6 +147,7 @@ pub struct BlockVerificationScheduler {
     pending_entry: Option<PendingEntryIngress>,
     entry_hash_verifier: EntryHashVerifier,
     in_flight_signature_verifications: usize,
+    in_flight_transaction_checks: usize,
     in_flight_execution_messages: usize,
     in_flight_executions_per_thread: Vec<usize>,
     in_flight_execution_cost_units_per_thread: Vec<u64>,
@@ -1377,6 +1379,7 @@ impl BlockVerificationScheduler {
             pending_entry: None,
             entry_hash_verifier: EntryHashVerifier::new(entry_verification_threads),
             in_flight_signature_verifications: 0,
+            in_flight_transaction_checks: 0,
             in_flight_execution_messages: 0,
             in_flight_executions_per_thread: vec![0; worker_count],
             in_flight_execution_cost_units_per_thread: vec![0; worker_count],
@@ -1392,6 +1395,7 @@ impl BlockVerificationScheduler {
             );
             self.service_transaction_check_dispatches(SIGNATURE_CHECK_DISPATCH_LIMIT);
             self.service_signature_verification_results(SIGNATURE_VERIFICATION_RESULT_LIMIT);
+            self.service_transaction_check_results(TRANSACTION_CHECK_RESULT_LIMIT);
             self.service_worker_responses(WORKER_RESPONSE_LIMIT);
             self.service_transaction_execution_dispatches(
                 TRANSACTION_EXECUTION_DISPATCH_LIMIT,
@@ -1487,6 +1491,20 @@ impl BlockVerificationScheduler {
         ));
     }
 
+    fn emit_transaction_sent_for_check_event(
+        &self,
+        slot: u64,
+        transaction_index: usize,
+        check_queue_len: usize,
+    ) {
+        self.emit_event(ReplayEvent::transaction_sent_for_check(
+            0,
+            slot,
+            u64::try_from(transaction_index).expect("transaction index must fit in u64"),
+            u64::try_from(check_queue_len).expect("check queue length must fit in u64"),
+        ));
+    }
+
     fn emit_transaction_worker_event(
         &self,
         tag: u64,
@@ -1534,24 +1552,6 @@ impl BlockVerificationScheduler {
             u64::try_from(transaction_index).expect("transaction index must fit in u64"),
             u64::try_from(worker_id).expect("worker id must fit in u64"),
             cost_units,
-        ));
-    }
-
-    fn emit_transaction_worker_dispatch_event(
-        &self,
-        tag: u64,
-        slot: u64,
-        transaction_index: usize,
-        worker_id: ThreadId,
-        worker_queue_len: usize,
-    ) {
-        self.emit_event(ReplayEvent::transaction_worker_dispatch_event(
-            0,
-            tag,
-            slot,
-            u64::try_from(transaction_index).expect("transaction index must fit in u64"),
-            u64::try_from(worker_id).expect("worker id must fit in u64"),
-            u64::try_from(worker_queue_len).expect("worker queue length must fit in u64"),
         ));
     }
 
@@ -1857,66 +1857,36 @@ impl BlockVerificationScheduler {
         for slot_index in 0..self.slot_order.len() {
             let slot = self.slot_order[slot_index];
             while dispatched < max_checks && self.has_pending_transaction_checks(slot) {
-                let mut made_progress = false;
-                for worker_index in 0..self.session.workers.len() {
-                    if dispatched == max_checks {
-                        return dispatched;
-                    }
-                    let Some(pending_check) = self.pending_transaction_check(slot) else {
-                        break;
-                    };
-                    if !self.worker_queue_has_capacity(worker_index) {
-                        continue;
-                    }
+                let Some(pending_check) = self.pending_transaction_check(slot) else {
+                    break;
+                };
 
-                    let Some(batch) =
-                        self.allocate_transaction_check_batch(slot, pending_check, worker_index)
-                    else {
-                        return dispatched;
-                    };
+                let Some(batch) = self.allocate_transaction_check_batch(slot, pending_check) else {
+                    return dispatched;
+                };
 
-                    let message = PackToWorkerMessage {
-                        flags: REPLAY_TRANSACTION_CHECK_FLAGS,
-                        max_working_slot: slot,
-                        batch,
-                    };
-                    let write_result = {
-                        let queue = &mut self.session.workers[worker_index].pack_to_worker;
-                        match queue.try_write(message) {
-                            Ok(()) => {
-                                queue.commit();
-                                Ok(queue.len())
-                            }
-                            Err(returned_message) => Err(returned_message.batch),
-                        }
-                    };
-                    let worker_queue_len = match write_result {
-                        Ok(worker_queue_len) => worker_queue_len,
-                        Err(batch) => {
-                            self.free_transaction_batch_allocation(batch);
-                            return dispatched;
-                        }
-                    };
-
-                    {
-                        let state = self.scheduling_state_mut(slot);
-                        state.pending_transaction_checks.pop_front();
-                        state.in_flight_worker_messages += 1;
-                    }
-                    self.emit_transaction_worker_dispatch_event(
-                        replay_event_tags::TRANSACTION_SENT_FOR_CHECK,
-                        slot,
-                        pending_check.transaction_index,
-                        worker_index,
-                        worker_queue_len,
-                    );
-                    dispatched += 1;
-                    made_progress = true;
-                }
-
-                if !made_progress {
+                let message = PackToWorkerMessage {
+                    flags: REPLAY_TRANSACTION_CHECK_FLAGS,
+                    max_working_slot: slot,
+                    batch,
+                };
+                if let Err(returned_message) = self.session.check_requests.try_write(message) {
+                    self.free_transaction_batch_allocation(returned_message.batch);
                     return dispatched;
                 }
+
+                {
+                    let state = self.scheduling_state_mut(slot);
+                    state.pending_transaction_checks.pop_front();
+                    state.in_flight_worker_messages += 1;
+                }
+                self.in_flight_transaction_checks += 1;
+                self.emit_transaction_sent_for_check_event(
+                    slot,
+                    pending_check.transaction_index,
+                    self.in_flight_transaction_checks,
+                );
+                dispatched += 1;
             }
             if dispatched == max_checks {
                 break;
@@ -2102,17 +2072,10 @@ impl BlockVerificationScheduler {
         self.slot_order.remove(slot_index);
     }
 
-    fn worker_queue_has_capacity(&mut self, worker_index: usize) -> bool {
-        let queue = &mut self.session.workers[worker_index].pack_to_worker;
-        queue.sync();
-        queue.len() < queue.capacity()
-    }
-
     fn allocate_transaction_check_batch(
         &self,
         slot: u64,
         pending_check: PendingTransactionCheck,
-        worker_index: usize,
     ) -> Option<SharableTransactionBatchRegion> {
         let ptr = self
             .session
@@ -2145,7 +2108,7 @@ impl BlockVerificationScheduler {
             meta_ptr.as_ptr().write(PendingWorkerCheck {
                 slot,
                 transaction_index: pending_check.transaction_index,
-                thread_id: worker_index,
+                thread_id: 0,
             });
         }
 
@@ -2272,6 +2235,50 @@ impl BlockVerificationScheduler {
         consumed
     }
 
+    fn service_transaction_check_results(&mut self, max_results: usize) -> usize {
+        if max_results == 0 {
+            return 0;
+        }
+
+        let mut consumed = 0;
+        while consumed < max_results {
+            let Some(result) = self.session.check_results.try_read() else {
+                break;
+            };
+            consumed += 1;
+            self.handle_check_worker_result(result);
+        }
+
+        consumed
+    }
+
+    fn handle_check_worker_result(&mut self, result: CheckWorkerResult) {
+        self.in_flight_transaction_checks = self
+            .in_flight_transaction_checks
+            .checked_sub(1)
+            .expect("check worker response without in-flight check");
+
+        let message = result.message;
+        if message.processed_code != processed_codes::PROCESSED {
+            let worker_check = self.worker_check_metadata(message.batch);
+            self.free_transaction_batch_allocation(message.batch);
+            self.decrement_in_flight_worker_messages(worker_check.slot);
+            if let Some(state) = self.scheduling_states.get_mut(&worker_check.slot) {
+                if !state.allows_transaction_processing() {
+                    return;
+                }
+                state
+                    .pending_transaction_checks
+                    .push_front(PendingTransactionCheck {
+                        transaction_index: worker_check.transaction_index,
+                    });
+            }
+            return;
+        }
+
+        self.handle_check_response(message, result.worker_id);
+    }
+
     fn handle_worker_response(&mut self, message: WorkerToPackMessage) {
         assert_eq!(
             message.processed_code,
@@ -2287,12 +2294,17 @@ impl BlockVerificationScheduler {
     }
 
     fn handle_worker_check_response(&mut self, message: WorkerToPackMessage) {
+        self.handle_check_response(message, self.worker_check_metadata(message.batch).thread_id);
+    }
+
+    fn handle_check_response(&mut self, message: WorkerToPackMessage, worker_id: ThreadId) {
         assert!(
             is_check_response_region(message.batch, message.responses),
             "malformed replay CHECK worker response",
         );
 
-        let worker_check = self.worker_check_metadata(message.batch);
+        let mut worker_check = self.worker_check_metadata(message.batch);
+        worker_check.thread_id = worker_id;
         let slot = worker_check.slot;
 
         let check_responses = self.check_response_ptr(message.responses);
@@ -4617,12 +4629,13 @@ mod tests {
             assert_eq!(event.transaction_index(), Some(0));
             assert_eq!(event.signature(), None);
         }
-        assert_eq!(events[2].worker_id(), Some(0));
+        assert_eq!(events[2].worker_id(), None);
         assert_eq!(events[3].worker_id(), Some(0));
         assert_eq!(events[4].worker_id(), None);
         assert_eq!(events[5].worker_id(), Some(0));
         assert_eq!(events[6].worker_id(), Some(0));
-        assert_eq!(events[2].worker_queue_len(), Some(1));
+        assert_eq!(events[2].check_queue_len(), Some(1));
+        assert_eq!(events[2].worker_queue_len(), None);
         assert_eq!(events[5].worker_queue_len(), Some(1));
         assert_eq!(events[3].worker_queue_len(), None);
         assert_eq!(events[3].estimated_cost_units(), Some(123));

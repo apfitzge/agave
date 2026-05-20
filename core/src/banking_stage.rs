@@ -75,6 +75,11 @@ mod vote_worker;
 mod progress_tracker;
 #[cfg(unix)]
 mod tpu_to_pack;
+#[cfg(unix)]
+pub(crate) use consume_worker::external::{
+    emit_replay_check_worker_batch_event, emit_replay_check_worker_transaction_event,
+    process_replay_check_message,
+};
 
 /// The maximum number of worker threads that can be spawned by banking stage.
 /// 64 because `ThreadAwareAccountLocks` uses a `u64` as a bitmask to

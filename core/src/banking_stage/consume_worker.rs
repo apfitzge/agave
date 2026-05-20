@@ -191,9 +191,11 @@ pub(crate) mod external {
                 PacketHandlingError, translate_to_runtime_view,
             },
         },
+        agave_block_verification_stage::setup::ReplayEventBroadcast,
         agave_scheduler_bindings::{
             MAX_TRANSACTIONS_PER_MESSAGE, NO_REPLAY_BANK_SLOT, PackToWorkerMessage,
-            SharablePubkeys, TransactionResponseRegion, WorkerToPackMessage,
+            SharablePubkeys, SharableTransactionBatchRegion, TransactionResponseRegion,
+            WorkerToPackMessage,
             pack_message_flags::{self, check_flags, execution_flags},
             processed_codes,
             worker_message_types::{
@@ -411,24 +413,13 @@ pub(crate) mod external {
             };
 
             if Self::is_replay_check_message(message) {
-                let batch = unsafe {
-                    // SAFETY: Replay check messages are allocated by the replay
-                    // scheduler with `ReplayTransactionCheckMetadata`.
-                    TransactionPtrBatch::<ReplayTransactionCheckMetadata>::from_sharable_transaction_batch_region(
-                        &message.batch,
-                        &self.allocator,
-                    )
-                };
-                for (_, metadata) in batch.iter() {
-                    event_broadcast.emit(ReplayEvent::transaction_worker_event(
-                        0,
-                        tag,
-                        metadata.slot,
-                        u64::try_from(metadata.transaction_index)
-                            .expect("transaction index must fit in u64"),
-                        u64::from(self.id),
-                    ));
-                }
+                Self::emit_replay_check_worker_transaction_event(
+                    &self.allocator,
+                    Some(event_broadcast),
+                    self.id,
+                    tag,
+                    message,
+                );
             } else if Self::is_replay_message(message) {
                 let batch = unsafe {
                     // SAFETY: Replay execution messages are allocated by the
@@ -658,19 +649,40 @@ pub(crate) mod external {
                 replay_event_tags::TRANSACTION_WORKER_CHECK_BANK_ACQUIRED,
                 message,
             );
+            let response = Self::build_check_response_message(
+                &self.allocator,
+                self.id,
+                self.event_broadcast.as_deref(),
+                message,
+                &parse_and_resolve_bank,
+                &working_bank,
+            )?;
 
+            self.send_response_message(message, response)?;
+
+            Ok(())
+        }
+
+        fn build_check_response_message(
+            allocator: &rts_alloc::Allocator,
+            worker_id: u32,
+            event_broadcast: Option<&ReplayEventBroadcast>,
+            message: &PackToWorkerMessage,
+            parse_and_resolve_bank: &Bank,
+            working_bank: &Bank,
+        ) -> Result<WorkerToPackMessage, ExternalConsumeWorkerError> {
             // SAFETY: Assumption that external scheduler does not pass messages with batch regions
             //         not pointing to valid regions in the allocator.
             let batch = unsafe {
                 TransactionPtrBatch::from_sharable_transaction_batch_region(
                     &message.batch,
-                    &self.allocator,
+                    allocator,
                 )
             };
 
             // Allocate space for all responses.
             let (responses_ptr, responses) = allocate_check_response_region(
-                &self.allocator,
+                allocator,
                 usize::from(message.batch.num_transactions),
             )
             .ok_or(ExternalConsumeWorkerError::AllocationFailure)?;
@@ -680,11 +692,14 @@ pub(crate) mod external {
                 Self::parse_transactions_and_populate_initial_check_responses(
                     message,
                     &batch,
-                    &parse_and_resolve_bank,
+                    parse_and_resolve_bank,
                     responses_ptr,
                 )
             };
-            self.emit_replay_worker_transaction_event(
+            Self::emit_replay_check_worker_transaction_event(
+                allocator,
+                event_broadcast,
+                worker_id,
                 replay_event_tags::TRANSACTION_WORKER_CHECK_PARSED,
                 message,
             );
@@ -696,7 +711,10 @@ pub(crate) mod external {
                     &parsed_transactions,
                     response_slice,
                 );
-                self.emit_replay_worker_transaction_event(
+                Self::emit_replay_check_worker_transaction_event(
+                    allocator,
+                    event_broadcast,
+                    worker_id,
                     replay_event_tags::TRANSACTION_WORKER_CHECK_SIGNATURES_COMPLETE,
                     message,
                 );
@@ -708,9 +726,12 @@ pub(crate) mod external {
                     &parsing_results,
                     &parsed_transactions,
                     response_slice,
-                    &working_bank,
+                    working_bank,
                 );
-                self.emit_replay_worker_transaction_event(
+                Self::emit_replay_check_worker_transaction_event(
+                    allocator,
+                    event_broadcast,
+                    worker_id,
                     replay_event_tags::TRANSACTION_WORKER_CHECK_FEE_PAYER_BALANCE_COMPLETE,
                     message,
                 );
@@ -718,29 +739,36 @@ pub(crate) mod external {
 
             // Do resolving next since we (currently) need resolved transactions for status checks.
             let (parsing_and_resolve_results, txs, max_ages) =
-                Self::translate_transaction_batch(&batch, &parse_and_resolve_bank);
+                Self::translate_transaction_batch(&batch, parse_and_resolve_bank);
 
             Self::check_populate_resolved_metadata(
                 &parsing_and_resolve_results,
                 &txs,
                 response_slice,
-                &parse_and_resolve_bank,
+                parse_and_resolve_bank,
                 message.flags & check_flags::ESTIMATE_COST != 0,
             );
-            self.emit_replay_worker_transaction_event(
+            Self::emit_replay_check_worker_transaction_event(
+                allocator,
+                event_broadcast,
+                worker_id,
                 replay_event_tags::TRANSACTION_WORKER_CHECK_RESOLVED,
                 message,
             );
 
             if message.flags & check_flags::LOAD_ADDRESS_LOOKUP_TABLES != 0 {
-                self.check_resolve_pubkeys(
+                Self::check_resolve_pubkeys(
+                    allocator,
                     &parsing_results,
                     &parsing_and_resolve_results,
                     &txs,
                     &max_ages,
                     response_slice,
                 )?;
-                self.emit_replay_worker_transaction_event(
+                Self::emit_replay_check_worker_transaction_event(
+                    allocator,
+                    event_broadcast,
+                    worker_id,
                     replay_event_tags::TRANSACTION_WORKER_CHECK_ADDRESS_TABLES_COMPLETE,
                     message,
                 );
@@ -751,23 +779,22 @@ pub(crate) mod external {
                     &parsing_and_resolve_results,
                     &txs,
                     response_slice,
-                    &working_bank,
+                    working_bank,
                 );
-                self.emit_replay_worker_transaction_event(
+                Self::emit_replay_check_worker_transaction_event(
+                    allocator,
+                    event_broadcast,
+                    worker_id,
                     replay_event_tags::TRANSACTION_WORKER_CHECK_STATUS_COMPLETE,
                     message,
                 );
             }
 
-            let response = WorkerToPackMessage {
+            Ok(WorkerToPackMessage {
                 batch: message.batch,
                 processed_code: agave_scheduler_bindings::processed_codes::PROCESSED,
                 responses,
-            };
-
-            self.send_response_message(message, response)?;
-
-            Ok(())
+            })
         }
 
         fn bank_for_check(&self, message: &PackToWorkerMessage) -> CheckBankResult {
@@ -900,7 +927,7 @@ pub(crate) mod external {
         }
 
         fn check_resolve_pubkeys(
-            &self,
+            allocator: &rts_alloc::Allocator,
             parsing_results: &[Result<(), TransactionViewError>],
             parsing_and_resolve_results: &[Result<(), PacketHandlingError>],
             txs: &[Tx],
@@ -945,8 +972,7 @@ pub(crate) mod external {
                 let (sharable_keys, alt_invalidation_slot) = match transaction.loaded_addresses() {
                     Some(loaded_addresses) if !loaded_addresses.is_empty() => {
                         let num_pubkeys = loaded_addresses.len();
-                        let pubkeys_allocation = self
-                            .allocator
+                        let pubkeys_allocation = allocator
                             .allocate(
                                 num_pubkeys.wrapping_mul(core::mem::size_of::<Pubkey>()) as u32
                             )
@@ -957,7 +983,7 @@ pub(crate) mod external {
                             Self::copy_loaded_addresses(loaded_addresses, pubkeys_allocation)
                         };
                         // SAFETY: pubkeys_allocation was allocated by allocator
-                        let offset = unsafe { self.allocator.offset(pubkeys_allocation.cast()) };
+                        let offset = unsafe { allocator.offset(pubkeys_allocation.cast()) };
                         (
                             SharablePubkeys {
                                 offset,
@@ -991,7 +1017,21 @@ pub(crate) mod external {
                 processed_code,
                 agave_scheduler_bindings::processed_codes::PROCESSED
             );
-            let response = WorkerToPackMessage {
+            let response = Self::unprocessed_response_message(message, processed_code);
+            self.send_response_message(message, response)?;
+
+            Ok(())
+        }
+
+        fn unprocessed_response_message(
+            message: &PackToWorkerMessage,
+            processed_code: u8,
+        ) -> WorkerToPackMessage {
+            assert_ne!(
+                processed_code,
+                agave_scheduler_bindings::processed_codes::PROCESSED
+            );
+            WorkerToPackMessage {
                 batch: message.batch,
                 processed_code,
                 responses: TransactionResponseRegion {
@@ -999,11 +1039,54 @@ pub(crate) mod external {
                     num_transaction_responses: 0,
                     transaction_responses_offset: 0,
                 },
+            }
+        }
+
+        pub(crate) fn emit_replay_check_worker_transaction_event(
+            allocator: &rts_alloc::Allocator,
+            event_broadcast: Option<&ReplayEventBroadcast>,
+            worker_id: u32,
+            tag: u64,
+            message: &PackToWorkerMessage,
+        ) {
+            Self::emit_replay_check_worker_batch_event(
+                allocator,
+                event_broadcast,
+                worker_id,
+                tag,
+                message.batch,
+            );
+        }
+
+        pub(crate) fn emit_replay_check_worker_batch_event(
+            allocator: &rts_alloc::Allocator,
+            event_broadcast: Option<&ReplayEventBroadcast>,
+            worker_id: u32,
+            tag: u64,
+            batch: SharableTransactionBatchRegion,
+        ) {
+            let Some(event_broadcast) = event_broadcast else {
+                return;
             };
 
-            self.send_response_message(message, response)?;
-
-            Ok(())
+            let batch = unsafe {
+                // SAFETY: Replay check messages are allocated by the replay
+                // scheduler with `ReplayTransactionCheckMetadata`.
+                TransactionPtrBatch::<ReplayTransactionCheckMetadata>::from_sharable_transaction_batch_region(
+                    &batch,
+                    allocator,
+                )
+            };
+            for (_, metadata) in batch.iter() {
+                event_broadcast.emit(ReplayEvent::transaction_worker_event(
+                    0,
+                    tag,
+                    metadata.slot,
+                    u64::try_from(metadata.transaction_index)
+                        .expect("transaction index must fit in u64"),
+                    u64::from(worker_id),
+                ));
+            }
         }
 
         /// # Safety:
@@ -1494,6 +1577,87 @@ pub(crate) mod external {
                 }
                 _ => not_included_reasons::SANITIZE_FAILURE,
             }
+        }
+    }
+
+    pub(crate) fn emit_replay_check_worker_transaction_event(
+        allocator: &rts_alloc::Allocator,
+        event_broadcast: Option<&ReplayEventBroadcast>,
+        worker_id: u32,
+        tag: u64,
+        message: &PackToWorkerMessage,
+    ) {
+        ExternalWorker::emit_replay_check_worker_transaction_event(
+            allocator,
+            event_broadcast,
+            worker_id,
+            tag,
+            message,
+        );
+    }
+
+    pub(crate) fn emit_replay_check_worker_batch_event(
+        allocator: &rts_alloc::Allocator,
+        event_broadcast: Option<&ReplayEventBroadcast>,
+        worker_id: u32,
+        tag: u64,
+        batch: SharableTransactionBatchRegion,
+    ) {
+        ExternalWorker::emit_replay_check_worker_batch_event(
+            allocator,
+            event_broadcast,
+            worker_id,
+            tag,
+            batch,
+        );
+    }
+
+    pub(crate) fn process_replay_check_message(
+        worker_id: u32,
+        allocator: &rts_alloc::Allocator,
+        bank_forks: &Arc<RwLock<BankForks>>,
+        event_broadcast: Option<&ReplayEventBroadcast>,
+        message: &PackToWorkerMessage,
+    ) -> Result<WorkerToPackMessage, ExternalConsumeWorkerError> {
+        if !ExternalWorker::validate_message(message)
+            || !ExternalWorker::is_replay_check_message(message)
+        {
+            return Ok(ExternalWorker::unprocessed_response_message(
+                message,
+                processed_codes::INVALID,
+            ));
+        }
+
+        let Some(bank) = bank_forks.read().unwrap().get(message.max_working_slot) else {
+            return Ok(ExternalWorker::unprocessed_response_message(
+                message,
+                processed_codes::BANK_NOT_AVAILABLE,
+            ));
+        };
+        ExternalWorker::emit_replay_check_worker_transaction_event(
+            allocator,
+            event_broadcast,
+            worker_id,
+            replay_event_tags::TRANSACTION_WORKER_CHECK_BANK_ACQUIRED,
+            message,
+        );
+
+        match ExternalWorker::build_check_response_message(
+            allocator,
+            worker_id,
+            event_broadcast,
+            message,
+            &bank,
+            &bank,
+        ) {
+            Ok(response) => Ok(response),
+            Err(ExternalConsumeWorkerError::AllocationFailure) => {
+                Ok(ExternalWorker::unprocessed_response_message(
+                    message,
+                    processed_codes::BANK_NOT_AVAILABLE,
+                ))
+            }
+            Err(err) => Err(err),
         }
     }
 

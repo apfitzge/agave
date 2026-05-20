@@ -19,6 +19,9 @@ use {
 const SESSION_ALLOCATOR_HANDLES: usize = 2;
 const ALLOCATOR_SLAB_SIZE: u32 = 2 * 1024 * 1024;
 const REPLAY_EVENT_CAPACITY: usize = 1024 * 1024;
+pub const CHECK_WORKER_COUNT: usize = 16;
+const CHECK_REQUEST_CAPACITY: usize = 16 * 1024;
+const CHECK_RESULT_CAPACITY: usize = 16 * 1024;
 pub const SIGNATURE_VERIFICATION_WORKER_COUNT: usize = 16;
 const SIGNATURE_VERIFICATION_REQUEST_CAPACITY: usize = 16 * 1024;
 const SIGNATURE_VERIFICATION_RESULT_CAPACITY: usize = 16 * 1024;
@@ -42,6 +45,8 @@ pub struct BlockVerificationStageSession {
     pub replay_to_pack: shaq::spsc::Consumer<ReplayToPackMessage>,
     pub replay_block_status: shaq::spsc::Producer<ReplayBlockStatusMessage>,
     pub workers: Vec<BlockVerificationStageWorkerSession>,
+    pub check_requests: shaq::mpmc::Producer<PackToWorkerMessage>,
+    pub check_results: shaq::mpmc::Consumer<CheckWorkerResult>,
     pub signature_verification_requests: shaq::mpmc::Producer<SignatureVerificationRequest>,
     pub signature_verification_results: shaq::mpmc::Consumer<SignatureVerificationResult>,
 }
@@ -66,11 +71,25 @@ pub struct BlockVerificationWorkerSession {
     pub worker_to_pack: shaq::spsc::Producer<WorkerToPackMessage>,
 }
 
+/// Check-worker-owned queue and allocator handles.
+pub struct CheckWorkerSession {
+    pub allocator: Allocator,
+    pub requests: shaq::mpmc::Consumer<PackToWorkerMessage>,
+    pub results: shaq::mpmc::Producer<CheckWorkerResult>,
+}
+
 /// Sigverify-worker-owned queue and read-only allocator handles.
 pub struct SignatureVerificationWorkerSession {
     pub allocator: FreeOnlyAllocator,
     pub requests: shaq::mpmc::Consumer<SignatureVerificationRequest>,
     pub results: shaq::mpmc::Producer<SignatureVerificationResult>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct CheckWorkerResult {
+    pub worker_id: usize,
+    pub message: WorkerToPackMessage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +128,7 @@ pub struct BlockVerificationStageSessions {
     pub block_verification_stage: BlockVerificationStageSession,
     pub replay_stage: ReplayStageSession,
     pub workers: Vec<BlockVerificationWorkerSession>,
+    pub check_workers: Vec<CheckWorkerSession>,
     pub signature_verification_workers: Vec<SignatureVerificationWorkerSession>,
 }
 
@@ -146,6 +166,10 @@ impl BlockVerificationStageSessions {
             create_queue_pair(config.replay_to_pack_capacity, true)?;
         let (replay_block_status_producer, replay_block_status_consumer) =
             create_queue_pair(config.replay_block_status_capacity, false)?;
+        let (check_request_producer, check_request_consumer) =
+            create_mpmc_queue_pair(CHECK_REQUEST_CAPACITY, true)?;
+        let (check_result_producer, check_result_consumer) =
+            create_mpmc_queue_pair(CHECK_RESULT_CAPACITY, true)?;
         let (signature_verification_request_producer, signature_verification_request_consumer) =
             create_mpmc_queue_pair(SIGNATURE_VERIFICATION_REQUEST_CAPACITY, true)?;
         let (signature_verification_result_producer, signature_verification_result_consumer) =
@@ -155,6 +179,12 @@ impl BlockVerificationStageSessions {
             config.worker_count,
             config.pack_to_worker_capacity,
             config.worker_to_pack_capacity,
+        )?;
+        let check_workers = create_check_worker_sessions(
+            &allocator_file,
+            CHECK_WORKER_COUNT,
+            check_request_consumer,
+            check_result_producer,
         )?;
         let signature_verification_workers = create_signature_verification_worker_sessions(
             &allocator_file,
@@ -169,6 +199,8 @@ impl BlockVerificationStageSessions {
                 replay_to_pack: replay_to_pack_consumer,
                 replay_block_status: replay_block_status_producer,
                 workers: block_verification_workers,
+                check_requests: check_request_producer,
+                check_results: check_result_consumer,
                 signature_verification_requests: signature_verification_request_producer,
                 signature_verification_results: signature_verification_result_consumer,
             },
@@ -178,6 +210,7 @@ impl BlockVerificationStageSessions {
                 replay_block_status: replay_block_status_consumer,
             },
             workers,
+            check_workers,
             signature_verification_workers,
         })
     }
@@ -189,7 +222,11 @@ fn create_allocator(
     allocator_size: usize,
     worker_count: usize,
 ) -> Result<(File, Allocator, Allocator), SetupError> {
-    let allocator_handles = SESSION_ALLOCATOR_HANDLES.checked_add(worker_count).unwrap();
+    let allocator_handles = SESSION_ALLOCATOR_HANDLES
+        .checked_add(worker_count)
+        .unwrap()
+        .checked_add(CHECK_WORKER_COUNT)
+        .unwrap();
     let (file, block_verification_allocator) = shared_memory::create_allocator(
         SHMEM_NAME,
         allocator_size,
@@ -252,6 +289,23 @@ fn create_worker_sessions(
             Ok((block_verification_workers, workers))
         },
     )
+}
+
+fn create_check_worker_sessions(
+    allocator_file: &File,
+    worker_count: usize,
+    requests: shaq::mpmc::Consumer<PackToWorkerMessage>,
+    results: shaq::mpmc::Producer<CheckWorkerResult>,
+) -> Result<Vec<CheckWorkerSession>, SetupError> {
+    (0..worker_count)
+        .map(|_| {
+            Ok(CheckWorkerSession {
+                allocator: Allocator::join(allocator_file)?,
+                requests: requests.clone(),
+                results: results.clone(),
+            })
+        })
+        .collect()
 }
 
 fn create_signature_verification_worker_sessions(

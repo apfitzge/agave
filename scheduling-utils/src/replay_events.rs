@@ -6,6 +6,8 @@ pub const REPLAY_EVENTS_IPC_FILE: &str = "agave_events.ipc";
 ///
 /// The current largest payload is transaction ingest:
 /// `slot: u64`, `transaction_index: u64`, `signature: [u8; 64]`.
+/// Check dispatch transaction events reuse the signature bytes as:
+/// `check_queue_len: u64`.
 /// Worker-associated transaction events reuse the signature bytes as:
 /// `worker_id: u64`.
 /// Worker dispatch transaction events also include `worker_queue_len: u64`.
@@ -63,9 +65,9 @@ pub mod replay_event_tags {
     ///
     /// Payload: `slot: u64`, `transaction_index: u64`, `signature: [u8; 64]`.
     pub const TRANSACTION_INGESTED: u64 = 2;
-    /// Transaction was sent to a worker for checking.
+    /// Transaction was sent to the replay check pool.
     ///
-    /// Payload includes `worker_id: u64`.
+    /// Payload includes `check_queue_len: u64`.
     pub const TRANSACTION_SENT_FOR_CHECK: u64 = 3;
     /// Worker check response rejected the transaction.
     ///
@@ -185,6 +187,7 @@ const SLOT_OFFSET: usize = 0;
 const SLOT_REASON_OFFSET: usize = SLOT_OFFSET + core::mem::size_of::<u64>();
 const TRANSACTION_INDEX_OFFSET: usize = SLOT_REASON_OFFSET;
 const SIGNATURE_OFFSET: usize = TRANSACTION_INDEX_OFFSET + core::mem::size_of::<u64>();
+const CHECK_QUEUE_LENGTH_OFFSET: usize = SIGNATURE_OFFSET;
 const WORKER_ID_OFFSET: usize = SIGNATURE_OFFSET;
 const WORKER_QUEUE_LENGTH_OFFSET: usize = WORKER_ID_OFFSET + core::mem::size_of::<u64>();
 const ESTIMATED_COST_UNITS_OFFSET: usize = WORKER_QUEUE_LENGTH_OFFSET;
@@ -241,6 +244,22 @@ impl ReplayEvent {
         let mut event = Self::new(timestamp_ns, tag);
         event.write_u64(SLOT_OFFSET, slot);
         event.write_u64(TRANSACTION_INDEX_OFFSET, transaction_index);
+        event
+    }
+
+    pub fn transaction_sent_for_check(
+        timestamp_ns: u64,
+        slot: u64,
+        transaction_index: u64,
+        check_queue_len: u64,
+    ) -> Self {
+        let mut event = Self::transaction_event(
+            timestamp_ns,
+            replay_event_tags::TRANSACTION_SENT_FOR_CHECK,
+            slot,
+            transaction_index,
+        );
+        event.write_u64(CHECK_QUEUE_LENGTH_OFFSET, check_queue_len);
         event
     }
 
@@ -427,6 +446,11 @@ impl ReplayEvent {
             .then(|| self.read_u64(WORKER_QUEUE_LENGTH_OFFSET))
     }
 
+    pub fn check_queue_len(&self) -> Option<u64> {
+        (self.tag == replay_event_tags::TRANSACTION_SENT_FOR_CHECK)
+            .then(|| self.read_u64(CHECK_QUEUE_LENGTH_OFFSET))
+    }
+
     pub fn estimated_cost_units(&self) -> Option<u64> {
         (self.tag == replay_event_tags::TRANSACTION_CHECK_PASSED)
             .then(|| self.read_u64(ESTIMATED_COST_UNITS_OFFSET))
@@ -516,8 +540,7 @@ impl ReplayEvent {
 pub const fn is_transaction_worker_event_tag(tag: u64) -> bool {
     matches!(
         tag,
-        replay_event_tags::TRANSACTION_SENT_FOR_CHECK
-            | replay_event_tags::TRANSACTION_CHECK_FAILED
+        replay_event_tags::TRANSACTION_CHECK_FAILED
             | replay_event_tags::TRANSACTION_CHECK_PASSED
             | replay_event_tags::TRANSACTION_WORKER_PICKED_UP
             | replay_event_tags::TRANSACTION_WORKER_CHECK_COMPLETED
@@ -540,11 +563,7 @@ pub const fn is_transaction_worker_event_tag(tag: u64) -> bool {
 }
 
 pub const fn is_transaction_worker_dispatch_event_tag(tag: u64) -> bool {
-    matches!(
-        tag,
-        replay_event_tags::TRANSACTION_SENT_FOR_CHECK
-            | replay_event_tags::TRANSACTION_SCHEDULED_FOR_EXEC
-    )
+    matches!(tag, replay_event_tags::TRANSACTION_SCHEDULED_FOR_EXEC)
 }
 
 pub const fn is_transaction_execution_result_event_tag(tag: u64) -> bool {
@@ -690,9 +709,20 @@ mod tests {
     }
 
     #[test]
+    fn transaction_sent_for_check_carries_check_queue_len() {
+        let event = ReplayEvent::transaction_sent_for_check(1, 2, 3, 4);
+
+        assert_eq!(event.slot(), 2);
+        assert_eq!(event.transaction_index(), Some(3));
+        assert_eq!(event.check_queue_len(), Some(4));
+        assert_eq!(event.worker_id(), None);
+        assert_eq!(event.worker_queue_len(), None);
+        assert_eq!(event.signature(), None);
+    }
+
+    #[test]
     fn transaction_worker_events_carry_worker_id_without_signature() {
         for tag in [
-            replay_event_tags::TRANSACTION_SENT_FOR_CHECK,
             replay_event_tags::TRANSACTION_CHECK_FAILED,
             replay_event_tags::TRANSACTION_CHECK_PASSED,
             replay_event_tags::TRANSACTION_WORKER_PICKED_UP,
@@ -728,18 +758,20 @@ mod tests {
 
     #[test]
     fn transaction_worker_dispatch_events_carry_queue_len() {
-        for tag in [
-            replay_event_tags::TRANSACTION_SENT_FOR_CHECK,
+        let event = ReplayEvent::transaction_worker_dispatch_event(
+            1,
             replay_event_tags::TRANSACTION_SCHEDULED_FOR_EXEC,
-        ] {
-            let event = ReplayEvent::transaction_worker_dispatch_event(1, tag, 2, 3, 4, 5);
+            2,
+            3,
+            4,
+            5,
+        );
 
-            assert_eq!(event.slot(), 2);
-            assert_eq!(event.transaction_index(), Some(3));
-            assert_eq!(event.worker_id(), Some(4));
-            assert_eq!(event.worker_queue_len(), Some(5));
-            assert_eq!(event.signature(), None);
-        }
+        assert_eq!(event.slot(), 2);
+        assert_eq!(event.transaction_index(), Some(3));
+        assert_eq!(event.worker_id(), Some(4));
+        assert_eq!(event.worker_queue_len(), Some(5));
+        assert_eq!(event.signature(), None);
     }
 
     #[test]
