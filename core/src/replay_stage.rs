@@ -2584,14 +2584,20 @@ impl ReplayStage {
         // the `check_slot_agrees_with_cluster()` called by `replay_active_banks()`
         // will break!
         let mut confirmation_elapsed = Measure::start("confirmation_elapsed");
+        let mut block_verification_status_wait_us = 0;
         let replay_result = Self::replay_blockstore_into_block_verification_stage(
             process_active_banks_context,
             bank,
             &mut w_replay_stats,
             &mut w_replay_progress,
+            &mut block_verification_status_wait_us,
         );
         confirmation_elapsed.stop();
-        w_replay_stats.confirmation_elapsed += confirmation_elapsed.as_us();
+        // `confirmation_without_replay_us` should include BVS submission work, but not the final
+        // wait for scheduler execution to complete.
+        w_replay_stats.confirmation_elapsed += confirmation_elapsed
+            .as_us()
+            .saturating_sub(block_verification_status_wait_us);
         replay_result?;
 
         let tx_count_after = w_replay_progress.num_txs;
@@ -2604,6 +2610,7 @@ impl ReplayStage {
         bank: &BankWithScheduler,
         replay_stats: &mut ReplaySlotStats,
         replay_progress: &mut ConfirmationProgress,
+        block_verification_status_wait_us: &mut u64,
     ) -> result::Result<(), BlockstoreProcessorError> {
         let slot = bank.slot();
         if bank.is_complete() {
@@ -2701,10 +2708,15 @@ impl ReplayStage {
                     return Ok(());
                 }
 
-                block_verification.wait_for_status(slot)
+                replay_elapsed.stop();
+                replay_stats.replay_elapsed += replay_elapsed.as_us();
+
+                let mut status_wait = Measure::start("block_verification_status_wait");
+                let status = block_verification.wait_for_status(slot);
+                status_wait.stop();
+                *block_verification_status_wait_us += status_wait.as_us();
+                status
             };
-            replay_elapsed.stop();
-            replay_stats.replay_elapsed += replay_elapsed.as_us();
             let Some(status) = status else {
                 return Ok(());
             };
