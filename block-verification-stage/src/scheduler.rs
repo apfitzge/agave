@@ -178,6 +178,8 @@ struct SchedulingState {
     entry_ingest_latency: LatencyStats,
     transaction_ingest_to_execution_latency: LatencyStats,
     transaction_scheduling_time: LatencyStats,
+    completed_work_to_schedule_latency: LatencyStats,
+    completed_work_to_schedule_start: Option<Instant>,
 }
 
 impl SchedulingState {
@@ -207,6 +209,8 @@ impl SchedulingState {
             entry_ingest_latency: LatencyStats::default(),
             transaction_ingest_to_execution_latency: LatencyStats::default(),
             transaction_scheduling_time: LatencyStats::default(),
+            completed_work_to_schedule_latency: LatencyStats::default(),
+            completed_work_to_schedule_start: None,
         }
     }
 
@@ -239,6 +243,8 @@ impl SchedulingState {
         self.entry_ingest_latency = LatencyStats::default();
         self.transaction_ingest_to_execution_latency = LatencyStats::default();
         self.transaction_scheduling_time = LatencyStats::default();
+        self.completed_work_to_schedule_latency = LatencyStats::default();
+        self.completed_work_to_schedule_start = None;
     }
 
     fn clear_for_pool(&mut self) {
@@ -289,6 +295,8 @@ impl SchedulingState {
         self.entry_ingest_latency = LatencyStats::default();
         self.transaction_ingest_to_execution_latency = LatencyStats::default();
         self.transaction_scheduling_time = LatencyStats::default();
+        self.completed_work_to_schedule_latency = LatencyStats::default();
+        self.completed_work_to_schedule_start = None;
     }
 
     fn accepts_ingress(&self) -> bool {
@@ -328,6 +336,14 @@ impl SchedulingState {
 
     fn record_transaction_scheduling_time(&mut self, elapsed: Duration) {
         self.transaction_scheduling_time.record(elapsed);
+    }
+
+    fn record_completed_work_received(&mut self, now: Instant) {
+        if self.has_scheduling_latency_work() {
+            self.completed_work_to_schedule_start.get_or_insert(now);
+        } else {
+            self.completed_work_to_schedule_start = None;
+        }
     }
 
     fn service_transaction_execution_dispatches(
@@ -452,6 +468,7 @@ impl SchedulingState {
         };
 
         self.move_checked_transaction_to_in_flight(transaction_index, thread_id);
+        self.record_completed_work_to_schedule_latency(Instant::now());
         dispatch_context.emit_transaction_worker_dispatch_event(
             replay_event_tags::TRANSACTION_SCHEDULED_FOR_EXEC,
             slot,
@@ -609,6 +626,13 @@ impl SchedulingState {
             || !self.ready_transactions.is_empty()
     }
 
+    fn has_scheduling_latency_work(&self) -> bool {
+        self.in_flight_worker_messages != 0
+            || self.in_flight_execution_messages != 0
+            || !self.pending_transaction_checks.is_empty()
+            || !self.ready_transactions.is_empty()
+    }
+
     fn transaction_has_pending_signature_verification(&self, transaction_index: usize) -> bool {
         self.pending_signature_verification_transactions
             .contains(&transaction_index)
@@ -700,6 +724,16 @@ impl SchedulingState {
                 .checked_duration_since(transaction_ingest_time)
                 .unwrap_or(Duration::ZERO),
         );
+    }
+
+    fn record_completed_work_to_schedule_latency(&mut self, schedule_time: Instant) {
+        if let Some(start) = self.completed_work_to_schedule_start.take() {
+            self.completed_work_to_schedule_latency.record(
+                schedule_time
+                    .checked_duration_since(start)
+                    .unwrap_or(Duration::ZERO),
+            );
+        }
     }
 }
 
@@ -2288,7 +2322,7 @@ impl BlockVerificationScheduler {
 
         match message.responses.tag {
             CHECK_RESPONSE => self.handle_worker_check_response(message),
-            EXECUTION_RESPONSE => self.handle_worker_execution_response(message),
+            EXECUTION_RESPONSE => self.handle_worker_execution_response(message, Instant::now()),
             tag => panic!("unsupported replay worker response tag: {tag}"),
         }
     }
@@ -2334,7 +2368,11 @@ impl BlockVerificationScheduler {
         self.decrement_in_flight_worker_messages(slot);
     }
 
-    fn handle_worker_execution_response(&mut self, message: WorkerToPackMessage) {
+    fn handle_worker_execution_response(
+        &mut self,
+        message: WorkerToPackMessage,
+        receive_time: Instant,
+    ) {
         assert!(
             is_execution_response_region(message.batch, message.responses),
             "malformed replay EXECUTION worker response",
@@ -2350,6 +2388,8 @@ impl BlockVerificationScheduler {
 
         let previous_transaction_state =
             self.finish_worker_execution(worker_execution, Instant::now());
+        self.scheduling_state_mut(slot)
+            .record_completed_work_received(receive_time);
         let estimated_cost_units = previous_transaction_state.estimated_cost_units();
         if self.transaction_has_pending_signature_verification(
             worker_execution.slot,
@@ -2829,6 +2869,31 @@ impl BlockVerificationScheduler {
             (
                 "transaction_scheduling_time_mean_ns",
                 state.transaction_scheduling_time.mean_ns(),
+                i64
+            ),
+            (
+                "completed_work_to_schedule_latency_count",
+                state.completed_work_to_schedule_latency.count,
+                i64
+            ),
+            (
+                "completed_work_to_schedule_latency_total_ns",
+                state.completed_work_to_schedule_latency.total_ns(),
+                i64
+            ),
+            (
+                "completed_work_to_schedule_latency_min_ns",
+                state.completed_work_to_schedule_latency.min_ns(),
+                i64
+            ),
+            (
+                "completed_work_to_schedule_latency_max_ns",
+                state.completed_work_to_schedule_latency.max_ns,
+                i64
+            ),
+            (
+                "completed_work_to_schedule_latency_mean_ns",
+                state.completed_work_to_schedule_latency.mean_ns(),
                 i64
             ),
         );
@@ -4512,7 +4577,17 @@ mod tests {
             successful_check_response(),
         );
         assert_eq!(scheduler.service_worker_responses(1), 1);
+        {
+            let state = scheduler.scheduling_states.get(&42).unwrap();
+            assert_eq!(state.completed_work_to_schedule_latency.count, 0);
+            assert!(state.completed_work_to_schedule_start.is_none());
+        }
         assert_eq!(scheduler.service_transaction_execution_dispatches(1, 1), 1);
+        {
+            let state = scheduler.scheduling_states.get(&42).unwrap();
+            assert_eq!(state.completed_work_to_schedule_latency.count, 0);
+            assert!(state.completed_work_to_schedule_start.is_none());
+        }
         assert_eq!(
             scheduler
                 .scheduling_states
@@ -4543,6 +4618,8 @@ mod tests {
         ));
         assert_eq!(state.transaction_ingest_to_execution_latency.count, 1);
         assert!(state.transaction_ingest_to_execution_latency.min_ns() > 0);
+        assert_eq!(state.completed_work_to_schedule_latency.count, 0);
+        assert!(state.completed_work_to_schedule_start.is_none());
 
         assert_eq!(
             scheduler.service_signature_verification_submissions(1024),
@@ -5538,6 +5615,8 @@ mod tests {
             assert_eq!(state.ready_scan_cursor, 0);
             assert!(state.unschedulable_read_locks.is_empty());
             assert!(state.unschedulable_write_locks.is_empty());
+            assert_eq!(state.completed_work_to_schedule_latency.count, 0);
+            assert!(state.completed_work_to_schedule_start.is_some());
         }
 
         assert_eq!(scheduler.service_transaction_execution_dispatches(1, 1), 1);
@@ -5547,6 +5626,9 @@ mod tests {
                 .transaction_index,
             1,
         );
+        let state = scheduler.scheduling_states.get(&42).unwrap();
+        assert_eq!(state.completed_work_to_schedule_latency.count, 1);
+        assert!(state.completed_work_to_schedule_start.is_none());
     }
 
     #[test]
