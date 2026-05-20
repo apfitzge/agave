@@ -3585,12 +3585,16 @@ fn active_leader_state(
 
 const STARTING_SLEEP_DURATION: Duration = Duration::from_micros(250);
 const MAX_SLEEP_DURATION: Duration = Duration::from_millis(1);
+const IDLE_YIELD_THRESHOLD: Duration = Duration::from_micros(100);
 const IDLE_SLEEP_THRESHOLD: Duration = Duration::from_secs(2);
 
 /// Sleeps for the specified time. Returns the next sleep duration to use.
 fn backoff(idle_duration: Duration, sleep_duration: &Duration) -> Duration {
     if idle_duration < IDLE_SLEEP_THRESHOLD {
         core::hint::spin_loop();
+        if idle_duration >= IDLE_YIELD_THRESHOLD {
+            std::thread::yield_now();
+        }
         *sleep_duration
     } else {
         std::thread::sleep(*sleep_duration);
@@ -4660,6 +4664,7 @@ mod tests {
 
     #[test]
     fn test_backoff() {
+        assert_eq!(IDLE_YIELD_THRESHOLD, Duration::from_micros(100));
         assert_eq!(IDLE_SLEEP_THRESHOLD, Duration::from_secs(2));
 
         let sleep_duration = STARTING_SLEEP_DURATION;

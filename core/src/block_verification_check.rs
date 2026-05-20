@@ -21,7 +21,7 @@ use {
 
 const STARTING_SLEEP_DURATION: Duration = Duration::from_micros(250);
 const MAX_SLEEP_DURATION: Duration = Duration::from_millis(1);
-const IDLE_SLEEP_THRESHOLD: Duration = Duration::from_secs(2);
+const IDLE_SLEEP_THRESHOLD: Duration = Duration::from_millis(10);
 
 pub(crate) fn spawn_replay_check_workers(
     exit: Arc<AtomicBool>,
@@ -135,6 +135,7 @@ fn send_result(exit: &AtomicBool, worker: &CheckWorkerSession, mut result: Check
 fn backoff(idle_duration: Duration, sleep_duration: Duration) -> Duration {
     if idle_duration < IDLE_SLEEP_THRESHOLD {
         core::hint::spin_loop();
+        thread::yield_now();
         sleep_duration
     } else {
         thread::sleep(sleep_duration);

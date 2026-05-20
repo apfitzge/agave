@@ -259,6 +259,7 @@ fn send_result(
 fn backoff(idle_duration: Duration, sleep_duration: Duration) -> Duration {
     if idle_duration < IDLE_SLEEP_THRESHOLD {
         core::hint::spin_loop();
+        thread::yield_now();
         sleep_duration
     } else {
         thread::sleep(sleep_duration);
