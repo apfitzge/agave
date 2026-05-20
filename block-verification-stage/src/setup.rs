@@ -8,7 +8,7 @@ use {
         replay_events::{REPLAY_EVENTS_IPC_FILE, ReplayEvent},
         shared_memory::{self, SharedMemoryError},
     },
-    rts_alloc::Allocator,
+    rts_alloc::{Allocator, FreeOnlyAllocator},
     std::{
         fs::File,
         path::{Path, PathBuf},
@@ -66,9 +66,9 @@ pub struct BlockVerificationWorkerSession {
     pub worker_to_pack: shaq::spsc::Producer<WorkerToPackMessage>,
 }
 
-/// Sigverify-worker-owned queue and allocator handles.
+/// Sigverify-worker-owned queue and read-only allocator handles.
 pub struct SignatureVerificationWorkerSession {
-    pub allocator: Allocator,
+    pub allocator: FreeOnlyAllocator,
     pub requests: shaq::mpmc::Consumer<SignatureVerificationRequest>,
     pub results: shaq::mpmc::Producer<SignatureVerificationResult>,
 }
@@ -141,11 +141,7 @@ impl BlockVerificationStageSessions {
     /// Creates the allocator and queues for an in-process block verification stage.
     pub fn setup(config: BlockVerificationStageSetupConfig) -> Result<Self, SetupError> {
         let (allocator_file, block_verification_allocator, replay_stage_allocator) =
-            create_allocator(
-                config.allocator_size,
-                config.worker_count,
-                SIGNATURE_VERIFICATION_WORKER_COUNT,
-            )?;
+            create_allocator(config.allocator_size, config.worker_count)?;
         let (replay_to_pack_producer, replay_to_pack_consumer) =
             create_queue_pair(config.replay_to_pack_capacity, true)?;
         let (replay_block_status_producer, replay_block_status_consumer) =
@@ -192,12 +188,8 @@ pub type SetupError = SharedMemoryError;
 fn create_allocator(
     allocator_size: usize,
     worker_count: usize,
-    signature_verification_worker_count: usize,
 ) -> Result<(File, Allocator, Allocator), SetupError> {
-    let allocator_handles = SESSION_ALLOCATOR_HANDLES
-        .checked_add(worker_count)
-        .and_then(|count| count.checked_add(signature_verification_worker_count))
-        .unwrap();
+    let allocator_handles = SESSION_ALLOCATOR_HANDLES.checked_add(worker_count).unwrap();
     let (file, block_verification_allocator) = shared_memory::create_allocator(
         SHMEM_NAME,
         allocator_size,
@@ -271,7 +263,7 @@ fn create_signature_verification_worker_sessions(
     (0..worker_count)
         .map(|_| {
             Ok(SignatureVerificationWorkerSession {
-                allocator: Allocator::join(allocator_file)?,
+                allocator: FreeOnlyAllocator::join(allocator_file)?,
                 requests: requests.clone(),
                 results: results.clone(),
             })
@@ -474,5 +466,77 @@ mod tests {
         sessions.block_verification_stage.workers[1]
             .worker_to_pack
             .finalize();
+    }
+
+    #[test]
+    fn setup_wires_signature_verification_queues_and_read_only_allocator() {
+        let sessions = setup(1).unwrap();
+        let transaction_bytes = [1, 2, 3, 4];
+        let transaction_ptr = sessions
+            .replay_stage
+            .allocator
+            .allocate(transaction_bytes.len().try_into().unwrap())
+            .unwrap();
+        unsafe {
+            // SAFETY: `transaction_ptr` references an allocation at least
+            // `transaction_bytes.len()` bytes long.
+            transaction_ptr
+                .as_ptr()
+                .copy_from_nonoverlapping(transaction_bytes.as_ptr(), transaction_bytes.len());
+        }
+        let transaction = SharableTransactionRegion {
+            // SAFETY: `transaction_ptr` was allocated by this allocator above.
+            offset: unsafe { sessions.replay_stage.allocator.offset(transaction_ptr) },
+            length: transaction_bytes.len() as u32,
+        };
+        let request = SignatureVerificationRequest {
+            slot: 42,
+            bank_id: 43,
+            transaction_index: 7,
+            transaction,
+        };
+
+        sessions
+            .block_verification_stage
+            .signature_verification_requests
+            .try_write(request)
+            .unwrap();
+        let worker_request = sessions.signature_verification_workers[0]
+            .requests
+            .try_read()
+            .expect("signature verification worker should receive request");
+        // SAFETY: The request references the transaction region allocated
+        // above in the same shared allocator mapping.
+        let worker_transaction_ptr = unsafe {
+            sessions.signature_verification_workers[0]
+                .allocator
+                .ptr_from_offset(worker_request.transaction.offset)
+        };
+        // SAFETY: The request carries the length of the transaction region
+        // allocated above.
+        let worker_transaction_bytes = unsafe {
+            core::slice::from_raw_parts(
+                worker_transaction_ptr.as_ptr(),
+                worker_request.transaction.length as usize,
+            )
+        };
+        assert_eq!(worker_transaction_bytes, transaction_bytes);
+
+        let result = SignatureVerificationResult::new(
+            worker_request.slot,
+            worker_request.transaction_index,
+            true,
+        );
+        sessions.signature_verification_workers[0]
+            .results
+            .try_write(result)
+            .unwrap();
+        assert_eq!(
+            sessions
+                .block_verification_stage
+                .signature_verification_results
+                .try_read(),
+            Some(result),
+        );
     }
 }

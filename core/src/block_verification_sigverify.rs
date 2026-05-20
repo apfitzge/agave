@@ -54,7 +54,6 @@ fn run_signature_verification_worker(
     let mut last_empty_time = Instant::now();
 
     while !exit.load(Ordering::Relaxed) {
-        worker.allocator.clean_remote_free_lists();
         let Some(request) = worker.requests.try_read() else {
             let now = Instant::now();
             if did_work {
@@ -82,7 +81,10 @@ fn verify_transaction_signatures(
     replay_vote_sender: &ReplayVoteSender,
 ) -> bool {
     let transaction = unsafe {
-        TransactionPtr::from_sharable_transaction_region(&request.transaction, &worker.allocator)
+        // SAFETY: The scheduler only submits transaction regions backed by
+        // the shared allocator mapping in this worker session.
+        let ptr = worker.allocator.ptr_from_offset(request.transaction.offset);
+        TransactionPtr::from_raw_parts(ptr, request.transaction.length as usize)
     };
     let Ok(view) = UnsanitizedTransactionView::try_new_unsanitized(transaction) else {
         return false;
