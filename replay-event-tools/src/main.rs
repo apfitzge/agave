@@ -2,7 +2,7 @@ mod store;
 
 use {
     agave_scheduling_utils::{
-        replay_events::{REPLAY_EVENTS_IPC_FILE, ReplayEvent},
+        replay_events::{REPLAY_EVENTS_IPC_FILE, ReplayEvent, replay_event_tags},
         shared_memory,
     },
     crossterm::{
@@ -110,6 +110,13 @@ struct TransactionSummary {
     index: u64,
     status: &'static str,
     slot_ingest_delta_ns: Option<u64>,
+    estimated_cost_units: Option<u64>,
+    cost_units: Option<u64>,
+    check_wait_ns: Option<u64>,
+    ready_wait_ns: Option<u64>,
+    scheduling_wait_ns: Option<u64>,
+    exec_wait_ns: Option<u64>,
+    execution_duration_ns: Option<u64>,
     duration_ns: Option<u64>,
     signature: String,
 }
@@ -375,12 +382,125 @@ fn transaction_summary(
         slot_ingest_delta_ns: slot_begin_timestamp_ns
             .zip(transaction.ingest_timestamp_ns())
             .map(|(slot_begin, ingest)| ingest.saturating_sub(slot_begin)),
+        estimated_cost_units: transaction_estimated_cost_units(transaction),
+        cost_units: transaction_cost_units(transaction),
+        check_wait_ns: transaction_check_wait_ns(transaction),
+        ready_wait_ns: transaction_ready_wait_ns(transaction),
+        scheduling_wait_ns: transaction_scheduling_wait_ns(transaction),
+        exec_wait_ns: transaction_exec_wait_ns(transaction),
+        execution_duration_ns: transaction_execution_duration_ns(transaction),
         duration_ns: transaction.total_duration_ns(),
         signature: transaction
             .signature
             .clone()
             .unwrap_or_else(|| "<signature-pending>".to_string()),
     }
+}
+
+fn transaction_estimated_cost_units(transaction: &TransactionRecord) -> Option<u64> {
+    transaction
+        .events
+        .iter()
+        .find_map(ReplayEvent::estimated_cost_units)
+}
+
+fn transaction_cost_units(transaction: &TransactionRecord) -> Option<u64> {
+    transaction.events.iter().find_map(ReplayEvent::cost_units)
+}
+
+fn transaction_check_wait_ns(transaction: &TransactionRecord) -> Option<u64> {
+    let sent_for_check = first_event_timestamp(
+        transaction,
+        replay_event_tags::TRANSACTION_SENT_FOR_CHECK,
+    )?;
+    let picked_up = first_event_timestamp_at_or_after(
+        transaction,
+        replay_event_tags::TRANSACTION_WORKER_PICKED_UP,
+        sent_for_check,
+    )?;
+    Some(picked_up.saturating_sub(sent_for_check))
+}
+
+fn transaction_ready_wait_ns(transaction: &TransactionRecord) -> Option<u64> {
+    let check_passed = first_event_timestamp(transaction, replay_event_tags::TRANSACTION_CHECK_PASSED)?;
+    transaction
+        .events
+        .iter()
+        .filter(|event| {
+            event.tag == replay_event_tags::TRANSACTION_READY_FOR_SCHEDULING
+                && event.timestamp_ns >= check_passed
+                && event
+                    .ready_released_by_transaction_index()
+                    .is_some_and(|transaction_index| transaction_index != transaction.index)
+        })
+        .map(|event| event.timestamp_ns.saturating_sub(check_passed))
+        .min()
+}
+
+fn transaction_scheduling_wait_ns(transaction: &TransactionRecord) -> Option<u64> {
+    let first_skip = first_event_timestamp(
+        transaction,
+        replay_event_tags::TRANSACTION_SCHEDULING_SKIPPED,
+    )?;
+    let scheduled = first_event_timestamp_at_or_after(
+        transaction,
+        replay_event_tags::TRANSACTION_SCHEDULED_FOR_EXEC,
+        first_skip,
+    )?;
+    Some(scheduled.saturating_sub(first_skip))
+}
+
+fn transaction_exec_wait_ns(transaction: &TransactionRecord) -> Option<u64> {
+    let scheduled = first_event_timestamp(
+        transaction,
+        replay_event_tags::TRANSACTION_SCHEDULED_FOR_EXEC,
+    )?;
+    let picked_up = first_event_timestamp_at_or_after(
+        transaction,
+        replay_event_tags::TRANSACTION_WORKER_PICKED_UP,
+        scheduled,
+    )?;
+    Some(picked_up.saturating_sub(scheduled))
+}
+
+fn transaction_execution_duration_ns(transaction: &TransactionRecord) -> Option<u64> {
+    let scheduled = first_event_timestamp(
+        transaction,
+        replay_event_tags::TRANSACTION_SCHEDULED_FOR_EXEC,
+    )?;
+    let picked_up = first_event_timestamp_at_or_after(
+        transaction,
+        replay_event_tags::TRANSACTION_WORKER_PICKED_UP,
+        scheduled,
+    )?;
+    let completed = first_event_timestamp_at_or_after(
+        transaction,
+        replay_event_tags::TRANSACTION_WORKER_EXECUTION_COMPLETED,
+        picked_up,
+    )?;
+    Some(completed.saturating_sub(picked_up))
+}
+
+fn first_event_timestamp(transaction: &TransactionRecord, tag: u64) -> Option<u64> {
+    transaction
+        .events
+        .iter()
+        .filter(|event| event.tag == tag)
+        .map(|event| event.timestamp_ns)
+        .min()
+}
+
+fn first_event_timestamp_at_or_after(
+    transaction: &TransactionRecord,
+    tag: u64,
+    timestamp_ns: u64,
+) -> Option<u64> {
+    transaction
+        .events
+        .iter()
+        .filter(|event| event.tag == tag && event.timestamp_ns >= timestamp_ns)
+        .map(|event| event.timestamp_ns)
+        .min()
 }
 
 fn transaction_timeline(
@@ -499,6 +619,12 @@ fn timeline_event_detail(event: &ReplayEvent) -> String {
     if let Some(signature_verification_queue_len) = event.signature_verification_queue_len() {
         details.push(format!("queue_len={signature_verification_queue_len}"));
     }
+    if let Some(estimated_cost_units) = event.estimated_cost_units() {
+        details.push(format!("estimated_cost_units={estimated_cost_units}"));
+    }
+    if let Some(cost_units) = event.cost_units() {
+        details.push(format!("cost_units={cost_units}"));
+    }
     if let Some(verified) = event.signature_verification_result() {
         details.push(format!("verified={verified}"));
     }
@@ -518,6 +644,12 @@ fn worker_timeline_event_detail(event: &ReplayEvent) -> String {
     let mut details = Vec::new();
     if let Some(worker_queue_len) = event.worker_queue_len() {
         details.push(format!("queue_len={worker_queue_len}"));
+    }
+    if let Some(estimated_cost_units) = event.estimated_cost_units() {
+        details.push(format!("estimated_cost_units={estimated_cost_units}"));
+    }
+    if let Some(cost_units) = event.cost_units() {
+        details.push(format!("cost_units={cost_units}"));
     }
     if let Some(verified) = event.signature_verification_worker_result() {
         details.push(format!("verified={verified}"));
@@ -1085,6 +1217,13 @@ fn render_transactions(frame: &mut Frame<'_>, area: Rect, app: &App, snapshot: &
                 String::new(),
                 String::new(),
                 String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
             ])]
         } else {
             slot.transactions
@@ -1095,6 +1234,28 @@ fn render_transactions(frame: &mut Frame<'_>, area: Rect, app: &App, snapshot: &
                         transaction.status.to_string(),
                         transaction
                             .slot_ingest_delta_ns
+                            .map(format_duration_ns)
+                            .unwrap_or_else(|| "-".to_string()),
+                        format_optional_u64(transaction.estimated_cost_units),
+                        format_optional_u64(transaction.cost_units),
+                        transaction
+                            .check_wait_ns
+                            .map(format_duration_ns)
+                            .unwrap_or_else(|| "-".to_string()),
+                        transaction
+                            .ready_wait_ns
+                            .map(format_duration_ns)
+                            .unwrap_or_else(|| "-".to_string()),
+                        transaction
+                            .scheduling_wait_ns
+                            .map(format_duration_ns)
+                            .unwrap_or_else(|| "-".to_string()),
+                        transaction
+                            .exec_wait_ns
+                            .map(format_duration_ns)
+                            .unwrap_or_else(|| "-".to_string()),
+                        transaction
+                            .execution_duration_ns
                             .map(format_duration_ns)
                             .unwrap_or_else(|| "-".to_string()),
                         transaction
@@ -1109,6 +1270,13 @@ fn render_transactions(frame: &mut Frame<'_>, area: Rect, app: &App, snapshot: &
     } else {
         vec![Row::new([
             "no slot".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
             String::new(),
             String::new(),
             String::new(),
@@ -1132,12 +1300,33 @@ fn render_transactions(frame: &mut Frame<'_>, area: Rect, app: &App, snapshot: &
             Constraint::Length(8),
             Constraint::Length(12),
             Constraint::Length(12),
-            Constraint::Length(12),
+            Constraint::Length(9),
+            Constraint::Length(9),
+            Constraint::Length(10),
+            Constraint::Length(11),
+            Constraint::Length(11),
+            Constraint::Length(10),
+            Constraint::Length(9),
+            Constraint::Length(9),
             Constraint::Min(12),
         ],
     )
     .header(
-        Row::new(["index", "status", "ingest", "total", "signature"]).style(
+        Row::new([
+            "index",
+            "status",
+            "ingest",
+            "est-cost",
+            "cost",
+            "chk-wait",
+            "ready-wait",
+            "sched-wait",
+            "exec-wait",
+            "exec",
+            "total",
+            "signature",
+        ])
+        .style(
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -1387,6 +1576,12 @@ fn short_signature(signature: &str) -> String {
     } else {
         format!("{}..{}", &signature[..8], &signature[signature.len() - 8..])
     }
+}
+
+fn format_optional_u64(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn format_duration_ns(ns: u64) -> String {
@@ -1865,6 +2060,136 @@ mod tests {
     }
 
     #[test]
+    fn transaction_summary_includes_costs_and_wait_times() {
+        let transaction = TransactionRecord {
+            index: 7,
+            signature: Some("signature-7".to_string()),
+            events: vec![
+                ReplayEvent::transaction_ingested(105, 42, 7, [1; 64]),
+                ReplayEvent::transaction_worker_dispatch_event(
+                    110,
+                    replay_event_tags::TRANSACTION_SENT_FOR_CHECK,
+                    42,
+                    7,
+                    3,
+                    4,
+                ),
+                ReplayEvent::transaction_worker_event(
+                    130,
+                    replay_event_tags::TRANSACTION_WORKER_PICKED_UP,
+                    42,
+                    7,
+                    3,
+                ),
+                ReplayEvent::transaction_check_passed(150, 42, 7, 3, 123),
+                ReplayEvent::transaction_ready_for_scheduling(180, 42, 7, 8),
+                ReplayEvent::transaction_event(
+                    190,
+                    replay_event_tags::TRANSACTION_SCHEDULING_SKIPPED,
+                    42,
+                    7,
+                ),
+                ReplayEvent::transaction_worker_dispatch_event(
+                    220,
+                    replay_event_tags::TRANSACTION_SCHEDULED_FOR_EXEC,
+                    42,
+                    7,
+                    3,
+                    5,
+                ),
+                ReplayEvent::transaction_worker_event(
+                    250,
+                    replay_event_tags::TRANSACTION_WORKER_PICKED_UP,
+                    42,
+                    7,
+                    3,
+                ),
+                ReplayEvent::transaction_worker_event(
+                    330,
+                    replay_event_tags::TRANSACTION_WORKER_EXECUTION_COMPLETED,
+                    42,
+                    7,
+                    3,
+                ),
+                ReplayEvent::transaction_execution_result(
+                    340,
+                    replay_event_tags::TRANSACTION_FINISHED_EXEC,
+                    42,
+                    7,
+                    3,
+                    456,
+                ),
+            ],
+        };
+
+        let summary = transaction_summary(Some(100), &transaction);
+
+        assert_eq!(summary.slot_ingest_delta_ns, Some(5));
+        assert_eq!(summary.estimated_cost_units, Some(123));
+        assert_eq!(summary.cost_units, Some(456));
+        assert_eq!(summary.check_wait_ns, Some(20));
+        assert_eq!(summary.ready_wait_ns, Some(30));
+        assert_eq!(summary.scheduling_wait_ns, Some(30));
+        assert_eq!(summary.exec_wait_ns, Some(30));
+        assert_eq!(summary.execution_duration_ns, Some(80));
+    }
+
+    #[test]
+    fn transaction_ready_wait_ignores_self_released_ready_events() {
+        let transaction = TransactionRecord {
+            index: 7,
+            signature: Some("signature-7".to_string()),
+            events: vec![
+                ReplayEvent::transaction_check_passed(10, 42, 7, 3, 123),
+                ReplayEvent::transaction_ready_for_scheduling(20, 42, 7, 7),
+            ],
+        };
+
+        let summary = transaction_summary(Some(0), &transaction);
+
+        assert_eq!(summary.ready_wait_ns, None);
+    }
+
+    #[test]
+    fn transaction_timeline_includes_cost_units() {
+        let transaction = TransactionRecord {
+            index: 7,
+            signature: Some("signature-7".to_string()),
+            events: vec![
+                ReplayEvent::transaction_ingested(10, 42, 7, [1; 64]),
+                ReplayEvent::transaction_check_passed(20, 42, 7, 3, 123),
+                ReplayEvent::transaction_execution_result(
+                    30,
+                    replay_event_tags::TRANSACTION_FINISHED_EXEC,
+                    42,
+                    7,
+                    3,
+                    456,
+                ),
+            ],
+        };
+
+        let timeline = transaction_timeline(42, Some(0), &transaction);
+        let check_passed = timeline
+            .events
+            .iter()
+            .find(|event| event.name == "tx-check-passed")
+            .unwrap();
+        let finished_exec = timeline
+            .events
+            .iter()
+            .find(|event| event.name == "tx-finished-exec")
+            .unwrap();
+
+        assert!(
+            check_passed
+                .detail
+                .contains("estimated_cost_units=123")
+        );
+        assert!(finished_exec.detail.contains("cost_units=456"));
+    }
+
+    #[test]
     fn worker_timeline_shows_worker_transaction_and_queue_len() {
         let slot = store::SlotRecord {
             slot: 42,
@@ -2012,6 +2337,13 @@ mod tests {
                         index: *index,
                         status: "ingested",
                         slot_ingest_delta_ns: None,
+                        estimated_cost_units: None,
+                        cost_units: None,
+                        check_wait_ns: None,
+                        ready_wait_ns: None,
+                        scheduling_wait_ns: None,
+                        exec_wait_ns: None,
+                        execution_duration_ns: None,
                         duration_ns: None,
                         signature: format!("signature-{index}"),
                     })

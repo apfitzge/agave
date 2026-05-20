@@ -1503,6 +1503,40 @@ impl BlockVerificationScheduler {
         ));
     }
 
+    fn emit_transaction_check_passed_event(
+        &self,
+        slot: u64,
+        transaction_index: usize,
+        worker_id: ThreadId,
+        estimated_cost_units: u64,
+    ) {
+        self.emit_event(ReplayEvent::transaction_check_passed(
+            0,
+            slot,
+            u64::try_from(transaction_index).expect("transaction index must fit in u64"),
+            u64::try_from(worker_id).expect("worker id must fit in u64"),
+            estimated_cost_units,
+        ));
+    }
+
+    fn emit_transaction_execution_result_event(
+        &self,
+        tag: u64,
+        slot: u64,
+        transaction_index: usize,
+        worker_id: ThreadId,
+        cost_units: u64,
+    ) {
+        self.emit_event(ReplayEvent::transaction_execution_result(
+            0,
+            tag,
+            slot,
+            u64::try_from(transaction_index).expect("transaction index must fit in u64"),
+            u64::try_from(worker_id).expect("worker id must fit in u64"),
+            cost_units,
+        ));
+    }
+
     fn emit_transaction_worker_dispatch_event(
         &self,
         tag: u64,
@@ -2276,11 +2310,11 @@ impl BlockVerificationScheduler {
             self.free_check_response_allocations(check_response);
             self.mark_slot_failed(slot, replay_block_status_reasons::INVALID_TRANSACTION);
         } else {
-            self.emit_transaction_worker_event(
-                replay_event_tags::TRANSACTION_CHECK_PASSED,
+            self.emit_transaction_check_passed_event(
                 slot,
                 worker_check.transaction_index,
                 worker_check.thread_id,
+                check_response.estimated_cost_units,
             );
             self.record_successful_check(worker_check, check_response);
         }
@@ -2304,7 +2338,7 @@ impl BlockVerificationScheduler {
 
         let previous_transaction_state =
             self.finish_worker_execution(worker_execution, Instant::now());
-        let cost_units = previous_transaction_state.estimated_cost_units();
+        let estimated_cost_units = previous_transaction_state.estimated_cost_units();
         if self.transaction_has_pending_signature_verification(
             worker_execution.slot,
             worker_execution.transaction_index,
@@ -2316,22 +2350,27 @@ impl BlockVerificationScheduler {
         } else {
             self.free_transaction_state_allocations(previous_transaction_state);
         }
-        self.decrement_in_flight_execution_messages(worker_execution.thread_id, cost_units);
+        self.decrement_in_flight_execution_messages(
+            worker_execution.thread_id,
+            estimated_cost_units,
+        );
 
         if execution_response_is_invalid(&execution_response) {
-            self.emit_transaction_worker_event(
+            self.emit_transaction_execution_result_event(
                 replay_event_tags::TRANSACTION_EXEC_FAILED,
                 slot,
                 worker_execution.transaction_index,
                 worker_execution.thread_id,
+                execution_response.cost_units,
             );
             self.mark_slot_failed(slot, replay_block_status_reasons::INVALID_TRANSACTION);
         } else {
-            self.emit_transaction_worker_event(
+            self.emit_transaction_execution_result_event(
                 replay_event_tags::TRANSACTION_FINISHED_EXEC,
                 slot,
                 worker_execution.transaction_index,
                 worker_execution.thread_id,
+                execution_response.cost_units,
             );
         }
     }
@@ -4529,7 +4568,7 @@ mod tests {
         queue_worker_check_response(
             &mut workers[0],
             check_message.batch,
-            successful_check_response(),
+            successful_check_response_with_cost(123),
         );
         assert_eq!(scheduler.service_worker_responses(1), 1);
         assert_eq!(scheduler.service_transaction_execution_dispatches(1, 1), 1);
@@ -4537,7 +4576,10 @@ mod tests {
         queue_worker_execution_response(
             &mut workers[0],
             execution_message.batch,
-            successful_execution_response(),
+            ExecutionResponse {
+                cost_units: 456,
+                ..successful_execution_response()
+            },
         );
         assert_eq!(scheduler.service_worker_responses(1), 1);
 
@@ -4583,7 +4625,9 @@ mod tests {
         assert_eq!(events[2].worker_queue_len(), Some(1));
         assert_eq!(events[5].worker_queue_len(), Some(1));
         assert_eq!(events[3].worker_queue_len(), None);
+        assert_eq!(events[3].estimated_cost_units(), Some(123));
         assert_eq!(events[4].ready_released_by_transaction_index(), Some(0));
+        assert_eq!(events[6].cost_units(), Some(456));
     }
 
     #[test]
