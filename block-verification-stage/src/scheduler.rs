@@ -145,6 +145,7 @@ pub struct BlockVerificationScheduler {
     terminal_slot_queue: VecDeque<u64>,
     pending_entry: Option<PendingEntryIngress>,
     entry_hash_verifier: EntryHashVerifier,
+    in_flight_signature_verifications: usize,
     in_flight_execution_messages: usize,
     in_flight_executions_per_thread: Vec<usize>,
     in_flight_execution_cost_units_per_thread: Vec<u64>,
@@ -1375,6 +1376,7 @@ impl BlockVerificationScheduler {
             terminal_slot_queue: VecDeque::new(),
             pending_entry: None,
             entry_hash_verifier: EntryHashVerifier::new(entry_verification_threads),
+            in_flight_signature_verifications: 0,
             in_flight_execution_messages: 0,
             in_flight_executions_per_thread: vec![0; worker_count],
             in_flight_execution_cost_units_per_thread: vec![0; worker_count],
@@ -1463,6 +1465,21 @@ impl BlockVerificationScheduler {
             slot,
             u64::try_from(transaction_index).expect("transaction index must fit in u64"),
             verified,
+        ));
+    }
+
+    fn emit_transaction_signatures_submitted_event(
+        &self,
+        slot: u64,
+        transaction_index: usize,
+        signature_verification_queue_len: usize,
+    ) {
+        self.emit_event(ReplayEvent::transaction_signatures_submitted(
+            0,
+            slot,
+            u64::try_from(transaction_index).expect("transaction index must fit in u64"),
+            u64::try_from(signature_verification_queue_len)
+                .expect("signature verification queue length must fit in u64"),
         ));
     }
 
@@ -1917,10 +1934,11 @@ impl BlockVerificationScheduler {
                     state.pending_signature_verification_requests.pop_front();
                     state.in_flight_signature_verifications += 1;
                 }
-                self.emit_transaction_event(
-                    replay_event_tags::TRANSACTION_SIGNATURES_SUBMITTED,
+                self.in_flight_signature_verifications += 1;
+                self.emit_transaction_signatures_submitted_event(
                     slot,
                     pending_request.transaction_index,
+                    self.in_flight_signature_verifications,
                 );
                 submitted += 1;
             }
@@ -1999,6 +2017,10 @@ impl BlockVerificationScheduler {
 
     fn handle_signature_verification_result(&mut self, result: SignatureVerificationResult) {
         let slot = result.slot;
+        self.in_flight_signature_verifications = self
+            .in_flight_signature_verifications
+            .checked_sub(1)
+            .expect("signature verification result without global in-flight verification");
         let transaction_state_to_free = {
             let Some(state) = self.scheduling_states.get_mut(&slot) else {
                 return;
@@ -4811,6 +4833,14 @@ mod tests {
         assert_eq!(scheduler.service_terminal_slots(1), 1);
 
         let events = drain_replay_events(&mut event_consumer);
+        let signature_submitted_event = events
+            .iter()
+            .find(|event| event.tag == replay_event_tags::TRANSACTION_SIGNATURES_SUBMITTED)
+            .expect("signature verification submission event should be emitted");
+        assert_eq!(
+            signature_submitted_event.signature_verification_queue_len(),
+            Some(1)
+        );
         let failed_event = events
             .iter()
             .find(|event| event.tag == replay_event_tags::SLOT_FAILED)

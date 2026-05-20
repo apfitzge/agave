@@ -9,6 +9,8 @@ pub const REPLAY_EVENTS_IPC_FILE: &str = "agave_events.ipc";
 /// Worker-associated transaction events reuse the signature bytes as:
 /// `worker_id: u64`.
 /// Worker dispatch transaction events also include `worker_queue_len: u64`.
+/// Signature verification submission events also include
+/// `signature_verification_queue_len: u64`.
 pub const REPLAY_EVENT_PAYLOAD_BYTES: usize = 80;
 
 use crate::thread_aware_account_locks::ThreadId;
@@ -82,6 +84,8 @@ pub mod replay_event_tags {
     /// Payload includes `worker_id: u64`.
     pub const TRANSACTION_WORKER_EXECUTION_COMPLETED: u64 = 15;
     /// Transaction signatures were submitted for Agave-side verification.
+    ///
+    /// Payload includes `signature_verification_queue_len: u64`.
     pub const TRANSACTION_SIGNATURES_SUBMITTED: u64 = 16;
     /// Agave-side signature verification returned for a transaction.
     ///
@@ -159,6 +163,7 @@ const TRANSACTION_INDEX_OFFSET: usize = SLOT_REASON_OFFSET;
 const SIGNATURE_OFFSET: usize = TRANSACTION_INDEX_OFFSET + core::mem::size_of::<u64>();
 const WORKER_ID_OFFSET: usize = SIGNATURE_OFFSET;
 const WORKER_QUEUE_LENGTH_OFFSET: usize = WORKER_ID_OFFSET + core::mem::size_of::<u64>();
+const SIGNATURE_VERIFICATION_QUEUE_LENGTH_OFFSET: usize = SIGNATURE_OFFSET;
 const SIGNATURE_VERIFICATION_RESULT_OFFSET: usize = SIGNATURE_OFFSET;
 
 impl ReplayEvent {
@@ -222,6 +227,25 @@ impl ReplayEvent {
             transaction_index,
         );
         event.write_u64(SIGNATURE_VERIFICATION_RESULT_OFFSET, u64::from(verified));
+        event
+    }
+
+    pub fn transaction_signatures_submitted(
+        timestamp_ns: u64,
+        slot: u64,
+        transaction_index: u64,
+        signature_verification_queue_len: u64,
+    ) -> Self {
+        let mut event = Self::transaction_event(
+            timestamp_ns,
+            replay_event_tags::TRANSACTION_SIGNATURES_SUBMITTED,
+            slot,
+            transaction_index,
+        );
+        event.write_u64(
+            SIGNATURE_VERIFICATION_QUEUE_LENGTH_OFFSET,
+            signature_verification_queue_len,
+        );
         event
     }
 
@@ -298,6 +322,14 @@ impl ReplayEvent {
         }
 
         Some(self.read_u64(SIGNATURE_VERIFICATION_RESULT_OFFSET) != 0)
+    }
+
+    pub fn signature_verification_queue_len(&self) -> Option<u64> {
+        if self.tag != replay_event_tags::TRANSACTION_SIGNATURES_SUBMITTED {
+            return None;
+        }
+
+        Some(self.read_u64(SIGNATURE_VERIFICATION_QUEUE_LENGTH_OFFSET))
     }
 
     fn slot_event(timestamp_ns: u64, tag: u64, slot: u64) -> Self {
@@ -515,6 +547,18 @@ mod tests {
             assert_eq!(event.worker_queue_len(), Some(5));
             assert_eq!(event.signature(), None);
         }
+    }
+
+    #[test]
+    fn transaction_signature_submission_events_carry_queue_len() {
+        let event = ReplayEvent::transaction_signatures_submitted(1, 2, 3, 4);
+
+        assert_eq!(event.slot(), 2);
+        assert_eq!(event.transaction_index(), Some(3));
+        assert_eq!(event.worker_id(), None);
+        assert_eq!(event.worker_queue_len(), None);
+        assert_eq!(event.signature_verification_queue_len(), Some(4));
+        assert_eq!(event.signature(), None);
     }
 
     #[test]
