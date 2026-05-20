@@ -91,6 +91,9 @@ struct SlotSummary {
     slot: u64,
     transaction_count: usize,
     duration_ns: Option<u64>,
+    active_duration_ns: Option<u64>,
+    active_session_count: usize,
+    active_pending_transactions: usize,
     status: &'static str,
 }
 
@@ -99,6 +102,9 @@ struct SelectedSlot {
     status: &'static str,
     slot_event_count: usize,
     duration_ns: Option<u64>,
+    active_duration_ns: Option<u64>,
+    active_pending_transactions: usize,
+    active_sessions: Vec<ActiveSessionSummary>,
     slot_events: Vec<TimelineEvent>,
     worker_events: Vec<WorkerTimelineEvent>,
     signature_verification_worker_events: Vec<WorkerTimelineEvent>,
@@ -109,6 +115,7 @@ struct SelectedSlot {
 struct TransactionSummary {
     index: u64,
     status: &'static str,
+    ingest_timestamp_ns: Option<u64>,
     slot_ingest_delta_ns: Option<u64>,
     estimated_cost_units: Option<u64>,
     cost_units: Option<u64>,
@@ -136,6 +143,22 @@ struct TimelineEvent {
     timestamp_ns: u64,
     name: &'static str,
     detail: String,
+}
+
+struct ActiveSessionSummary {
+    start_delta_ns: u64,
+    start_timestamp_ns: u64,
+    end_timestamp_ns: Option<u64>,
+    duration_ns: Option<u64>,
+    transaction_count: usize,
+    pending_transactions: usize,
+}
+
+struct ActiveSession {
+    start_timestamp_ns: u64,
+    end_timestamp_ns: Option<u64>,
+    transaction_count: usize,
+    pending_transactions: usize,
 }
 
 struct WorkerTimelineEvent {
@@ -319,10 +342,20 @@ fn snapshot(
         .into_iter()
         .filter_map(|slot| {
             let slot_record = store.slot(slot)?;
+            let active_sessions = slot_active_sessions(slot_record);
+            let active_duration_ns = active_sessions_total_duration_ns(
+                &active_sessions,
+                slot_latest_timestamp_ns(slot_record),
+            );
             Some(SlotSummary {
                 slot,
                 transaction_count: slot_record.transactions.len(),
                 duration_ns: slot_record.duration_ns(),
+                active_duration_ns,
+                active_session_count: active_sessions.len(),
+                active_pending_transactions: active_sessions_pending_transactions(
+                    &active_sessions,
+                ),
                 status: slot_record.status(),
             })
         })
@@ -333,6 +366,17 @@ fn snapshot(
         .map(|slot_record| {
             let transactions = slot_record.transactions_by_ingest();
             let slot_begin_timestamp_ns = slot_record.begin_timestamp_ns();
+            let active_sessions = slot_active_sessions(slot_record);
+            let latest_timestamp_ns = slot_latest_timestamp_ns(slot_record);
+            let active_duration_ns =
+                active_sessions_total_duration_ns(&active_sessions, latest_timestamp_ns);
+            let active_pending_transactions =
+                active_sessions_pending_transactions(&active_sessions);
+            let active_sessions = active_session_summaries(
+                &active_sessions,
+                slot_begin_timestamp_ns,
+                latest_timestamp_ns,
+            );
             let selected_transaction = selected_transaction
                 .and_then(|selected_index| {
                     transactions
@@ -353,6 +397,9 @@ fn snapshot(
                 status: slot_record.status(),
                 slot_event_count: slot_record.slot_events.len(),
                 duration_ns: slot_record.duration_ns(),
+                active_duration_ns,
+                active_pending_transactions,
+                active_sessions,
                 slot_events: slot_timeline(slot_record),
                 worker_events: worker_timeline(slot_record, WorkerTimelineKind::Replay),
                 signature_verification_worker_events: worker_timeline(
@@ -372,6 +419,127 @@ fn snapshot(
     }
 }
 
+fn slot_active_sessions(slot: &store::SlotRecord) -> Vec<ActiveSession> {
+    let mut transitions = Vec::new();
+    for transaction in slot.transactions.values() {
+        if let Some(ingest_timestamp_ns) = transaction.ingest_timestamp_ns() {
+            transitions.push((ingest_timestamp_ns, 1usize, 0usize));
+        }
+        if let Some(terminal_timestamp_ns) = transaction.terminal_timestamp_ns() {
+            transitions.push((terminal_timestamp_ns, 0usize, 1usize));
+        }
+    }
+    transitions.sort_by_key(|(timestamp_ns, starts, _)| (*timestamp_ns, usize::MAX - *starts));
+
+    let mut sessions = Vec::new();
+    let mut outstanding_transactions = 0usize;
+    let mut current_session: Option<ActiveSession> = None;
+    let mut index = 0usize;
+    while index < transitions.len() {
+        let timestamp_ns = transitions[index].0;
+        let mut starts = 0usize;
+        let mut stops = 0usize;
+        while index < transitions.len() && transitions[index].0 == timestamp_ns {
+            starts = starts.saturating_add(transitions[index].1);
+            stops = stops.saturating_add(transitions[index].2);
+            index += 1;
+        }
+
+        if outstanding_transactions == 0 && starts > 0 {
+            current_session = Some(ActiveSession {
+                start_timestamp_ns: timestamp_ns,
+                end_timestamp_ns: None,
+                transaction_count: 0,
+                pending_transactions: 0,
+            });
+        }
+        outstanding_transactions = outstanding_transactions.saturating_add(starts);
+        if let Some(session) = &mut current_session {
+            session.transaction_count = session.transaction_count.saturating_add(starts);
+        }
+
+        outstanding_transactions = outstanding_transactions.saturating_sub(stops);
+        if outstanding_transactions == 0 {
+            if let Some(mut session) = current_session.take() {
+                session.end_timestamp_ns = Some(timestamp_ns);
+                sessions.push(session);
+            }
+        }
+    }
+
+    if let Some(mut session) = current_session {
+        session.pending_transactions = outstanding_transactions;
+        sessions.push(session);
+    }
+
+    sessions
+}
+
+fn slot_latest_timestamp_ns(slot: &store::SlotRecord) -> Option<u64> {
+    slot.slot_events
+        .iter()
+        .chain(
+            slot.transactions
+                .values()
+                .flat_map(|transaction| transaction.events.iter()),
+        )
+        .map(|event| event.timestamp_ns)
+        .max()
+}
+
+fn active_sessions_total_duration_ns(
+    sessions: &[ActiveSession],
+    open_session_end_timestamp_ns: Option<u64>,
+) -> Option<u64> {
+    if sessions.is_empty() {
+        return None;
+    }
+
+    Some(
+        sessions
+            .iter()
+            .filter_map(|session| active_session_duration_ns(session, open_session_end_timestamp_ns))
+            .sum(),
+    )
+}
+
+fn active_sessions_pending_transactions(sessions: &[ActiveSession]) -> usize {
+    sessions
+        .last()
+        .filter(|session| session.end_timestamp_ns.is_none())
+        .map_or(0, |session| session.pending_transactions)
+}
+
+fn active_session_summaries(
+    sessions: &[ActiveSession],
+    slot_begin_timestamp_ns: Option<u64>,
+    open_session_end_timestamp_ns: Option<u64>,
+) -> Vec<ActiveSessionSummary> {
+    sessions
+        .iter()
+        .map(|session| ActiveSessionSummary {
+            start_delta_ns: slot_begin_timestamp_ns
+                .map(|slot_begin| session.start_timestamp_ns.saturating_sub(slot_begin))
+                .unwrap_or_default(),
+            start_timestamp_ns: session.start_timestamp_ns,
+            end_timestamp_ns: session.end_timestamp_ns,
+            duration_ns: active_session_duration_ns(session, open_session_end_timestamp_ns),
+            transaction_count: session.transaction_count,
+            pending_transactions: session.pending_transactions,
+        })
+        .collect()
+}
+
+fn active_session_duration_ns(
+    session: &ActiveSession,
+    open_session_end_timestamp_ns: Option<u64>,
+) -> Option<u64> {
+    session
+        .end_timestamp_ns
+        .or(open_session_end_timestamp_ns)
+        .map(|end_timestamp_ns| end_timestamp_ns.saturating_sub(session.start_timestamp_ns))
+}
+
 fn transaction_summary(
     slot_begin_timestamp_ns: Option<u64>,
     transaction: &TransactionRecord,
@@ -379,6 +547,7 @@ fn transaction_summary(
     TransactionSummary {
         index: transaction.index,
         status: transaction.status(),
+        ingest_timestamp_ns: transaction.ingest_timestamp_ns(),
         slot_ingest_delta_ns: slot_begin_timestamp_ns
             .zip(transaction.ingest_timestamp_ns())
             .map(|(slot_begin, ingest)| ingest.saturating_sub(slot_begin)),
@@ -1170,7 +1339,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App, snapshot: &UiSnap
 
 fn render_slots(frame: &mut Frame<'_>, area: Rect, app: &App, snapshot: &UiSnapshot) {
     let rows = if snapshot.slots.is_empty() {
-        vec![Row::new(["waiting", "", "", ""])]
+        vec![Row::new(["waiting", "", "", "", "", ""])]
     } else {
         snapshot
             .slots
@@ -1184,6 +1353,20 @@ fn render_slots(frame: &mut Frame<'_>, area: Rect, app: &App, snapshot: &UiSnaps
                             .map(format_duration_ns)
                             .unwrap_or_else(|| "-".to_string()),
                     ),
+                    Cell::from(
+                        slot.active_duration_ns
+                            .map(format_duration_ns)
+                            .unwrap_or_else(|| "-".to_string()),
+                    ),
+                    Cell::from(format!(
+                        "{}{}",
+                        slot.active_session_count,
+                        if slot.active_pending_transactions == 0 {
+                            String::new()
+                        } else {
+                            format!("+{}", slot.active_pending_transactions)
+                        }
+                    )),
                     Cell::from(slot.status),
                 ])
             })
@@ -1195,11 +1378,13 @@ fn render_slots(frame: &mut Frame<'_>, area: Rect, app: &App, snapshot: &UiSnaps
             Constraint::Length(12),
             Constraint::Length(7),
             Constraint::Length(12),
+            Constraint::Length(12),
+            Constraint::Length(8),
             Constraint::Min(8),
         ],
     )
     .header(
-        Row::new(["slot", "txs", "block", "status"]).style(
+        Row::new(["slot", "txs", "block", "active", "sessions", "status"]).style(
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -1215,79 +1400,17 @@ fn render_slots(frame: &mut Frame<'_>, area: Rect, app: &App, snapshot: &UiSnaps
 }
 
 fn render_transactions(frame: &mut Frame<'_>, area: Rect, app: &App, snapshot: &UiSnapshot) {
-    let rows = if let Some(slot) = &snapshot.selected_slot {
+    let (rows, selected_row) = if let Some(slot) = &snapshot.selected_slot {
         if slot.transactions.is_empty() {
-            vec![Row::new([
-                "no txs".to_string(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-            ])]
+            (vec![placeholder_transaction_row("no txs")], None)
         } else {
-            slot.transactions
-                .iter()
-                .map(|transaction| {
-                    Row::new([
-                        transaction.index.to_string(),
-                        transaction.status.to_string(),
-                        transaction
-                            .slot_ingest_delta_ns
-                            .map(format_duration_ns)
-                            .unwrap_or_else(|| "-".to_string()),
-                        format_optional_u64(transaction.estimated_cost_units),
-                        format_optional_u64(transaction.cost_units),
-                        transaction
-                            .check_wait_ns
-                            .map(format_duration_ns)
-                            .unwrap_or_else(|| "-".to_string()),
-                        transaction
-                            .ready_wait_ns
-                            .map(format_duration_ns)
-                            .unwrap_or_else(|| "-".to_string()),
-                        transaction
-                            .scheduling_wait_ns
-                            .map(format_duration_ns)
-                            .unwrap_or_else(|| "-".to_string()),
-                        transaction
-                            .exec_wait_ns
-                            .map(format_duration_ns)
-                            .unwrap_or_else(|| "-".to_string()),
-                        transaction
-                            .execution_duration_ns
-                            .map(format_duration_ns)
-                            .unwrap_or_else(|| "-".to_string()),
-                        transaction
-                            .duration_ns
-                            .map(format_duration_ns)
-                            .unwrap_or_else(|| "-".to_string()),
-                        short_signature(&transaction.signature),
-                    ])
-                })
-                .collect()
+            (
+                transaction_table_rows(slot),
+                Some(app.transaction_index.min(slot.transactions.len() - 1)),
+            )
         }
     } else {
-        vec![Row::new([
-            "no slot".to_string(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-        ])]
+        (vec![placeholder_transaction_row("no slot")], None)
     };
 
     let title = snapshot
@@ -1295,8 +1418,15 @@ fn render_transactions(frame: &mut Frame<'_>, area: Rect, app: &App, snapshot: &
         .as_ref()
         .map(|slot| {
             format!(
-                "Transactions slot={} status={} slot_events={}",
-                slot.slot, slot.status, slot.slot_event_count
+                "Transactions slot={} status={} active={} sessions={} pending={} slot_events={}",
+                slot.slot,
+                slot.status,
+                slot.active_duration_ns
+                    .map(format_duration_ns)
+                    .unwrap_or_else(|| "-".to_string()),
+                slot.active_sessions.len(),
+                slot.active_pending_transactions,
+                slot.slot_event_count
             )
         })
         .unwrap_or_else(|| "Transactions".to_string());
@@ -1341,14 +1471,109 @@ fn render_transactions(frame: &mut Frame<'_>, area: Rect, app: &App, snapshot: &
     .block(focused_block(title, app.focus == FocusPane::Transactions))
     .row_highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan));
     let mut state = TableState::default();
-    if snapshot
-        .selected_slot
-        .as_ref()
-        .is_some_and(|slot| !slot.transactions.is_empty())
-    {
-        state.select(Some(app.transaction_index));
-    }
+    state.select(selected_row);
     frame.render_stateful_widget(table, area, &mut state);
+}
+
+fn transaction_table_rows(slot: &SelectedSlot) -> Vec<Row<'static>> {
+    let fresh_start_transaction_indices = fresh_start_transaction_indices(slot);
+    slot.transactions
+        .iter()
+        .map(|transaction| {
+            transaction_table_row(
+                transaction,
+                fresh_start_transaction_indices.contains(&transaction.index),
+            )
+        })
+        .collect()
+}
+
+fn fresh_start_transaction_indices(slot: &SelectedSlot) -> Vec<u64> {
+    let mut indices = Vec::with_capacity(slot.active_sessions.len());
+    let mut transaction_index = 0usize;
+    for session in &slot.active_sessions {
+        while transaction_index < slot.transactions.len() {
+            let transaction = &slot.transactions[transaction_index];
+            let Some(ingest_timestamp_ns) = transaction.ingest_timestamp_ns else {
+                transaction_index += 1;
+                continue;
+            };
+            if ingest_timestamp_ns < session.start_timestamp_ns {
+                transaction_index += 1;
+                continue;
+            }
+            if session
+                .end_timestamp_ns
+                .is_none_or(|end_timestamp_ns| ingest_timestamp_ns <= end_timestamp_ns)
+            {
+                indices.push(transaction.index);
+            }
+            break;
+        }
+    }
+    indices
+}
+
+fn transaction_table_row(transaction: &TransactionSummary, fresh_start: bool) -> Row<'static> {
+    Row::new([
+        transaction.index.to_string(),
+        transaction.status.to_string(),
+        transaction
+            .slot_ingest_delta_ns
+            .map(format_duration_ns)
+            .unwrap_or_else(|| "-".to_string()),
+        format_optional_u64(transaction.estimated_cost_units),
+        format_optional_u64(transaction.cost_units),
+        transaction
+            .check_wait_ns
+            .map(format_duration_ns)
+            .unwrap_or_else(|| "-".to_string()),
+        transaction
+            .ready_wait_ns
+            .map(format_duration_ns)
+            .unwrap_or_else(|| "-".to_string()),
+        transaction
+            .scheduling_wait_ns
+            .map(format_duration_ns)
+            .unwrap_or_else(|| "-".to_string()),
+        transaction
+            .exec_wait_ns
+            .map(format_duration_ns)
+            .unwrap_or_else(|| "-".to_string()),
+        transaction
+            .execution_duration_ns
+            .map(format_duration_ns)
+            .unwrap_or_else(|| "-".to_string()),
+        transaction
+            .duration_ns
+            .map(format_duration_ns)
+            .unwrap_or_else(|| "-".to_string()),
+        short_signature(&transaction.signature),
+    ])
+    .style(if fresh_start {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    })
+}
+
+fn placeholder_transaction_row(label: &str) -> Row<'static> {
+    Row::new([
+        label.to_string(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+    ])
 }
 
 fn render_tx_timeline(frame: &mut Frame<'_>, area: Rect, app: &App, snapshot: &UiSnapshot) {
@@ -1398,12 +1623,17 @@ fn tx_timeline_lines(snapshot: &UiSnapshot) -> Vec<Line<'static>> {
 
     let mut lines = vec![
         Line::from(format!(
-            "slot={} status={} slot_duration={} transactions={}",
+            "slot={} status={} slot_duration={} active={} sessions={} pending={} transactions={}",
             slot.slot,
             slot.status,
             slot.duration_ns
                 .map(format_duration_ns)
                 .unwrap_or_else(|| "-".to_string()),
+            slot.active_duration_ns
+                .map(format_duration_ns)
+                .unwrap_or_else(|| "-".to_string()),
+            slot.active_sessions.len(),
+            slot.active_pending_transactions,
             slot.transactions.len()
         )),
         Line::from(""),
@@ -1414,6 +1644,17 @@ fn tx_timeline_lines(snapshot: &UiSnapshot) -> Vec<Line<'static>> {
         lines.push(Line::from("no slot events recorded"));
     } else {
         lines.extend(slot.slot_events.iter().map(timeline_event_line));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(format!(
+        "{:>14} {:>22} active session",
+        "delta", "timestamp_ns"
+    )));
+    if slot.active_sessions.is_empty() {
+        lines.push(Line::from("no active sessions inferred"));
+    } else {
+        lines.extend(slot.active_sessions.iter().map(active_session_line));
     }
 
     lines.push(Line::from(""));
@@ -1533,6 +1774,26 @@ fn timeline_event_line(event: &TimelineEvent) -> Line<'static> {
         event.timestamp_ns,
         event.name,
         detail
+    ))
+}
+
+fn active_session_line(session: &ActiveSessionSummary) -> Line<'static> {
+    let end = session
+        .end_timestamp_ns
+        .map(|timestamp_ns| timestamp_ns.to_string())
+        .unwrap_or_else(|| "open".to_string());
+    let duration = session
+        .duration_ns
+        .map(format_duration_ns)
+        .unwrap_or_else(|| "-".to_string());
+    Line::from(format!(
+        "{:>14} {:>22} active-session duration={} end={} txs={} pending={}",
+        format_duration_ns(session.start_delta_ns),
+        session.start_timestamp_ns,
+        duration,
+        end,
+        session.transaction_count,
+        session.pending_transactions
     ))
 }
 
@@ -2126,6 +2387,186 @@ mod tests {
     }
 
     #[test]
+    fn active_sessions_wait_for_signature_verification_after_execution() {
+        let slot = store::SlotRecord {
+            slot: 42,
+            slot_events: vec![ReplayEvent::slot_begin(0, 42)],
+            transactions: std::collections::BTreeMap::from([(
+                7,
+                TransactionRecord {
+                    index: 7,
+                    signature: None,
+                    events: vec![
+                        ReplayEvent::transaction_ingested(10, 42, 7, [1; 64]),
+                        ReplayEvent::transaction_signatures_submitted(12, 42, 7, 1),
+                        ReplayEvent::transaction_event(
+                            30,
+                            replay_event_tags::TRANSACTION_FINISHED_EXEC,
+                            42,
+                            7,
+                        ),
+                        ReplayEvent::transaction_signatures_returned(50, 42, 7, true),
+                    ],
+                },
+            )]),
+        };
+
+        let sessions = slot_active_sessions(&slot);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].start_timestamp_ns, 10);
+        assert_eq!(sessions[0].end_timestamp_ns, Some(50));
+        assert_eq!(
+            active_sessions_total_duration_ns(&sessions, slot_latest_timestamp_ns(&slot)),
+            Some(40)
+        );
+    }
+
+    #[test]
+    fn active_sessions_close_at_execution_when_signature_verification_was_ready() {
+        let slot = store::SlotRecord {
+            slot: 42,
+            slot_events: vec![ReplayEvent::slot_begin(0, 42)],
+            transactions: std::collections::BTreeMap::from([(
+                7,
+                TransactionRecord {
+                    index: 7,
+                    signature: None,
+                    events: vec![
+                        ReplayEvent::transaction_ingested(10, 42, 7, [1; 64]),
+                        ReplayEvent::transaction_signatures_submitted(12, 42, 7, 1),
+                        ReplayEvent::transaction_signatures_returned(20, 42, 7, true),
+                        ReplayEvent::transaction_event(
+                            50,
+                            replay_event_tags::TRANSACTION_FINISHED_EXEC,
+                            42,
+                            7,
+                        ),
+                    ],
+                },
+            )]),
+        };
+
+        let sessions = slot_active_sessions(&slot);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].start_timestamp_ns, 10);
+        assert_eq!(sessions[0].end_timestamp_ns, Some(50));
+        assert_eq!(
+            active_sessions_total_duration_ns(&sessions, slot_latest_timestamp_ns(&slot)),
+            Some(40)
+        );
+    }
+
+    #[test]
+    fn active_sessions_merge_overlapping_transactions() {
+        let slot = store::SlotRecord {
+            slot: 42,
+            slot_events: vec![ReplayEvent::slot_begin(0, 42)],
+            transactions: std::collections::BTreeMap::from([
+                (
+                    7,
+                    TransactionRecord {
+                        index: 7,
+                        signature: None,
+                        events: vec![
+                            ReplayEvent::transaction_ingested(10, 42, 7, [1; 64]),
+                            ReplayEvent::transaction_event(
+                                50,
+                                replay_event_tags::TRANSACTION_FINISHED_EXEC,
+                                42,
+                                7,
+                            ),
+                        ],
+                    },
+                ),
+                (
+                    8,
+                    TransactionRecord {
+                        index: 8,
+                        signature: None,
+                        events: vec![
+                            ReplayEvent::transaction_ingested(30, 42, 8, [2; 64]),
+                            ReplayEvent::transaction_event(
+                                70,
+                                replay_event_tags::TRANSACTION_FINISHED_EXEC,
+                                42,
+                                8,
+                            ),
+                        ],
+                    },
+                ),
+            ]),
+        };
+
+        let sessions = slot_active_sessions(&slot);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].start_timestamp_ns, 10);
+        assert_eq!(sessions[0].end_timestamp_ns, Some(70));
+        assert_eq!(sessions[0].transaction_count, 2);
+    }
+
+    #[test]
+    fn transaction_table_rows_mark_first_transaction_in_active_session() {
+        let selected_slot = SelectedSlot {
+            slot: 42,
+            status: "running",
+            slot_event_count: 0,
+            duration_ns: None,
+            active_duration_ns: Some(60),
+            active_pending_transactions: 0,
+            active_sessions: vec![ActiveSessionSummary {
+                start_delta_ns: 10,
+                start_timestamp_ns: 10,
+                end_timestamp_ns: Some(70),
+                duration_ns: Some(60),
+                transaction_count: 2,
+                pending_transactions: 0,
+            }],
+            slot_events: Vec::new(),
+            worker_events: Vec::new(),
+            signature_verification_worker_events: Vec::new(),
+            transactions: vec![
+                TransactionSummary {
+                    index: 7,
+                    status: "finished",
+                    ingest_timestamp_ns: Some(10),
+                    slot_ingest_delta_ns: Some(10),
+                    estimated_cost_units: None,
+                    cost_units: None,
+                    check_wait_ns: None,
+                    ready_wait_ns: None,
+                    scheduling_wait_ns: None,
+                    exec_wait_ns: None,
+                    execution_duration_ns: None,
+                    duration_ns: Some(40),
+                    signature: "signature-7".to_string(),
+                },
+                TransactionSummary {
+                    index: 8,
+                    status: "finished",
+                    ingest_timestamp_ns: Some(30),
+                    slot_ingest_delta_ns: Some(30),
+                    estimated_cost_units: None,
+                    cost_units: None,
+                    check_wait_ns: None,
+                    ready_wait_ns: None,
+                    scheduling_wait_ns: None,
+                    exec_wait_ns: None,
+                    execution_duration_ns: None,
+                    duration_ns: Some(40),
+                    signature: "signature-8".to_string(),
+                },
+            ],
+            selected_transaction: None,
+        };
+
+        let rows = transaction_table_rows(&selected_slot);
+        let fresh_start_indices = fresh_start_transaction_indices(&selected_slot);
+
+        assert_eq!(fresh_start_indices, [7]);
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
     fn transaction_ready_wait_ignores_self_released_ready_events() {
         let transaction = TransactionRecord {
             index: 7,
@@ -2312,6 +2753,9 @@ mod tests {
                 status: "running",
                 slot_event_count: 0,
                 duration_ns: None,
+                active_duration_ns: None,
+                active_pending_transactions: 0,
+                active_sessions: Vec::new(),
                 slot_events: Vec::new(),
                 worker_events: Vec::new(),
                 signature_verification_worker_events: Vec::new(),
@@ -2320,6 +2764,7 @@ mod tests {
                     .map(|index| TransactionSummary {
                         index: *index,
                         status: "ingested",
+                        ingest_timestamp_ns: None,
                         slot_ingest_delta_ns: None,
                         estimated_cost_units: None,
                         cost_units: None,
@@ -2354,6 +2799,9 @@ mod tests {
             slot,
             transaction_count: 0,
             duration_ns: None,
+            active_duration_ns: None,
+            active_session_count: 0,
+            active_pending_transactions: 0,
             status: "running",
         }
     }

@@ -251,9 +251,10 @@ impl TransactionRecord {
     }
 
     pub(crate) fn terminal_timestamp_ns(&self) -> Option<u64> {
-        self.events
+        let transaction_terminal = self
+            .events
             .iter()
-            .find(|event| {
+            .filter(|event| {
                 matches!(
                     event.tag,
                     replay_event_tags::TRANSACTION_FINISHED_EXEC
@@ -262,6 +263,36 @@ impl TransactionRecord {
                 )
             })
             .map(|event| event.timestamp_ns)
+            .max();
+        let signature_submitted = self
+            .events
+            .iter()
+            .any(|event| event.tag == replay_event_tags::TRANSACTION_SIGNATURES_SUBMITTED);
+        let signature_returned = self
+            .events
+            .iter()
+            .filter(|event| event.tag == replay_event_tags::TRANSACTION_SIGNATURES_RETURNED)
+            .map(|event| event.timestamp_ns)
+            .max();
+        let signature_failed = self
+            .events
+            .iter()
+            .filter(|event| {
+                event.tag == replay_event_tags::TRANSACTION_SIGNATURES_RETURNED
+                    && event.signature_verification_result() == Some(false)
+            })
+            .map(|event| event.timestamp_ns)
+            .max();
+
+        match (transaction_terminal, signature_submitted, signature_returned) {
+            (Some(transaction_terminal), true, Some(signature_returned)) => {
+                Some(transaction_terminal.max(signature_returned))
+            }
+            (Some(_), true, None) => None,
+            (Some(transaction_terminal), false, _) => Some(transaction_terminal),
+            (None, _, _) if signature_failed.is_some() => signature_failed,
+            (None, _, _) => None,
+        }
     }
 
     pub(crate) fn total_duration_ns(&self) -> Option<u64> {
@@ -387,6 +418,48 @@ mod tests {
         assert_eq!(transaction.status(), "finished");
         assert_eq!(transaction.total_duration_ns(), Some(50));
         assert_eq!(transaction.events.len(), 6);
+    }
+
+    #[test]
+    fn transaction_duration_waits_for_slower_signature_verification() {
+        let mut store = EventStore::new(4);
+
+        store.apply_event(ReplayEvent::slot_begin(1, 42));
+        store.apply_event(ReplayEvent::transaction_ingested(10, 42, 0, [7; 64]));
+        store.apply_event(ReplayEvent::transaction_signatures_submitted(20, 42, 0, 1));
+        store.apply_event(ReplayEvent::transaction_event(
+            30,
+            replay_event_tags::TRANSACTION_FINISHED_EXEC,
+            42,
+            0,
+        ));
+        store.apply_event(ReplayEvent::transaction_signatures_returned(
+            50, 42, 0, true,
+        ));
+
+        let transaction = store.slot(42).unwrap().transactions.get(&0).unwrap();
+        assert_eq!(transaction.total_duration_ns(), Some(40));
+    }
+
+    #[test]
+    fn transaction_duration_uses_execution_when_signature_verification_was_ready() {
+        let mut store = EventStore::new(4);
+
+        store.apply_event(ReplayEvent::slot_begin(1, 42));
+        store.apply_event(ReplayEvent::transaction_ingested(10, 42, 0, [7; 64]));
+        store.apply_event(ReplayEvent::transaction_signatures_submitted(12, 42, 0, 1));
+        store.apply_event(ReplayEvent::transaction_signatures_returned(
+            20, 42, 0, true,
+        ));
+        store.apply_event(ReplayEvent::transaction_event(
+            50,
+            replay_event_tags::TRANSACTION_FINISHED_EXEC,
+            42,
+            0,
+        ));
+
+        let transaction = store.slot(42).unwrap().transactions.get(&0).unwrap();
+        assert_eq!(transaction.total_duration_ns(), Some(40));
     }
 
     #[test]
