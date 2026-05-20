@@ -13,6 +13,8 @@ pub const REPLAY_EVENTS_IPC_FILE: &str = "agave_events.ipc";
 /// `signature_verification_queue_len: u64`.
 /// Signature verification worker transaction events reuse the signature bytes as:
 /// `signature_verification_worker_id: u64`.
+/// Ready-for-scheduling transaction events reuse the signature bytes as:
+/// `ready_released_by_transaction_index: u64`.
 pub const REPLAY_EVENT_PAYLOAD_BYTES: usize = 80;
 
 use crate::thread_aware_account_locks::ThreadId;
@@ -72,6 +74,8 @@ pub mod replay_event_tags {
     /// Payload includes `worker_id: u64`.
     pub const TRANSACTION_CHECK_PASSED: u64 = 5;
     /// Transaction was moved into the ready queue for scheduling.
+    ///
+    /// Payload includes `ready_released_by_transaction_index: u64`.
     pub const TRANSACTION_READY_FOR_SCHEDULING: u64 = 12;
     /// Replay worker began processing a transaction message.
     ///
@@ -186,6 +190,7 @@ const SIGNATURE_VERIFICATION_RESULT_OFFSET: usize = SIGNATURE_OFFSET;
 const SIGNATURE_VERIFICATION_WORKER_ID_OFFSET: usize = SIGNATURE_OFFSET;
 const SIGNATURE_VERIFICATION_WORKER_RESULT_OFFSET: usize =
     SIGNATURE_VERIFICATION_WORKER_ID_OFFSET + core::mem::size_of::<u64>();
+const READY_RELEASED_BY_TRANSACTION_INDEX_OFFSET: usize = SIGNATURE_OFFSET;
 
 impl ReplayEvent {
     pub fn slot_begin(timestamp_ns: u64, slot: u64) -> Self {
@@ -232,6 +237,25 @@ impl ReplayEvent {
         let mut event = Self::new(timestamp_ns, tag);
         event.write_u64(SLOT_OFFSET, slot);
         event.write_u64(TRANSACTION_INDEX_OFFSET, transaction_index);
+        event
+    }
+
+    pub fn transaction_ready_for_scheduling(
+        timestamp_ns: u64,
+        slot: u64,
+        transaction_index: u64,
+        ready_released_by_transaction_index: u64,
+    ) -> Self {
+        let mut event = Self::transaction_event(
+            timestamp_ns,
+            replay_event_tags::TRANSACTION_READY_FOR_SCHEDULING,
+            slot,
+            transaction_index,
+        );
+        event.write_u64(
+            READY_RELEASED_BY_TRANSACTION_INDEX_OFFSET,
+            ready_released_by_transaction_index,
+        );
         event
     }
 
@@ -403,6 +427,14 @@ impl ReplayEvent {
         }
 
         Some(self.read_u64(SIGNATURE_VERIFICATION_WORKER_RESULT_OFFSET) != 0)
+    }
+
+    pub fn ready_released_by_transaction_index(&self) -> Option<u64> {
+        if self.tag != replay_event_tags::TRANSACTION_READY_FOR_SCHEDULING {
+            return None;
+        }
+
+        Some(self.read_u64(READY_RELEASED_BY_TRANSACTION_INDEX_OFFSET))
     }
 
     fn slot_event(timestamp_ns: u64, tag: u64, slot: u64) -> Self {
@@ -578,10 +610,7 @@ mod tests {
 
     #[test]
     fn non_ingest_transaction_events_reference_index_without_signature() {
-        for tag in [
-            replay_event_tags::TRANSACTION_READY_FOR_SCHEDULING,
-            replay_event_tags::TRANSACTION_SCHEDULING_SKIPPED,
-        ] {
+        for tag in [replay_event_tags::TRANSACTION_SCHEDULING_SKIPPED] {
             let event = ReplayEvent::transaction_event(1, tag, 2, 3);
 
             assert_eq!(event.slot(), 2);
@@ -590,6 +619,17 @@ mod tests {
             assert_eq!(event.signature(), None);
             assert_eq!(event.payload[SIGNATURE_OFFSET..], [0; 64]);
         }
+    }
+
+    #[test]
+    fn transaction_ready_for_scheduling_carries_releasing_transaction_index() {
+        let event = ReplayEvent::transaction_ready_for_scheduling(1, 2, 3, 4);
+
+        assert_eq!(event.slot(), 2);
+        assert_eq!(event.transaction_index(), Some(3));
+        assert_eq!(event.ready_released_by_transaction_index(), Some(4));
+        assert_eq!(event.worker_id(), None);
+        assert_eq!(event.signature(), None);
     }
 
     #[test]

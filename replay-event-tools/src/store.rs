@@ -368,10 +368,10 @@ mod tests {
             42,
             0,
         ));
-        store.apply_event(ReplayEvent::transaction_event(
+        store.apply_event(ReplayEvent::transaction_ready_for_scheduling(
             50,
-            replay_event_tags::TRANSACTION_READY_FOR_SCHEDULING,
             42,
+            0,
             0,
         ));
         store.apply_event(ReplayEvent::transaction_event(

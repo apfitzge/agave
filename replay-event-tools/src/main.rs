@@ -505,6 +505,9 @@ fn timeline_event_detail(event: &ReplayEvent) -> String {
     if let Some(verified) = event.signature_verification_worker_result() {
         details.push(format!("verified={verified}"));
     }
+    if let Some(transaction_index) = event.ready_released_by_transaction_index() {
+        details.push(format!("ready_released_by_tx={transaction_index}"));
+    }
     if let Some(reason) = event.slot_failure_reason() {
         details.push(format!("reason={reason}"));
     }
@@ -1838,6 +1841,27 @@ mod tests {
             .unwrap();
 
         assert!(submitted.detail.contains("queue_len=4"));
+    }
+
+    #[test]
+    fn transaction_timeline_includes_ready_releasing_transaction() {
+        let transaction = TransactionRecord {
+            index: 7,
+            signature: Some("signature-7".to_string()),
+            events: vec![
+                ReplayEvent::transaction_ingested(10, 42, 7, [1; 64]),
+                ReplayEvent::transaction_ready_for_scheduling(20, 42, 7, 3),
+            ],
+        };
+
+        let timeline = transaction_timeline(42, Some(0), &transaction);
+        let ready = timeline
+            .events
+            .iter()
+            .find(|event| event.name == "tx-ready-for-scheduling")
+            .unwrap();
+
+        assert!(ready.detail.contains("ready_released_by_tx=3"));
     }
 
     #[test]

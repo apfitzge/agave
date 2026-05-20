@@ -1443,14 +1443,18 @@ impl BlockVerificationScheduler {
         ));
     }
 
-    fn emit_transaction_event(&self, tag: u64, slot: u64, transaction_index: usize) {
-        let transaction_index =
-            u64::try_from(transaction_index).expect("transaction index must fit in u64");
-        self.emit_event(ReplayEvent::transaction_event(
+    fn emit_transaction_ready_for_scheduling_event(
+        &self,
+        slot: u64,
+        transaction_index: usize,
+        ready_released_by_transaction_index: usize,
+    ) {
+        self.emit_event(ReplayEvent::transaction_ready_for_scheduling(
             0,
-            tag,
             slot,
-            transaction_index,
+            u64::try_from(transaction_index).expect("transaction index must fit in u64"),
+            u64::try_from(ready_released_by_transaction_index)
+                .expect("transaction index must fit in u64"),
         ));
     }
 
@@ -2508,10 +2512,10 @@ impl BlockVerificationScheduler {
         };
 
         for transaction_index in promoted_transactions {
-            self.emit_transaction_event(
-                replay_event_tags::TRANSACTION_READY_FOR_SCHEDULING,
+            self.emit_transaction_ready_for_scheduling_event(
                 slot,
                 transaction_index,
+                worker_check.transaction_index,
             );
         }
     }
@@ -4579,6 +4583,7 @@ mod tests {
         assert_eq!(events[2].worker_queue_len(), Some(1));
         assert_eq!(events[5].worker_queue_len(), Some(1));
         assert_eq!(events[3].worker_queue_len(), None);
+        assert_eq!(events[4].ready_released_by_transaction_index(), Some(0));
     }
 
     #[test]
@@ -4632,15 +4637,29 @@ mod tests {
                         | replay_event_tags::TRANSACTION_READY_FOR_SCHEDULING
                 )
             })
-            .map(|event| (event.tag, event.transaction_index()))
+            .map(|event| {
+                (
+                    event.tag,
+                    event.transaction_index(),
+                    event.ready_released_by_transaction_index(),
+                )
+            })
             .collect::<Vec<_>>();
         assert_eq!(
             check_and_ready_events,
             [
-                (replay_event_tags::TRANSACTION_CHECK_PASSED, Some(1)),
-                (replay_event_tags::TRANSACTION_CHECK_PASSED, Some(0)),
-                (replay_event_tags::TRANSACTION_READY_FOR_SCHEDULING, Some(0),),
-                (replay_event_tags::TRANSACTION_READY_FOR_SCHEDULING, Some(1),),
+                (replay_event_tags::TRANSACTION_CHECK_PASSED, Some(1), None),
+                (replay_event_tags::TRANSACTION_CHECK_PASSED, Some(0), None),
+                (
+                    replay_event_tags::TRANSACTION_READY_FOR_SCHEDULING,
+                    Some(0),
+                    Some(0),
+                ),
+                (
+                    replay_event_tags::TRANSACTION_READY_FOR_SCHEDULING,
+                    Some(1),
+                    Some(0),
+                ),
             ],
         );
     }
