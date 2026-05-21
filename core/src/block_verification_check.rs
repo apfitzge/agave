@@ -4,7 +4,7 @@ use {
         process_replay_check_message,
     },
     agave_block_verification_stage::setup::{
-        CheckWorkerResult, CheckWorkerSession, ReplayEventBroadcast,
+        CheckWorkerResult, CheckWorkerSession, ReplayEventBroadcast, ReplayEventBuffer,
     },
     agave_scheduler_bindings::processed_codes,
     agave_scheduling_utils::replay_events::replay_event_tags,
@@ -54,6 +54,8 @@ fn run_check_worker(
     bank_forks: Arc<RwLock<BankForks>>,
     event_broadcast: Option<Arc<ReplayEventBroadcast>>,
 ) {
+    let mut event_buffer = ReplayEventBuffer::new(event_broadcast);
+
     while !exit.load(Ordering::Relaxed) {
         worker.allocator.clean_remote_free_lists();
         let message = match worker.requests.read_timeout(REQUEST_WAIT_TIMEOUT) {
@@ -63,7 +65,7 @@ fn run_check_worker(
 
         emit_replay_check_worker_transaction_event(
             &worker.allocator,
-            event_broadcast.as_deref(),
+            &mut event_buffer,
             worker_id
                 .try_into()
                 .expect("check worker id must fit in u32"),
@@ -76,11 +78,12 @@ fn run_check_worker(
                 .expect("check worker id must fit in u32"),
             &worker.allocator,
             &bank_forks,
-            event_broadcast.as_deref(),
+            &mut event_buffer,
             &message,
         ) {
             Ok(response) => response,
             Err(err) => {
+                event_buffer.flush();
                 error!("Replay check worker error; err={err}");
                 continue;
             }
@@ -88,7 +91,7 @@ fn run_check_worker(
         if response.processed_code == processed_codes::PROCESSED {
             emit_replay_check_worker_batch_event(
                 &worker.allocator,
-                event_broadcast.as_deref(),
+                &mut event_buffer,
                 worker_id
                     .try_into()
                     .expect("check worker id must fit in u32"),
@@ -104,6 +107,7 @@ fn run_check_worker(
                 message: response,
             },
         );
+        event_buffer.flush();
     }
 }
 

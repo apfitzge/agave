@@ -12,13 +12,14 @@ use {
     std::{
         fs::File,
         path::{Path, PathBuf},
-        sync::atomic::Ordering,
+        sync::{Arc, atomic::Ordering},
     },
 };
 
 const SESSION_ALLOCATOR_HANDLES: usize = 2;
 const ALLOCATOR_SLAB_SIZE: u32 = 2 * 1024 * 1024;
 const REPLAY_EVENT_CAPACITY: usize = 1024 * 1024;
+const REPLAY_EVENT_BUFFER_INITIAL_CAPACITY: usize = 64;
 pub const CHECK_WORKER_COUNT: usize = 8;
 const CHECK_REQUEST_CAPACITY: usize = 16 * 1024;
 const CHECK_RESULT_CAPACITY: usize = 16 * 1024;
@@ -154,6 +155,64 @@ impl ReplayEventBroadcast {
     pub fn emit(&self, mut event: ReplayEvent) {
         event.timestamp_ns = replay_event_timestamp_ns();
         let _ = self.producer.try_write(event, Ordering::Relaxed);
+    }
+
+    pub fn emit_batch(&self, events: &[ReplayEvent]) {
+        if events.is_empty() {
+            return;
+        }
+
+        let Some(mut batch) = (unsafe {
+            // SAFETY: Every reserved slot is initialized below before `batch`
+            // is dropped and published.
+            self.producer.reserve_write_batch(events.len())
+        }) else {
+            return;
+        };
+
+        for (index, event) in events.iter().copied().enumerate() {
+            unsafe {
+                // SAFETY: `index` is within `batch.len()` because the batch
+                // was reserved for exactly `events.len()` slots.
+                batch.write_atomic(index, event, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+pub struct ReplayEventBuffer {
+    broadcast: Option<Arc<ReplayEventBroadcast>>,
+    events: Vec<ReplayEvent>,
+}
+
+impl ReplayEventBuffer {
+    pub fn new(broadcast: Option<Arc<ReplayEventBroadcast>>) -> Self {
+        let events = if broadcast.is_some() {
+            Vec::with_capacity(REPLAY_EVENT_BUFFER_INITIAL_CAPACITY)
+        } else {
+            Vec::new()
+        };
+        Self { broadcast, events }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.broadcast.is_some()
+    }
+
+    pub fn push(&mut self, mut event: ReplayEvent) {
+        if self.broadcast.is_none() {
+            return;
+        }
+
+        event.timestamp_ns = replay_event_timestamp_ns();
+        self.events.push(event);
+    }
+
+    pub fn flush(&mut self) {
+        if let Some(broadcast) = &self.broadcast {
+            broadcast.emit_batch(&self.events);
+        }
+        self.events.clear();
     }
 }
 

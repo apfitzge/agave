@@ -36,7 +36,7 @@ use crate::thread_aware_account_locks::ThreadId;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct ReplayEvent {
-    /// Approximate Unix timestamp in nanoseconds.
+    /// Monotonic timestamp in nanoseconds.
     pub timestamp_ns: u64,
     /// See [`replay_event_tags`] for the payload shape.
     pub tag: u64,

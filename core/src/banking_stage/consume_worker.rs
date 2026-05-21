@@ -191,7 +191,7 @@ pub(crate) mod external {
                 PacketHandlingError, translate_to_runtime_view,
             },
         },
-        agave_block_verification_stage::setup::ReplayEventBroadcast,
+        agave_block_verification_stage::setup::ReplayEventBuffer,
         agave_scheduler_bindings::{
             MAX_TRANSACTIONS_PER_MESSAGE, NO_REPLAY_BANK_SLOT, PackToWorkerMessage,
             SharablePubkeys, SharableTransactionBatchRegion, TransactionResponseRegion,
@@ -246,7 +246,7 @@ pub(crate) mod external {
         consumer: Consumer,
         sender: shaq::spsc::Producer<WorkerToPackMessage>,
         allocator: rts_alloc::Allocator,
-        event_broadcast: Option<Arc<agave_block_verification_stage::setup::ReplayEventBroadcast>>,
+        event_buffer: ReplayEventBuffer,
 
         shared_leader_state: SharedLeaderState,
         bank_forks: Arc<RwLock<BankForks>>,
@@ -302,7 +302,7 @@ pub(crate) mod external {
                 consumer,
                 sender,
                 allocator,
-                event_broadcast,
+                event_buffer: ReplayEventBuffer::new(event_broadcast),
                 shared_leader_state,
                 bank_forks,
                 sharable_banks,
@@ -351,8 +351,9 @@ pub(crate) mod external {
                     // Process message, if bank is unavailable enable draining for the
                     // remainder of the current batch (i.e. what our `receiver.sync()`
                     // fetched).
-                    *should_drain_executes |=
-                        self.process_message(message, *should_drain_executes)?;
+                    let process_result = self.process_message(message, *should_drain_executes);
+                    self.event_buffer.flush();
+                    *should_drain_executes |= process_result?;
 
                     // Publish our send & read offsets.
                     self.sender.commit();
@@ -378,7 +379,7 @@ pub(crate) mod external {
         }
 
         fn emit_replay_worker_response_event(
-            &self,
+            &mut self,
             source_message: &PackToWorkerMessage,
             response: &WorkerToPackMessage,
         ) {
@@ -398,15 +399,15 @@ pub(crate) mod external {
             self.emit_replay_worker_transaction_event(tag, source_message);
         }
 
-        fn emit_replay_worker_transaction_event(&self, tag: u64, message: &PackToWorkerMessage) {
-            let Some(event_broadcast) = self.event_broadcast.as_ref() else {
-                return;
-            };
-
+        fn emit_replay_worker_transaction_event(
+            &mut self,
+            tag: u64,
+            message: &PackToWorkerMessage,
+        ) {
             if Self::is_replay_check_message(message) {
                 Self::emit_replay_check_worker_transaction_event(
                     &self.allocator,
-                    Some(event_broadcast),
+                    &mut self.event_buffer,
                     self.id,
                     tag,
                     message,
@@ -422,14 +423,15 @@ pub(crate) mod external {
                     )
                 };
                 for (_, metadata) in batch.iter() {
-                    event_broadcast.emit(ReplayEvent::transaction_worker_event(
-                        0,
-                        tag,
-                        metadata.slot,
-                        u64::try_from(metadata.transaction_index)
-                            .expect("transaction index must fit in u64"),
-                        u64::from(self.id),
-                    ));
+                    self.event_buffer
+                        .push(ReplayEvent::transaction_worker_event(
+                            0,
+                            tag,
+                            metadata.slot,
+                            u64::try_from(metadata.transaction_index)
+                                .expect("transaction index must fit in u64"),
+                            u64::from(self.id),
+                        ));
                 }
             }
         }
@@ -643,7 +645,7 @@ pub(crate) mod external {
             let response = Self::build_check_response_message(
                 &self.allocator,
                 self.id,
-                self.event_broadcast.as_deref(),
+                &mut self.event_buffer,
                 message,
                 &parse_and_resolve_bank,
                 &working_bank,
@@ -657,7 +659,7 @@ pub(crate) mod external {
         fn build_check_response_message(
             allocator: &rts_alloc::Allocator,
             worker_id: u32,
-            event_broadcast: Option<&ReplayEventBroadcast>,
+            event_buffer: &mut ReplayEventBuffer,
             message: &PackToWorkerMessage,
             parse_and_resolve_bank: &Bank,
             working_bank: &Bank,
@@ -689,7 +691,7 @@ pub(crate) mod external {
             };
             Self::emit_replay_check_worker_transaction_event(
                 allocator,
-                event_broadcast,
+                event_buffer,
                 worker_id,
                 replay_event_tags::TRANSACTION_WORKER_CHECK_PARSED,
                 message,
@@ -704,7 +706,7 @@ pub(crate) mod external {
                 );
                 Self::emit_replay_check_worker_transaction_event(
                     allocator,
-                    event_broadcast,
+                    event_buffer,
                     worker_id,
                     replay_event_tags::TRANSACTION_WORKER_CHECK_SIGNATURES_COMPLETE,
                     message,
@@ -721,7 +723,7 @@ pub(crate) mod external {
                 );
                 Self::emit_replay_check_worker_transaction_event(
                     allocator,
-                    event_broadcast,
+                    event_buffer,
                     worker_id,
                     replay_event_tags::TRANSACTION_WORKER_CHECK_FEE_PAYER_BALANCE_COMPLETE,
                     message,
@@ -741,7 +743,7 @@ pub(crate) mod external {
             );
             Self::emit_replay_check_worker_transaction_event(
                 allocator,
-                event_broadcast,
+                event_buffer,
                 worker_id,
                 replay_event_tags::TRANSACTION_WORKER_CHECK_RESOLVED,
                 message,
@@ -758,7 +760,7 @@ pub(crate) mod external {
                 )?;
                 Self::emit_replay_check_worker_transaction_event(
                     allocator,
-                    event_broadcast,
+                    event_buffer,
                     worker_id,
                     replay_event_tags::TRANSACTION_WORKER_CHECK_ADDRESS_TABLES_COMPLETE,
                     message,
@@ -774,7 +776,7 @@ pub(crate) mod external {
                 );
                 Self::emit_replay_check_worker_transaction_event(
                     allocator,
-                    event_broadcast,
+                    event_buffer,
                     worker_id,
                     replay_event_tags::TRANSACTION_WORKER_CHECK_STATUS_COMPLETE,
                     message,
@@ -1035,14 +1037,14 @@ pub(crate) mod external {
 
         pub(crate) fn emit_replay_check_worker_transaction_event(
             allocator: &rts_alloc::Allocator,
-            event_broadcast: Option<&ReplayEventBroadcast>,
+            event_buffer: &mut ReplayEventBuffer,
             worker_id: u32,
             tag: u64,
             message: &PackToWorkerMessage,
         ) {
             Self::emit_replay_check_worker_batch_event(
                 allocator,
-                event_broadcast,
+                event_buffer,
                 worker_id,
                 tag,
                 message.batch,
@@ -1051,15 +1053,11 @@ pub(crate) mod external {
 
         pub(crate) fn emit_replay_check_worker_batch_event(
             allocator: &rts_alloc::Allocator,
-            event_broadcast: Option<&ReplayEventBroadcast>,
+            event_buffer: &mut ReplayEventBuffer,
             worker_id: u32,
             tag: u64,
             batch: SharableTransactionBatchRegion,
         ) {
-            let Some(event_broadcast) = event_broadcast else {
-                return;
-            };
-
             let batch = unsafe {
                 // SAFETY: Replay check messages are allocated by the replay
                 // scheduler with `ReplayTransactionCheckMetadata`.
@@ -1069,7 +1067,7 @@ pub(crate) mod external {
                 )
             };
             for (_, metadata) in batch.iter() {
-                event_broadcast.emit(ReplayEvent::transaction_worker_event(
+                event_buffer.push(ReplayEvent::transaction_worker_event(
                     0,
                     tag,
                     metadata.slot,
@@ -1573,14 +1571,14 @@ pub(crate) mod external {
 
     pub(crate) fn emit_replay_check_worker_transaction_event(
         allocator: &rts_alloc::Allocator,
-        event_broadcast: Option<&ReplayEventBroadcast>,
+        event_buffer: &mut ReplayEventBuffer,
         worker_id: u32,
         tag: u64,
         message: &PackToWorkerMessage,
     ) {
         ExternalWorker::emit_replay_check_worker_transaction_event(
             allocator,
-            event_broadcast,
+            event_buffer,
             worker_id,
             tag,
             message,
@@ -1589,14 +1587,14 @@ pub(crate) mod external {
 
     pub(crate) fn emit_replay_check_worker_batch_event(
         allocator: &rts_alloc::Allocator,
-        event_broadcast: Option<&ReplayEventBroadcast>,
+        event_buffer: &mut ReplayEventBuffer,
         worker_id: u32,
         tag: u64,
         batch: SharableTransactionBatchRegion,
     ) {
         ExternalWorker::emit_replay_check_worker_batch_event(
             allocator,
-            event_broadcast,
+            event_buffer,
             worker_id,
             tag,
             batch,
@@ -1607,7 +1605,7 @@ pub(crate) mod external {
         worker_id: u32,
         allocator: &rts_alloc::Allocator,
         bank_forks: &Arc<RwLock<BankForks>>,
-        event_broadcast: Option<&ReplayEventBroadcast>,
+        event_buffer: &mut ReplayEventBuffer,
         message: &PackToWorkerMessage,
     ) -> Result<WorkerToPackMessage, ExternalConsumeWorkerError> {
         if !ExternalWorker::validate_message(message)
@@ -1627,7 +1625,7 @@ pub(crate) mod external {
         };
         ExternalWorker::emit_replay_check_worker_transaction_event(
             allocator,
-            event_broadcast,
+            event_buffer,
             worker_id,
             replay_event_tags::TRANSACTION_WORKER_CHECK_BANK_ACQUIRED,
             message,
@@ -1636,7 +1634,7 @@ pub(crate) mod external {
         match ExternalWorker::build_check_response_message(
             allocator,
             worker_id,
-            event_broadcast,
+            event_buffer,
             message,
             &bank,
             &bank,
@@ -1938,7 +1936,7 @@ pub(crate) mod external {
                 shared_memory::join_broadcast_consumer_at_path(event_broadcast.path()).unwrap();
             assert_eq!(event_consumer.try_read(Ordering::Relaxed).unwrap(), None);
 
-            worker.event_broadcast = Some(Arc::new(event_broadcast));
+            worker.event_buffer = ReplayEventBuffer::new(Some(Arc::new(event_broadcast)));
 
             (event_consumer, temp_dir)
         }

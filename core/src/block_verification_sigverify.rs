@@ -1,7 +1,7 @@
 use {
     agave_block_verification_stage::setup::{
-        ReplayEventBroadcast, SignatureVerificationRequest, SignatureVerificationResult,
-        SignatureVerificationWorkerSession,
+        ReplayEventBroadcast, ReplayEventBuffer, SignatureVerificationRequest,
+        SignatureVerificationResult, SignatureVerificationWorkerSession,
     },
     agave_scheduling_utils::{
         replay_events::{ReplayEvent, replay_event_tags},
@@ -63,6 +63,8 @@ fn run_signature_verification_worker(
     replay_vote_sender: ReplayVoteSender,
     event_broadcast: Option<Arc<ReplayEventBroadcast>>,
 ) {
+    let mut event_buffer = ReplayEventBuffer::new(event_broadcast);
+
     while !exit.load(Ordering::Relaxed) {
         let request = match worker.requests.read_timeout(REQUEST_WAIT_TIMEOUT) {
             Ok(request) => request,
@@ -70,7 +72,7 @@ fn run_signature_verification_worker(
         };
 
         emit_signature_verification_worker_event(
-            event_broadcast.as_deref(),
+            &mut event_buffer,
             replay_event_tags::TRANSACTION_SIGNATURE_VERIFICATION_WORKER_PICKED_UP,
             worker_id,
             request,
@@ -80,15 +82,16 @@ fn run_signature_verification_worker(
             worker_id,
             request,
             &replay_vote_sender,
-            event_broadcast.as_deref(),
+            &mut event_buffer,
         );
         send_result(
             &exit,
             &worker,
             worker_id,
             SignatureVerificationResult::new(request.slot, request.transaction_index, verified),
-            event_broadcast.as_deref(),
+            &mut event_buffer,
         );
+        event_buffer.flush();
     }
 }
 
@@ -97,7 +100,7 @@ fn verify_transaction_signatures(
     worker_id: usize,
     request: SignatureVerificationRequest,
     replay_vote_sender: &ReplayVoteSender,
-    event_broadcast: Option<&ReplayEventBroadcast>,
+    event_buffer: &mut ReplayEventBuffer,
 ) -> bool {
     let transaction = unsafe {
         // SAFETY: The scheduler only submits transaction regions backed by
@@ -109,7 +112,7 @@ fn verify_transaction_signatures(
         return false;
     };
     emit_signature_verification_worker_event(
-        event_broadcast,
+        event_buffer,
         replay_event_tags::TRANSACTION_SIGNATURE_VERIFICATION_WORKER_PARSED,
         worker_id,
         request,
@@ -117,7 +120,7 @@ fn verify_transaction_signatures(
 
     let verified = verify_signatures(&view);
     emit_signature_verification_worker_result_event(
-        event_broadcast,
+        event_buffer,
         replay_event_tags::TRANSACTION_SIGNATURE_VERIFICATION_WORKER_SIGNATURES_COMPLETE,
         worker_id,
         request.slot,
@@ -142,16 +145,12 @@ fn verify_transaction_signatures(
 }
 
 fn emit_signature_verification_worker_event(
-    event_broadcast: Option<&ReplayEventBroadcast>,
+    event_buffer: &mut ReplayEventBuffer,
     tag: u64,
     worker_id: usize,
     request: SignatureVerificationRequest,
 ) {
-    let Some(event_broadcast) = event_broadcast else {
-        return;
-    };
-
-    event_broadcast.emit(
+    event_buffer.push(
         ReplayEvent::transaction_signature_verification_worker_event(
             0,
             tag,
@@ -163,18 +162,14 @@ fn emit_signature_verification_worker_event(
 }
 
 fn emit_signature_verification_worker_result_event(
-    event_broadcast: Option<&ReplayEventBroadcast>,
+    event_buffer: &mut ReplayEventBuffer,
     tag: u64,
     worker_id: usize,
     slot: u64,
     transaction_index: usize,
     verified: bool,
 ) {
-    let Some(event_broadcast) = event_broadcast else {
-        return;
-    };
-
-    event_broadcast.emit(
+    event_buffer.push(
         ReplayEvent::transaction_signature_verification_worker_result_event(
             0,
             tag,
@@ -217,7 +212,7 @@ fn send_result(
     worker: &SignatureVerificationWorkerSession,
     worker_id: usize,
     mut result: SignatureVerificationResult,
-    event_broadcast: Option<&ReplayEventBroadcast>,
+    event_buffer: &mut ReplayEventBuffer,
 ) {
     let mut sleep_duration = STARTING_SLEEP_DURATION;
     let mut last_full_time = Instant::now();
@@ -228,7 +223,7 @@ fn send_result(
         match worker.results.try_write(result) {
             Ok(()) => {
                 emit_signature_verification_worker_result_event(
-                    event_broadcast,
+                    event_buffer,
                     replay_event_tags::TRANSACTION_SIGNATURE_VERIFICATION_WORKER_RESULT_SENT,
                     worker_id,
                     slot,
