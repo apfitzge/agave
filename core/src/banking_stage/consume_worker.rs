@@ -319,26 +319,9 @@ pub(crate) mod external {
             mut receiver: shaq::spsc::Consumer<PackToWorkerMessage>,
         ) -> Result<(), ExternalConsumeWorkerError> {
             let mut should_drain_executes = false;
-            let mut did_work = false;
-            let mut last_empty_time = Instant::now();
-            let mut sleep_duration = STARTING_SLEEP_DURATION;
 
             while !self.exit.load(Ordering::Relaxed) {
-                match self.iterate(&mut receiver, &mut should_drain_executes)? {
-                    IterationResult::ProcessedMessage => {
-                        did_work = true;
-                    }
-                    IterationResult::Idle => {
-                        let now = Instant::now();
-
-                        if did_work {
-                            last_empty_time = now;
-                        }
-                        did_work = false;
-                        let idle_duration = now.duration_since(last_empty_time);
-                        sleep_duration = backoff(idle_duration, &sleep_duration);
-                    }
-                }
+                let _ = self.iterate(&mut receiver, &mut should_drain_executes)?;
             }
 
             Ok(())
@@ -351,8 +334,16 @@ pub(crate) mod external {
         ) -> Result<IterationResult, ExternalConsumeWorkerError> {
             self.allocator.clean_remote_free_lists();
             if receiver.is_empty() {
-                receiver.sync();
                 *should_drain_executes = false;
+                receiver.sync();
+                if receiver.is_empty()
+                    && matches!(
+                        receiver.wait_readable_timeout(BVS_WORKER_WAIT_TIMEOUT),
+                        Err(shaq::error::WaitError::Timeout)
+                    )
+                {
+                    return Ok(IterationResult::Idle);
+                }
             }
 
             match receiver.try_read() {
@@ -3587,6 +3578,7 @@ const STARTING_SLEEP_DURATION: Duration = Duration::from_micros(250);
 const MAX_SLEEP_DURATION: Duration = Duration::from_millis(1);
 const IDLE_YIELD_THRESHOLD: Duration = Duration::from_micros(100);
 const IDLE_SLEEP_THRESHOLD: Duration = Duration::from_secs(2);
+const BVS_WORKER_WAIT_TIMEOUT: Duration = Duration::from_millis(1);
 
 /// Sleeps for the specified time. Returns the next sleep duration to use.
 fn backoff(idle_duration: Duration, sleep_duration: &Duration) -> Duration {

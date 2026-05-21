@@ -22,6 +22,7 @@ use {
 const STARTING_SLEEP_DURATION: Duration = Duration::from_micros(250);
 const MAX_SLEEP_DURATION: Duration = Duration::from_millis(1);
 const IDLE_SLEEP_THRESHOLD: Duration = Duration::from_millis(10);
+const REQUEST_WAIT_TIMEOUT: Duration = Duration::from_millis(1);
 
 pub(crate) fn spawn_replay_check_workers(
     exit: Arc<AtomicBool>,
@@ -53,24 +54,13 @@ fn run_check_worker(
     bank_forks: Arc<RwLock<BankForks>>,
     event_broadcast: Option<Arc<ReplayEventBroadcast>>,
 ) {
-    let mut sleep_duration = STARTING_SLEEP_DURATION;
-    let mut did_work = false;
-    let mut last_empty_time = Instant::now();
-
     while !exit.load(Ordering::Relaxed) {
         worker.allocator.clean_remote_free_lists();
-        let Some(message) = worker.requests.try_read() else {
-            let now = Instant::now();
-            if did_work {
-                last_empty_time = now;
-            }
-            did_work = false;
-            sleep_duration = backoff(now.duration_since(last_empty_time), sleep_duration);
-            continue;
+        let message = match worker.requests.read_timeout(REQUEST_WAIT_TIMEOUT) {
+            Ok(message) => message,
+            Err(shaq::error::WaitError::Timeout) => continue,
         };
 
-        did_work = true;
-        sleep_duration = STARTING_SLEEP_DURATION;
         emit_replay_check_worker_transaction_event(
             &worker.allocator,
             event_broadcast.as_deref(),

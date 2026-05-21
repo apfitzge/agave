@@ -25,6 +25,7 @@ use {
 const STARTING_SLEEP_DURATION: Duration = Duration::from_micros(250);
 const MAX_SLEEP_DURATION: Duration = Duration::from_millis(1);
 const IDLE_SLEEP_THRESHOLD: Duration = Duration::from_millis(10);
+const REQUEST_WAIT_TIMEOUT: Duration = Duration::from_millis(1);
 
 pub(crate) fn spawn_replay_signature_verification_workers(
     exit: Arc<AtomicBool>,
@@ -62,23 +63,12 @@ fn run_signature_verification_worker(
     replay_vote_sender: ReplayVoteSender,
     event_broadcast: Option<Arc<ReplayEventBroadcast>>,
 ) {
-    let mut sleep_duration = STARTING_SLEEP_DURATION;
-    let mut did_work = false;
-    let mut last_empty_time = Instant::now();
-
     while !exit.load(Ordering::Relaxed) {
-        let Some(request) = worker.requests.try_read() else {
-            let now = Instant::now();
-            if did_work {
-                last_empty_time = now;
-            }
-            did_work = false;
-            sleep_duration = backoff(now.duration_since(last_empty_time), sleep_duration);
-            continue;
+        let request = match worker.requests.read_timeout(REQUEST_WAIT_TIMEOUT) {
+            Ok(request) => request,
+            Err(shaq::error::WaitError::Timeout) => continue,
         };
 
-        did_work = true;
-        sleep_duration = STARTING_SLEEP_DURATION;
         emit_signature_verification_worker_event(
             event_broadcast.as_deref(),
             replay_event_tags::TRANSACTION_SIGNATURE_VERIFICATION_WORKER_PICKED_UP,
