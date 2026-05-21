@@ -61,6 +61,7 @@ const TRANSACTION_EXECUTION_DISPATCH_LIMIT: usize = 128;
 const TRANSACTION_EXECUTION_SCAN_LIMIT: usize = 128;
 const MAX_OUTSTANDING_EXECUTIONS_PER_WORKER: usize = 128;
 const MAX_OUTSTANDING_EXECUTION_COST_UNITS_PER_WORKER: u64 = 4_000_000;
+const MAX_OUTSTANDING_ACCOUNT_LOCKS_PER_WORKER: u32 = 64;
 const WORKER_RESPONSE_LIMIT: usize = 128;
 const TERMINAL_SLOT_CLEANUP_LIMIT: usize = 128;
 const SCHEDULING_STATE_POOL_LIMIT: usize = 5;
@@ -758,12 +759,14 @@ fn select_execution_thread(
     thread_set: ThreadSet,
     in_flight_executions_per_thread: &[usize],
     in_flight_execution_cost_units_per_thread: &[u64],
+    account_locks: &ThreadAwareAccountLocks,
 ) -> ThreadId {
     thread_set
         .contained_threads_iter()
         .min_by_key(|thread_id| {
             (
                 in_flight_execution_cost_units_per_thread[*thread_id],
+                account_locks.thread_total_lock_count(*thread_id),
                 in_flight_executions_per_thread[*thread_id],
                 *thread_id,
             )
@@ -949,15 +952,16 @@ impl ExecutionDispatchContext<'_> {
             return ExecutionDispatchResult::Unavailable;
         }
 
-        let Ok(thread_id) = account_locks.try_lock_accounts(
+        let Ok(thread_id) = account_locks.try_lock_accounts_with_context(
             transaction.write_locks(),
             transaction.read_locks(),
             self.available_execution_threads,
-            |thread_set| {
+            |thread_set, account_locks| {
                 select_execution_thread(
                     thread_set,
                     self.in_flight_executions_per_thread,
                     self.in_flight_execution_cost_units_per_thread,
+                    account_locks,
                 )
             },
         ) else {
@@ -1008,14 +1012,18 @@ impl ExecutionDispatchContext<'_> {
         };
 
         self.increment_in_flight_execution_messages(thread_id, estimated_cost_units);
-        self.remove_worker_if_unavailable_after_dispatch(thread_id, worker_queue_len);
+        self.remove_worker_if_unavailable_after_dispatch(
+            thread_id,
+            worker_queue_len,
+            account_locks,
+        );
         ExecutionDispatchResult::Scheduled {
             thread_id,
             worker_queue_len,
         }
     }
 
-    fn refresh_available_execution_threads(&mut self) {
+    fn refresh_available_execution_threads(&mut self, account_locks: &ThreadAwareAccountLocks) {
         let mut available_threads = ThreadSet::none();
         for worker_index in 0..self.workers.len() {
             let in_flight_execution_count = self.in_flight_executions_per_thread[worker_index];
@@ -1023,11 +1031,14 @@ impl ExecutionDispatchContext<'_> {
                 in_flight_execution_count,
                 self.in_flight_execution_cost_units_per_thread[worker_index],
             );
+            let has_lock_capacity =
+                Self::worker_has_lock_capacity(account_locks.thread_total_lock_count(worker_index));
             let queue = &mut self.workers[worker_index].pack_to_worker;
             queue.sync();
             if queue.len() < queue.capacity()
                 && in_flight_execution_count < MAX_OUTSTANDING_EXECUTIONS_PER_WORKER
                 && has_cost_capacity
+                && has_lock_capacity
             {
                 available_threads.insert(worker_index);
             }
@@ -1040,6 +1051,7 @@ impl ExecutionDispatchContext<'_> {
         &mut self,
         thread_id: ThreadId,
         worker_queue_len: usize,
+        account_locks: &ThreadAwareAccountLocks,
     ) {
         let in_flight_execution_count = self.in_flight_executions_per_thread[thread_id];
         if worker_queue_len >= self.workers[thread_id].pack_to_worker.capacity()
@@ -1048,6 +1060,7 @@ impl ExecutionDispatchContext<'_> {
                 in_flight_execution_count,
                 self.in_flight_execution_cost_units_per_thread[thread_id],
             )
+            || !Self::worker_has_lock_capacity(account_locks.thread_total_lock_count(thread_id))
         {
             self.available_execution_threads.remove(thread_id);
         }
@@ -1059,6 +1072,10 @@ impl ExecutionDispatchContext<'_> {
     ) -> bool {
         in_flight_execution_count == 0
             || in_flight_cost_units < MAX_OUTSTANDING_EXECUTION_COST_UNITS_PER_WORKER
+    }
+
+    fn worker_has_lock_capacity(lock_count: u32) -> bool {
+        lock_count < MAX_OUTSTANDING_ACCOUNT_LOCKS_PER_WORKER
     }
 
     fn increment_in_flight_execution_messages(&mut self, thread_id: ThreadId, cost_units: u64) {
@@ -2239,7 +2256,6 @@ impl BlockVerificationScheduler {
         if !dispatch_context.has_capacity() {
             return 0;
         }
-        dispatch_context.refresh_available_execution_threads();
 
         let mut counts = ExecutionDispatchCounts::default();
         for state in self.scheduling_states.values_mut() {
@@ -2249,7 +2265,11 @@ impl BlockVerificationScheduler {
             {
                 break;
             }
-            let scheduling_start = state.has_transaction_scheduling_work().then(Instant::now);
+            let has_scheduling_work = state.has_transaction_scheduling_work();
+            if has_scheduling_work {
+                dispatch_context.refresh_available_execution_threads(&state.account_locks);
+            }
+            let scheduling_start = has_scheduling_work.then(Instant::now);
             let state_counts = state.service_transaction_execution_dispatches(
                 &mut dispatch_context,
                 max_executions - counts.scheduled,
@@ -3115,7 +3135,8 @@ mod tests {
         super::*,
         crate::setup::{
             BlockVerificationStageSessions, BlockVerificationStageSetupConfig,
-            BlockVerificationWorkerSession, ReplayEventBroadcast, ReplayStageSession,
+            BlockVerificationWorkerSession, CheckWorkerSession, ReplayEventBroadcast,
+            ReplayStageSession,
         },
         agave_scheduler_bindings::{
             ReplayToPackMessage, ReplayToPackMessagePayload, worker_message_types::cost_model_flags,
@@ -3357,6 +3378,31 @@ mod tests {
         }
 
         messages
+    }
+
+    fn read_check_worker_request(worker: &mut CheckWorkerSession) -> Option<PackToWorkerMessage> {
+        worker.requests.try_read()
+    }
+
+    fn queue_check_worker_result(
+        worker: &mut CheckWorkerSession,
+        worker_id: usize,
+        batch: SharableTransactionBatchRegion,
+        response: CheckResponse,
+    ) {
+        let responses =
+            resolve_responses_from_iter(&worker.allocator, [response].into_iter()).unwrap();
+        worker
+            .results
+            .try_write(CheckWorkerResult {
+                worker_id,
+                message: WorkerToPackMessage {
+                    batch,
+                    processed_code: processed_codes::PROCESSED,
+                    responses,
+                },
+            })
+            .unwrap();
     }
 
     fn queue_signature_verification_result(
@@ -5473,6 +5519,141 @@ mod tests {
     }
 
     #[test]
+    fn worker_execution_lock_limit_allows_one_transaction_over_cap() {
+        assert!(ExecutionDispatchContext::worker_has_lock_capacity(
+            MAX_OUTSTANDING_ACCOUNT_LOCKS_PER_WORKER - 1,
+        ));
+        assert!(!ExecutionDispatchContext::worker_has_lock_capacity(
+            MAX_OUTSTANDING_ACCOUNT_LOCKS_PER_WORKER,
+        ));
+    }
+
+    #[test]
+    fn execution_thread_selection_considers_locks_after_cost_before_count() {
+        let first_account = Pubkey::new_unique();
+        let second_account = Pubkey::new_unique();
+        let mut account_locks = ThreadAwareAccountLocks::new(2);
+        account_locks
+            .try_lock_accounts(
+                [&first_account].into_iter(),
+                std::iter::empty(),
+                ThreadSet::any(2),
+                |_| 0,
+            )
+            .unwrap();
+
+        assert_eq!(
+            select_execution_thread(ThreadSet::any(2), &[0, 0], &[0, 1], &account_locks),
+            0,
+            "cost should dominate lock count",
+        );
+        assert_eq!(
+            select_execution_thread(ThreadSet::any(2), &[10, 0], &[0, 0], &account_locks),
+            1,
+            "lock count should dominate tx count",
+        );
+
+        account_locks
+            .try_lock_accounts(
+                [&second_account].into_iter(),
+                std::iter::empty(),
+                ThreadSet::any(2),
+                |_| 1,
+            )
+            .unwrap();
+        assert_eq!(
+            select_execution_thread(ThreadSet::any(2), &[10, 0], &[0, 0], &account_locks),
+            1,
+            "tx count should break ties after lock count",
+        );
+    }
+
+    #[test]
+    fn execution_dispatch_is_bounded_by_worker_lock_count() {
+        let sessions = setup_sessions_with_config(BlockVerificationStageSetupConfig {
+            allocator_size: 64 * 1024 * 1024,
+            replay_to_pack_capacity: 128,
+            replay_block_status_capacity: 8,
+            worker_count: 1,
+            pack_to_worker_capacity: 128,
+            worker_to_pack_capacity: 128,
+        });
+        let exit = Arc::new(AtomicBool::new(false));
+        let mut scheduler = BlockVerificationScheduler::new(
+            exit,
+            sessions.block_verification_stage,
+            NonZeroUsize::new(1).unwrap(),
+            None,
+        );
+        let mut replay_stage = sessions.replay_stage;
+        let mut check_workers = sessions.check_workers;
+        let transaction_count = MAX_OUTSTANDING_ACCOUNT_LOCKS_PER_WORKER as usize + 1;
+        assert!(replay_stage.replay_to_pack.try_write(begin(42)).is_ok());
+        assert!(
+            replay_stage
+                .replay_to_pack
+                .try_write(entry(42, transaction_count as u32))
+                .is_ok()
+        );
+        for index in 0..transaction_count {
+            let transaction = allocate_minimal_transaction_region_with_account(
+                &replay_stage.allocator,
+                index as u8,
+                Pubkey::new_unique(),
+            );
+            assert!(
+                replay_stage
+                    .replay_to_pack
+                    .try_write(transaction_message(transaction))
+                    .is_ok()
+            );
+        }
+        replay_stage.replay_to_pack.commit();
+
+        assert_eq!(
+            scheduler.service_ingress_queue(transaction_count + 2),
+            transaction_count + 2,
+        );
+        assert_eq!(
+            scheduler.service_transaction_check_dispatches(1024),
+            transaction_count,
+        );
+        let mut check_message_count = 0;
+        while let Some(message) = read_check_worker_request(&mut check_workers[0]) {
+            queue_check_worker_result(
+                &mut check_workers[0],
+                0,
+                message.batch,
+                successful_check_response(),
+            );
+            check_message_count += 1;
+        }
+        assert_eq!(check_message_count, transaction_count);
+        assert_eq!(
+            scheduler.service_transaction_check_results(1024),
+            transaction_count,
+        );
+
+        assert_eq!(
+            scheduler.service_transaction_execution_dispatches(1024, 1024),
+            MAX_OUTSTANDING_ACCOUNT_LOCKS_PER_WORKER as usize,
+        );
+
+        let state = scheduler.scheduling_states.get(&42).unwrap();
+        assert_eq!(
+            state.account_locks.thread_total_lock_count(0),
+            MAX_OUTSTANDING_ACCOUNT_LOCKS_PER_WORKER,
+        );
+        assert!(
+            state
+                .ready_transactions
+                .iter()
+                .copied()
+                .eq(MAX_OUTSTANDING_ACCOUNT_LOCKS_PER_WORKER as usize..transaction_count)
+        );
+    }
+
+    #[test]
     fn execution_dispatch_does_not_rescan_deferred_ready_transactions_without_completion() {
         let (mut scheduler, mut replay_stage, mut workers) =
             setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
@@ -5763,16 +5944,17 @@ mod tests {
 
     #[test]
     fn execution_dispatch_is_bounded_by_worker_backlog() {
+        const PACK_TO_WORKER_CAPACITY: usize = 8;
         let (mut scheduler, mut replay_stage, mut workers) =
             setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
                 allocator_size: 64 * 1024 * 1024,
                 replay_to_pack_capacity: 512,
                 replay_block_status_capacity: 8,
                 worker_count: 2,
-                pack_to_worker_capacity: 512,
+                pack_to_worker_capacity: PACK_TO_WORKER_CAPACITY,
                 worker_to_pack_capacity: 512,
             });
-        let transaction_count = MAX_OUTSTANDING_EXECUTIONS_PER_WORKER * 2 + 8;
+        let transaction_count = PACK_TO_WORKER_CAPACITY * 2 + 8;
         assert!(replay_stage.replay_to_pack.try_write(begin(42)).is_ok());
         assert!(
             replay_stage
@@ -5814,19 +5996,16 @@ mod tests {
 
         assert_eq!(
             scheduler.service_transaction_execution_dispatches(1024, 1024),
-            MAX_OUTSTANDING_EXECUTIONS_PER_WORKER * 2,
+            PACK_TO_WORKER_CAPACITY * 2,
         );
 
         assert_eq!(
             scheduler.in_flight_execution_messages,
-            MAX_OUTSTANDING_EXECUTIONS_PER_WORKER * 2,
+            PACK_TO_WORKER_CAPACITY * 2,
         );
         assert_eq!(
             scheduler.in_flight_executions_per_thread,
-            vec![
-                MAX_OUTSTANDING_EXECUTIONS_PER_WORKER,
-                MAX_OUTSTANDING_EXECUTIONS_PER_WORKER,
-            ],
+            vec![PACK_TO_WORKER_CAPACITY, PACK_TO_WORKER_CAPACITY],
         );
         assert_eq!(
             scheduler.in_flight_execution_cost_units_per_thread,
@@ -5839,7 +6018,8 @@ mod tests {
     #[test]
     fn execution_dispatch_scan_limit_bounds_conflict_walk() {
         const SCAN_LIMIT: usize = 3;
-        const TRANSACTION_COUNT: usize = MAX_OUTSTANDING_EXECUTIONS_PER_WORKER + SCAN_LIMIT + 2;
+        const LOCK_LIMIT: usize = MAX_OUTSTANDING_ACCOUNT_LOCKS_PER_WORKER as usize;
+        const TRANSACTION_COUNT: usize = LOCK_LIMIT + SCAN_LIMIT + 2;
         let (mut scheduler, mut replay_stage, mut workers) =
             setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
                 allocator_size: 64 * 1024 * 1024,
@@ -5890,20 +6070,14 @@ mod tests {
         assert_eq!(scheduler.service_worker_responses(1024), TRANSACTION_COUNT);
 
         assert_eq!(
-            scheduler.service_transaction_execution_dispatches(
-                MAX_OUTSTANDING_EXECUTIONS_PER_WORKER,
-                MAX_OUTSTANDING_EXECUTIONS_PER_WORKER,
-            ),
-            MAX_OUTSTANDING_EXECUTIONS_PER_WORKER,
+            scheduler.service_transaction_execution_dispatches(LOCK_LIMIT, LOCK_LIMIT),
+            LOCK_LIMIT,
         );
         let mut execution_message_count = 0;
         while read_pack_to_worker_message(&mut workers[0]).is_some() {
             execution_message_count += 1;
         }
-        assert_eq!(
-            execution_message_count,
-            MAX_OUTSTANDING_EXECUTIONS_PER_WORKER,
-        );
+        assert_eq!(execution_message_count, LOCK_LIMIT);
         assert!(read_pack_to_worker_message(&mut workers[1]).is_none());
 
         assert_eq!(
@@ -5919,7 +6093,7 @@ mod tests {
                 .ready_transactions
                 .iter()
                 .copied()
-                .eq(MAX_OUTSTANDING_EXECUTIONS_PER_WORKER..TRANSACTION_COUNT)
+                .eq(LOCK_LIMIT..TRANSACTION_COUNT)
         );
     }
 
