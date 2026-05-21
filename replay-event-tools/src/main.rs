@@ -1832,6 +1832,7 @@ fn render_transactions(frame: &mut Frame<'_>, area: Rect, app: &App, snapshot: &
             Constraint::Length(10),
             Constraint::Length(9),
             Constraint::Length(9),
+            Constraint::Length(9),
             Constraint::Min(12),
         ],
     )
@@ -1847,6 +1848,7 @@ fn render_transactions(frame: &mut Frame<'_>, area: Rect, app: &App, snapshot: &
             "sched-wait",
             "exec-wait",
             "exec",
+            "ns/CU",
             "total",
             "signature",
         ])
@@ -1932,6 +1934,7 @@ fn transaction_table_row(transaction: &TransactionSummary, fresh_start: bool) ->
             .execution_duration_ns
             .map(format_duration_ns)
             .unwrap_or_else(|| "-".to_string()),
+        format_time_per_cost_unit_ns(transaction.execution_duration_ns, transaction.cost_units),
         transaction
             .duration_ns
             .map(format_duration_ns)
@@ -1950,6 +1953,7 @@ fn transaction_table_row(transaction: &TransactionSummary, fresh_start: bool) ->
 fn placeholder_transaction_row(label: &str) -> Row<'static> {
     Row::new([
         label.to_string(),
+        String::new(),
         String::new(),
         String::new(),
         String::new(),
@@ -2255,6 +2259,29 @@ fn format_optional_cost_units(value: Option<u64>) -> String {
     value
         .map(format_cost_units)
         .unwrap_or_else(|| "-".to_string())
+}
+
+fn format_time_per_cost_unit_ns(duration_ns: Option<u64>, cost_units: Option<u64>) -> String {
+    let Some(duration_ns) = duration_ns else {
+        return "-".to_string();
+    };
+    let Some(cost_units) = cost_units else {
+        return "-".to_string();
+    };
+    if cost_units == 0 {
+        return "-".to_string();
+    }
+
+    let ns_per_cost_unit = duration_ns as f64 / cost_units as f64;
+    if ns_per_cost_unit >= 1_000.0 {
+        format!("{:.1}k", ns_per_cost_unit / 1_000.0)
+    } else if ns_per_cost_unit >= 100.0 {
+        format!("{ns_per_cost_unit:.0}")
+    } else if ns_per_cost_unit >= 10.0 {
+        format!("{ns_per_cost_unit:.1}")
+    } else {
+        format!("{ns_per_cost_unit:.2}")
+    }
 }
 
 fn format_cost_units(value: u64) -> String {
@@ -3024,6 +3051,15 @@ mod tests {
         assert_eq!(format_optional_cost_units(Some(12_345)), "12.3k");
         assert_eq!(format_optional_cost_units(Some(1_000_000)), "1.0M");
         assert_eq!(format_optional_cost_units(Some(12_345_678)), "12.3M");
+    }
+
+    #[test]
+    fn time_per_cost_unit_formatter_uses_execution_duration_and_actual_cost_units() {
+        assert_eq!(format_time_per_cost_unit_ns(None, Some(10)), "-");
+        assert_eq!(format_time_per_cost_unit_ns(Some(10), None), "-");
+        assert_eq!(format_time_per_cost_unit_ns(Some(10), Some(0)), "-");
+        assert_eq!(format_time_per_cost_unit_ns(Some(80), Some(456)), "0.18");
+        assert_eq!(format_time_per_cost_unit_ns(Some(12_345), Some(1)), "12.3k");
     }
 
     #[test]
