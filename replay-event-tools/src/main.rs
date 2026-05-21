@@ -330,6 +330,7 @@ fn run_tui(store: &Arc<Mutex<EventStore>>, stats: &Arc<ReaderStats>) -> io::Resu
             ui_snapshot = snapshot(store, stats, app.selected_slot, app.selected_transaction);
         }
         app.bound_timeline_scrolls(&ui_snapshot);
+        store.lock().unwrap().pin_slot(app.selected_slot);
 
         terminal.draw(|frame| draw_ui(frame, &app, &ui_snapshot))?;
 
@@ -346,6 +347,7 @@ fn run_tui(store: &Arc<Mutex<EventStore>>, stats: &Arc<ReaderStats>) -> io::Resu
             if handle_key_events(&mut app, keys, &ui_snapshot) {
                 break;
             }
+            store.lock().unwrap().pin_slot(app.selected_slot);
         }
     }
     terminal.show_cursor()

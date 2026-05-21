@@ -7,6 +7,7 @@ use {
 
 pub(crate) struct EventStore {
     max_slots: usize,
+    pinned_slot: Option<u64>,
     slots: BTreeMap<u64, SlotRecord>,
     active_slots: BTreeMap<u64, ActiveSlotTracker>,
 }
@@ -51,9 +52,18 @@ impl EventStore {
         assert!(max_slots > 0, "must retain at least one slot");
         Self {
             max_slots,
+            pinned_slot: None,
             slots: BTreeMap::new(),
             active_slots: BTreeMap::new(),
         }
+    }
+
+    pub(crate) fn pin_slot(&mut self, pinned_slot: Option<u64>) {
+        if self.pinned_slot == pinned_slot {
+            return;
+        }
+        self.pinned_slot = pinned_slot;
+        self.prune_old_slots();
     }
 
     pub(crate) fn apply_event(&mut self, event: ReplayEvent) {
@@ -124,10 +134,22 @@ impl EventStore {
     }
 
     fn prune_old_slots(&mut self) {
-        while self.slots.len() > self.max_slots {
-            let Some(slot) = self.slots.keys().next().copied() else {
-                break;
-            };
+        let Some(oldest_retained_slot) = self
+            .slots
+            .keys()
+            .rev()
+            .nth(self.max_slots.saturating_sub(1))
+            .copied()
+        else {
+            return;
+        };
+        let old_slots = self
+            .slots
+            .keys()
+            .copied()
+            .filter(|slot| *slot < oldest_retained_slot && Some(*slot) != self.pinned_slot)
+            .collect::<Vec<_>>();
+        for slot in old_slots {
             self.slots.remove(&slot);
             self.active_slots.remove(&slot);
         }
@@ -596,6 +618,24 @@ mod tests {
         assert_eq!(store.slot_ids(), [11, 12]);
         assert!(store.slot(10).is_none());
         assert_eq!(store.active_slot_stats(10).session_count, 0);
+    }
+
+    #[test]
+    fn prunes_slots_without_dropping_pinned_slot() {
+        let mut store = EventStore::new(2);
+
+        store.apply_event(ReplayEvent::slot_begin(1, 10));
+        store.apply_event(ReplayEvent::slot_begin(2, 11));
+        store.pin_slot(Some(10));
+        store.apply_event(ReplayEvent::slot_begin(3, 12));
+        store.apply_event(ReplayEvent::slot_begin(4, 13));
+
+        assert_eq!(store.slot_ids(), [10, 12, 13]);
+        assert!(store.slot(11).is_none());
+
+        store.pin_slot(Some(12));
+        assert_eq!(store.slot_ids(), [12, 13]);
+        assert!(store.slot(10).is_none());
     }
 
     #[test]
