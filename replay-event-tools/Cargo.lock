@@ -1108,7 +1108,7 @@ checksum = "5f179d4e11094a893b82fff208f74d448a7512f99f5a0acbd5c679b705f83ed9"
 [[package]]
 name = "shaq"
 version = "3.0.0"
-source = "git+https://github.com/apfitzge/shaq?branch=futex_and_broadcast#bea8ac097624f778fb70b548f7d2e2af09f1b373"
+source = "git+https://github.com/apfitzge/shaq?branch=futex_and_broadcast#a5a67f192b4370bb841f9d73e014019a3322a606"
 dependencies = [
  "libc",
 ]

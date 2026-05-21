@@ -6616,7 +6616,7 @@ dependencies = [
 [[package]]
 name = "shaq"
 version = "3.0.0"
-source = "git+https://github.com/apfitzge/shaq?branch=futex_and_broadcast#bea8ac097624f778fb70b548f7d2e2af09f1b373"
+source = "git+https://github.com/apfitzge/shaq?branch=futex_and_broadcast#a5a67f192b4370bb841f9d73e014019a3322a606"
 dependencies = [
  "libc",
 ]
