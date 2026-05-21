@@ -330,10 +330,16 @@ fn run_tui(store: &Arc<Mutex<EventStore>>, stats: &Arc<ReaderStats>) -> io::Resu
         terminal.draw(|frame| draw_ui(frame, &app, &ui_snapshot))?;
 
         if event::poll(Duration::from_millis(DEFAULT_UI_TICK_MS))? {
-            let Event::Key(key) = event::read()? else {
-                continue;
-            };
-            if key.kind == KeyEventKind::Press && handle_key(&mut app, key, &ui_snapshot) {
+            let mut keys = Vec::new();
+            loop {
+                if let Event::Key(key) = event::read()? {
+                    keys.push(key);
+                }
+                if !event::poll(Duration::ZERO)? {
+                    break;
+                }
+            }
+            if handle_key_events(&mut app, keys, &ui_snapshot) {
                 break;
             }
         }
@@ -1009,6 +1015,62 @@ fn handle_key(app: &mut App, key: KeyEvent, snapshot: &UiSnapshot) -> bool {
     false
 }
 
+fn handle_key_events(
+    app: &mut App,
+    keys: impl IntoIterator<Item = KeyEvent>,
+    snapshot: &UiSnapshot,
+) -> bool {
+    let mut pending_navigation = None;
+    for key in keys {
+        if !is_action_key(&key) {
+            continue;
+        }
+
+        if is_coalescible_navigation_key(&key) {
+            if pending_navigation
+                .as_ref()
+                .is_some_and(|pending| same_key_action(pending, &key))
+            {
+                pending_navigation = Some(key);
+            } else {
+                if let Some(pending_navigation) = pending_navigation.take() {
+                    if handle_key(app, pending_navigation, snapshot) {
+                        return true;
+                    }
+                }
+                pending_navigation = Some(key);
+            }
+            continue;
+        }
+
+        if let Some(pending_navigation) = pending_navigation.take() {
+            if handle_key(app, pending_navigation, snapshot) {
+                return true;
+            }
+        }
+        if handle_key(app, key, snapshot) {
+            return true;
+        }
+    }
+
+    pending_navigation.is_some_and(|key| handle_key(app, key, snapshot))
+}
+
+fn is_action_key(key: &KeyEvent) -> bool {
+    matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+}
+
+fn is_coalescible_navigation_key(key: &KeyEvent) -> bool {
+    matches!(
+        key.code,
+        KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown
+    )
+}
+
+fn same_key_action(left: &KeyEvent, right: &KeyEvent) -> bool {
+    left.code == right.code && left.modifiers == right.modifiers
+}
+
 impl App {
     fn set_focus(&mut self, focus: FocusPane) {
         self.focus = focus;
@@ -1467,7 +1529,7 @@ fn draw_ui(frame: &mut Frame<'_>, app: &App, snapshot: &UiSnapshot) {
         .split(frame.area());
     let body = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
         .split(layout[1]);
     let details = Layout::default()
         .direction(Direction::Vertical)
@@ -1755,7 +1817,7 @@ fn transaction_table_row(transaction: &TransactionSummary, fresh_start: bool) ->
             .duration_ns
             .map(format_duration_ns)
             .unwrap_or_else(|| "-".to_string()),
-        short_signature(&transaction.signature),
+        transaction.signature.clone(),
     ])
     .style(if fresh_start {
         Style::default()
@@ -2045,14 +2107,6 @@ where
     }
 }
 
-fn short_signature(signature: &str) -> String {
-    if signature == "<signature-pending>" || signature.len() <= 20 {
-        signature.to_string()
-    } else {
-        format!("{}..{}", &signature[..8], &signature[signature.len() - 8..])
-    }
-}
-
 fn format_optional_u64(value: Option<u64>) -> String {
     value
         .map(|value| value.to_string())
@@ -2225,6 +2279,49 @@ mod tests {
         app.page_up(&snapshot);
         assert_eq!(app.transaction_index, 0);
         assert_eq!(app.selected_transaction, Some(0));
+    }
+
+    #[test]
+    fn repeated_navigation_keys_are_coalesced_per_event_batch() {
+        let mut app = App {
+            selected_slot: Some(42),
+            selected_transaction: Some(0),
+            focus: FocusPane::Transactions,
+            ..App::default()
+        };
+        let snapshot = snapshot_with_transactions(&(0..15).collect::<Vec<_>>());
+
+        assert!(!handle_key_events(
+            &mut app,
+            [
+                key_event(KeyCode::Down),
+                key_event(KeyCode::Down),
+                key_event(KeyCode::Down),
+            ],
+            &snapshot,
+        ));
+        assert_eq!(app.transaction_index, 1);
+        assert_eq!(app.selected_transaction, Some(1));
+    }
+
+    #[test]
+    fn different_navigation_keys_are_not_coalesced_together() {
+        let mut app = App {
+            selected_slot: Some(42),
+            selected_transaction: Some(1),
+            transaction_index: 1,
+            focus: FocusPane::Transactions,
+            ..App::default()
+        };
+        let snapshot = snapshot_with_transactions(&(0..15).collect::<Vec<_>>());
+
+        assert!(!handle_key_events(
+            &mut app,
+            [key_event(KeyCode::Down), key_event(KeyCode::Up)],
+            &snapshot,
+        ));
+        assert_eq!(app.transaction_index, 1);
+        assert_eq!(app.selected_transaction, Some(1));
     }
 
     #[test]
@@ -3265,5 +3362,9 @@ mod tests {
             active_pending_transactions: 0,
             status: "running",
         }
+    }
+
+    fn key_event(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
     }
 }
