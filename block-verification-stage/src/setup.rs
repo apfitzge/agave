@@ -209,6 +209,14 @@ impl ReplayEventBuffer {
         }
 
         event.timestamp_ns = replay_event_timestamp_ns();
+        self.push_timestamped(event);
+    }
+
+    pub fn push_timestamped(&mut self, event: ReplayEvent) {
+        if self.broadcast.is_none() {
+            return;
+        }
+
         self.events.push(event);
     }
 

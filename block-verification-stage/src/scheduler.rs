@@ -3,6 +3,7 @@ use {
         entry_hash_verifier::{
             EntryHashVerificationResult, EntryHashVerificationTask, EntryHashVerifier,
         },
+        replay_event_timestamp::replay_event_timestamp_ns,
         setup::{
             BlockVerificationStageSession, BlockVerificationStageWorkerSession, CheckWorkerResult,
             ReplayEventBroadcast, ReplayEventBuffer, SignatureVerificationRequest,
@@ -418,7 +419,7 @@ impl SchedulingState {
         dispatch_context: &mut ExecutionDispatchContext<'_>,
     ) -> ReadyTransactionDispatchResult {
         let slot = self.slot;
-        let (thread_id, worker_queue_len) = {
+        let (thread_id, worker_queue_len, timestamp_ns) = {
             let transaction = self
                 .transactions
                 .get(transaction_index)
@@ -459,7 +460,8 @@ impl SchedulingState {
                 ExecutionDispatchResult::Scheduled {
                     thread_id,
                     worker_queue_len,
-                } => (thread_id, worker_queue_len),
+                    timestamp_ns,
+                } => (thread_id, worker_queue_len, timestamp_ns),
                 ExecutionDispatchResult::AccountConflict => {
                     transaction.record_unschedulable_locks(
                         &mut self.unschedulable_read_locks,
@@ -494,6 +496,7 @@ impl SchedulingState {
             thread_id,
             worker_queue_len,
             unscheduled_ready_transactions_ahead,
+            timestamp_ns,
         );
         ReadyTransactionDispatchResult::Scheduled
     }
@@ -908,6 +911,7 @@ enum ExecutionDispatchResult {
     Scheduled {
         thread_id: ThreadId,
         worker_queue_len: usize,
+        timestamp_ns: u64,
     },
     Unavailable,
 }
@@ -939,10 +943,11 @@ impl ExecutionDispatchContext<'_> {
         worker_id: ThreadId,
         worker_queue_len: usize,
         unscheduled_ready_transactions_ahead: usize,
+        timestamp_ns: u64,
     ) {
         self.event_buffer
-            .push(ReplayEvent::transaction_worker_dispatch_event(
-                0,
+            .push_timestamped(ReplayEvent::transaction_worker_dispatch_event(
+                timestamp_ns,
                 tag,
                 slot,
                 u64::try_from(transaction_index).expect("transaction index must fit in u64"),
@@ -1017,6 +1022,7 @@ impl ExecutionDispatchContext<'_> {
             max_working_slot: slot,
             batch,
         };
+        let timestamp_ns = replay_event_timestamp_ns();
         let write_result = {
             let queue = &mut self.workers[thread_id].pack_to_worker;
             match queue.try_write(message) {
@@ -1050,6 +1056,7 @@ impl ExecutionDispatchContext<'_> {
         ExecutionDispatchResult::Scheduled {
             thread_id,
             worker_queue_len,
+            timestamp_ns,
         }
     }
 
@@ -1605,9 +1612,10 @@ impl BlockVerificationScheduler {
         slot: u64,
         transaction_index: usize,
         signature_verification_queue_len: usize,
+        timestamp_ns: u64,
     ) {
-        event_buffer.push(ReplayEvent::transaction_signatures_submitted(
-            0,
+        event_buffer.push_timestamped(ReplayEvent::transaction_signatures_submitted(
+            timestamp_ns,
             slot,
             u64::try_from(transaction_index).expect("transaction index must fit in u64"),
             u64::try_from(signature_verification_queue_len)
@@ -1620,9 +1628,10 @@ impl BlockVerificationScheduler {
         slot: u64,
         transaction_index: usize,
         check_queue_len: usize,
+        timestamp_ns: u64,
     ) {
-        event_buffer.push(ReplayEvent::transaction_sent_for_check(
-            0,
+        event_buffer.push_timestamped(ReplayEvent::transaction_sent_for_check(
+            timestamp_ns,
             slot,
             u64::try_from(transaction_index).expect("transaction index must fit in u64"),
             u64::try_from(check_queue_len).expect("check queue length must fit in u64"),
@@ -2001,6 +2010,7 @@ impl BlockVerificationScheduler {
                     max_working_slot: slot,
                     batch,
                 };
+                let timestamp_ns = replay_event_timestamp_ns();
                 if let Err(returned_message) = check_requests.try_write(message) {
                     Self::free_transaction_batch_allocation_with_allocator(
                         allocator,
@@ -2018,6 +2028,7 @@ impl BlockVerificationScheduler {
                     slot,
                     pending_check.transaction_index,
                     *in_flight_transaction_checks,
+                    timestamp_ns,
                 );
                 dispatched += 1;
             }
@@ -2057,6 +2068,7 @@ impl BlockVerificationScheduler {
                 };
                 let request =
                     Self::signature_verification_request(allocator, state, pending_request);
+                let timestamp_ns = replay_event_timestamp_ns();
                 if signature_verification_requests.try_write(request).is_err() {
                     event_buffer.flush();
                     return submitted;
@@ -2070,6 +2082,7 @@ impl BlockVerificationScheduler {
                     slot,
                     pending_request.transaction_index,
                     *in_flight_signature_verifications,
+                    timestamp_ns,
                 );
                 submitted += 1;
             }
