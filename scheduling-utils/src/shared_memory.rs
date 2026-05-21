@@ -14,8 +14,8 @@ const HUGE_PAGE_SIZE: usize = 2 * 1024 * 1024;
 const REGULAR_PAGE_SIZE: usize = 4096;
 const COOPERATIVE_DESCRIPTOR_CAPACITY: usize = 4096;
 
-pub type MpmcProducer<T> = shaq::mpmc::Producer<T>;
-pub type MpmcConsumer<T> = shaq::mpmc::Consumer<T>;
+pub type MpmcProducer<T> = shaq::mpmc::CooperativeProducer<T>;
+pub type MpmcConsumer<T> = shaq::mpmc::CooperativeConsumer<T>;
 pub type BroadcastProducer<T> = shaq::broadcast::CooperativeProducer<T>;
 pub type BroadcastConsumer<T> = shaq::broadcast::CooperativeConsumer<T>;
 
@@ -114,10 +114,17 @@ pub fn create_mpmc_queue_pair<T>(
 ) -> Result<(MpmcProducer<T>, MpmcConsumer<T>), SharedMemoryError> {
     let create = |huge: bool| {
         let file = create_shmem(name, huge)?;
-        let minimum_file_size = shaq::mpmc::minimum_file_size::<T>(capacity);
+        let options = shaq::mpmc::Options::new()
+            .with_cooperative_descriptor_capacity(cooperative_descriptor_capacity(capacity));
+        let minimum_file_size = shaq::mpmc::minimum_file_size_for_mode::<
+            T,
+            { shaq::mpmc::MODE_COOPERATIVE },
+        >(capacity, options);
         let file_size = align_file_size(minimum_file_size, huge);
-        let producer = unsafe { shaq::mpmc::Producer::create(&file, file_size) }?;
-        let consumer = unsafe { shaq::mpmc::Consumer::join(&file) }?;
+        let producer = unsafe {
+            shaq::mpmc::CooperativeProducer::create_with_options(&file, file_size, options)
+        }?;
+        let consumer = unsafe { shaq::mpmc::CooperativeConsumer::join(&file) }?;
 
         Ok((producer, consumer))
     };
