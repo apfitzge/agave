@@ -98,6 +98,8 @@ struct UiSnapshot {
 struct SlotSummary {
     slot: u64,
     transaction_count: usize,
+    estimated_cost_units: Option<u64>,
+    cost_units: Option<u64>,
     duration_ns: Option<u64>,
     active_duration_ns: Option<u64>,
     active_session_count: usize,
@@ -408,6 +410,8 @@ fn snapshot(
             Some(SlotSummary {
                 slot,
                 transaction_count: slot_record.transactions.len(),
+                estimated_cost_units: slot_estimated_cost_units(slot_record),
+                cost_units: slot_cost_units(slot_record),
                 duration_ns: slot_record.duration_ns(),
                 active_duration_ns: selected_slot_summary
                     .and_then(|selected_slot| selected_slot.active_duration_ns)
@@ -589,6 +593,28 @@ fn transaction_estimated_cost_units(transaction: &TransactionRecord) -> Option<u
 
 fn transaction_cost_units(transaction: &TransactionRecord) -> Option<u64> {
     transaction.events.iter().find_map(ReplayEvent::cost_units)
+}
+
+fn slot_estimated_cost_units(slot: &store::SlotRecord) -> Option<u64> {
+    sum_slot_transaction_values(slot, transaction_estimated_cost_units)
+}
+
+fn slot_cost_units(slot: &store::SlotRecord) -> Option<u64> {
+    sum_slot_transaction_values(slot, transaction_cost_units)
+}
+
+fn sum_slot_transaction_values(
+    slot: &store::SlotRecord,
+    value: impl Fn(&TransactionRecord) -> Option<u64>,
+) -> Option<u64> {
+    let mut total = 0u64;
+    let mut has_value = false;
+    for value in slot.transactions.values().filter_map(value) {
+        total = total.saturating_add(value);
+        has_value = true;
+    }
+
+    has_value.then_some(total)
 }
 
 fn transaction_check_wait_ns(transaction: &TransactionRecord) -> Option<u64> {
@@ -1513,7 +1539,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App, snapshot: &UiSnap
 
 fn render_slots(frame: &mut Frame<'_>, area: Rect, app: &App, snapshot: &UiSnapshot) {
     let rows = if snapshot.slots.is_empty() {
-        vec![Row::new(["waiting", "", "", "", "", ""])]
+        vec![Row::new(["waiting", "", "", "", "", "", "", ""])]
     } else {
         snapshot
             .slots
@@ -1522,6 +1548,8 @@ fn render_slots(frame: &mut Frame<'_>, area: Rect, app: &App, snapshot: &UiSnaps
                 Row::new([
                     Cell::from(slot.slot.to_string()),
                     Cell::from(slot.transaction_count.to_string()),
+                    Cell::from(format_optional_cost_units(slot.estimated_cost_units)),
+                    Cell::from(format_optional_cost_units(slot.cost_units)),
                     Cell::from(
                         slot.duration_ns
                             .map(format_duration_ns)
@@ -1551,6 +1579,8 @@ fn render_slots(frame: &mut Frame<'_>, area: Rect, app: &App, snapshot: &UiSnaps
         [
             Constraint::Length(12),
             Constraint::Length(7),
+            Constraint::Length(10),
+            Constraint::Length(10),
             Constraint::Length(12),
             Constraint::Length(12),
             Constraint::Length(8),
@@ -1558,7 +1588,10 @@ fn render_slots(frame: &mut Frame<'_>, area: Rect, app: &App, snapshot: &UiSnaps
         ],
     )
     .header(
-        Row::new(["slot", "txs", "block", "active", "sessions", "status"]).style(
+        Row::new([
+            "slot", "txs", "est CUs", "cost CUs", "block", "active", "sessions", "status",
+        ])
+        .style(
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -2024,6 +2057,22 @@ fn format_optional_u64(value: Option<u64>) -> String {
     value
         .map(|value| value.to_string())
         .unwrap_or_else(|| "-".to_string())
+}
+
+fn format_optional_cost_units(value: Option<u64>) -> String {
+    value
+        .map(format_cost_units)
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn format_cost_units(value: u64) -> String {
+    if value >= 1_000_000 {
+        format!("{:.1}M", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}k", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
+    }
 }
 
 fn format_duration_ns(ns: u64) -> String {
@@ -2681,6 +2730,65 @@ mod tests {
     }
 
     #[test]
+    fn cost_unit_formatter_uses_compact_suffixes() {
+        assert_eq!(format_optional_cost_units(None), "-");
+        assert_eq!(format_optional_cost_units(Some(999)), "999");
+        assert_eq!(format_optional_cost_units(Some(1_000)), "1.0k");
+        assert_eq!(format_optional_cost_units(Some(12_345)), "12.3k");
+        assert_eq!(format_optional_cost_units(Some(1_000_000)), "1.0M");
+        assert_eq!(format_optional_cost_units(Some(12_345_678)), "12.3M");
+    }
+
+    #[test]
+    fn slot_cost_unit_summaries_sum_transaction_costs() {
+        let slot = store::SlotRecord {
+            slot: 42,
+            slot_events: vec![ReplayEvent::slot_begin(0, 42)],
+            transactions: std::collections::BTreeMap::from([
+                (
+                    1,
+                    TransactionRecord {
+                        index: 1,
+                        signature: None,
+                        events: vec![
+                            ReplayEvent::transaction_check_passed(10, 42, 1, 0, 100),
+                            ReplayEvent::transaction_execution_result(
+                                20,
+                                replay_event_tags::TRANSACTION_FINISHED_EXEC,
+                                42,
+                                1,
+                                0,
+                                70,
+                            ),
+                        ],
+                    },
+                ),
+                (
+                    2,
+                    TransactionRecord {
+                        index: 2,
+                        signature: None,
+                        events: vec![
+                            ReplayEvent::transaction_check_passed(30, 42, 2, 0, 200),
+                            ReplayEvent::transaction_execution_result(
+                                40,
+                                replay_event_tags::TRANSACTION_FINISHED_EXEC,
+                                42,
+                                2,
+                                0,
+                                80,
+                            ),
+                        ],
+                    },
+                ),
+            ]),
+        };
+
+        assert_eq!(slot_estimated_cost_units(&slot), Some(300));
+        assert_eq!(slot_cost_units(&slot), Some(150));
+    }
+
+    #[test]
     fn active_sessions_wait_for_signature_verification_after_execution() {
         let slot = store::SlotRecord {
             slot: 42,
@@ -3149,6 +3257,8 @@ mod tests {
         SlotSummary {
             slot,
             transaction_count: 0,
+            estimated_cost_units: None,
+            cost_units: None,
             duration_ns: None,
             active_duration_ns: None,
             active_session_count: 0,
