@@ -40,7 +40,7 @@ use {
     solana_metrics::datapoint_info,
     solana_pubkey::{Pubkey, PubkeyHasherBuilder},
     std::{
-        collections::{HashMap, HashSet, VecDeque},
+        collections::{HashSet, VecDeque},
         hash::BuildHasher,
         num::NonZeroUsize,
         sync::{
@@ -141,8 +141,7 @@ pub struct BlockVerificationScheduler {
     exit: Arc<AtomicBool>,
     session: BlockVerificationStageSession,
     event_broadcast: Option<Arc<ReplayEventBroadcast>>,
-    scheduling_states: HashMap<u64, SchedulingState>,
-    slot_order: Vec<u64>,
+    scheduling_states: VecDeque<SchedulingState>,
     scheduling_state_pool: Vec<SchedulingState>,
     terminal_slot_queue: VecDeque<u64>,
     pending_entry: Option<PendingEntryIngress>,
@@ -753,6 +752,32 @@ impl SchedulingState {
             );
         }
     }
+}
+
+fn find_scheduling_state(
+    states: &VecDeque<SchedulingState>,
+    slot: u64,
+) -> Option<&SchedulingState> {
+    states.iter().find(|state| state.slot == slot)
+}
+
+fn find_scheduling_state_mut(
+    states: &mut VecDeque<SchedulingState>,
+    slot: u64,
+) -> Option<&mut SchedulingState> {
+    states.iter_mut().find(|state| state.slot == slot)
+}
+
+fn remove_scheduling_state(
+    states: &mut VecDeque<SchedulingState>,
+    slot: u64,
+) -> Option<SchedulingState> {
+    if states.front().is_some_and(|state| state.slot == slot) {
+        return states.pop_front();
+    }
+
+    let index = states.iter().position(|state| state.slot == slot)?;
+    states.remove(index)
 }
 
 fn select_execution_thread(
@@ -1465,8 +1490,7 @@ impl BlockVerificationScheduler {
             exit,
             session,
             event_broadcast,
-            scheduling_states: HashMap::new(),
-            slot_order: Vec::new(),
+            scheduling_states: VecDeque::new(),
             scheduling_state_pool: Vec::new(),
             terminal_slot_queue: VecDeque::new(),
             pending_entry: None,
@@ -1653,7 +1677,7 @@ impl BlockVerificationScheduler {
     }
 
     fn update_slot_work_timings(&mut self, now: Instant) {
-        for state in self.scheduling_states.values_mut() {
+        for state in self.scheduling_states.iter_mut() {
             state.update_work_timing(now);
         }
     }
@@ -1740,16 +1764,17 @@ impl BlockVerificationScheduler {
 
     fn handle_entry_verification_result(&mut self, result: EntryHashVerificationResult) {
         let slot = result.slot;
-        let should_record_failure = if let Some(state) = self.scheduling_states.get_mut(&slot) {
-            state.entry_verification.pending_jobs = state
-                .entry_verification
-                .pending_jobs
-                .checked_sub(1)
-                .expect("entry verification result without pending job");
-            !result.is_valid
-        } else {
-            false
-        };
+        let should_record_failure =
+            if let Some(state) = find_scheduling_state_mut(&mut self.scheduling_states, slot) {
+                state.entry_verification.pending_jobs = state
+                    .entry_verification
+                    .pending_jobs
+                    .checked_sub(1)
+                    .expect("entry verification result without pending job");
+                !result.is_valid
+            } else {
+                false
+            };
 
         if should_record_failure {
             self.mark_slot_failed(slot, replay_block_status_reasons::INVALID_ENTRY_HASH);
@@ -1778,9 +1803,7 @@ impl BlockVerificationScheduler {
             if let Some(status) = self.try_finish_terminal_slot(slot) {
                 self.send_replay_block_status(status);
                 cleaned += 1;
-            } else if self
-                .scheduling_states
-                .get(&slot)
+            } else if find_scheduling_state(&self.scheduling_states, slot)
                 .is_some_and(|state| state.terminal_status.is_some())
             {
                 self.terminal_slot_queue.push_back(slot);
@@ -1805,7 +1828,7 @@ impl BlockVerificationScheduler {
 
     fn handle_bank_begin(&mut self, slot: u64, bank_id: u64, last_entry_hash: Hash) {
         assert!(
-            !self.scheduling_states.contains_key(&slot),
+            find_scheduling_state(&self.scheduling_states, slot).is_none(),
             "slot already has scheduling state: {slot}",
         );
 
@@ -1816,19 +1839,12 @@ impl BlockVerificationScheduler {
             .unwrap_or_else(|| SchedulingState::new(slot, bank_id, last_entry_hash, worker_count));
         state.reset_for_slot(slot, bank_id, last_entry_hash, worker_count);
 
-        let previous = self.scheduling_states.insert(slot, state);
-        assert!(
-            previous.is_none(),
-            "slot already has scheduling state: {slot}"
-        );
-        self.insert_slot_order(slot);
+        self.scheduling_states.push_back(state);
         self.emit_slot_event(replay_event_tags::SLOT_BEGIN, slot);
     }
 
     fn handle_bank_complete(&mut self, slot: u64) {
-        let state = self
-            .scheduling_states
-            .get_mut(&slot)
+        let state = find_scheduling_state_mut(&mut self.scheduling_states, slot)
             .expect("complete received for unknown slot");
         assert!(
             !state.ingress_complete,
@@ -1907,8 +1923,7 @@ impl BlockVerificationScheduler {
         };
 
         let transaction_index = self
-            .scheduling_states
-            .get(&slot)
+            .scheduling_state(slot)
             .expect("replay ingress received for unknown slot")
             .transactions
             .len();
@@ -1956,10 +1971,8 @@ impl BlockVerificationScheduler {
         let in_flight_transaction_checks = &mut self.in_flight_transaction_checks;
         let scheduling_states = &mut self.scheduling_states;
         let mut dispatched = 0;
-        for slot in self.slot_order.iter().copied() {
-            let Some(state) = scheduling_states.get_mut(&slot) else {
-                continue;
-            };
+        for state in scheduling_states.iter_mut() {
+            let slot = state.slot;
             if !state.allows_transaction_processing() {
                 continue;
             }
@@ -2017,10 +2030,8 @@ impl BlockVerificationScheduler {
         let in_flight_signature_verifications = &mut self.in_flight_signature_verifications;
         let scheduling_states = &mut self.scheduling_states;
         let mut submitted = 0;
-        for slot in self.slot_order.iter().copied() {
-            let Some(state) = scheduling_states.get_mut(&slot) else {
-                continue;
-            };
+        for state in scheduling_states.iter_mut() {
+            let slot = state.slot;
             if !state.allows_transaction_processing() {
                 continue;
             }
@@ -2103,7 +2114,7 @@ impl BlockVerificationScheduler {
             .checked_sub(1)
             .expect("signature verification result without global in-flight verification");
         let transaction_state_to_free = {
-            let Some(state) = self.scheduling_states.get_mut(&slot) else {
+            let Some(state) = find_scheduling_state_mut(&mut self.scheduling_states, slot) else {
                 return;
             };
             state.in_flight_signature_verifications = state
@@ -2121,28 +2132,6 @@ impl BlockVerificationScheduler {
         if !verified {
             self.mark_slot_failed(slot, replay_block_status_reasons::INVALID_TRANSACTION);
         }
-    }
-
-    fn insert_slot_order(&mut self, slot: u64) {
-        assert!(
-            !self.slot_order.contains(&slot),
-            "slot already present in block verification slot order",
-        );
-        let slot_index = self
-            .slot_order
-            .iter()
-            .position(|ordered_slot| *ordered_slot > slot)
-            .unwrap_or(self.slot_order.len());
-        self.slot_order.insert(slot_index, slot);
-    }
-
-    fn remove_slot_order(&mut self, slot: u64) {
-        let slot_index = self
-            .slot_order
-            .iter()
-            .position(|ordered_slot| *ordered_slot == slot)
-            .expect("slot missing from block verification slot order");
-        self.slot_order.remove(slot_index);
     }
 
     fn allocate_transaction_check_batch(
@@ -2231,7 +2220,7 @@ impl BlockVerificationScheduler {
         }
 
         let mut counts = ExecutionDispatchCounts::default();
-        for state in self.scheduling_states.values_mut() {
+        for state in self.scheduling_states.iter_mut() {
             if counts.scheduled == max_executions
                 || counts.scanned == max_scanned_transactions
                 || !dispatch_context.has_capacity()
@@ -2334,7 +2323,9 @@ impl BlockVerificationScheduler {
             let worker_check = self.worker_check_metadata(message.batch);
             self.free_transaction_batch_allocation(message.batch);
             self.decrement_in_flight_worker_messages(worker_check.slot);
-            if let Some(state) = self.scheduling_states.get_mut(&worker_check.slot) {
+            if let Some(state) =
+                find_scheduling_state_mut(&mut self.scheduling_states, worker_check.slot)
+            {
                 if !state.allows_transaction_processing() {
                     return;
                 }
@@ -2572,7 +2563,7 @@ impl BlockVerificationScheduler {
         slot: u64,
         transaction_index: usize,
     ) -> bool {
-        self.scheduling_states.get(&slot).is_some_and(|state| {
+        find_scheduling_state(&self.scheduling_states, slot).is_some_and(|state| {
             state.transaction_has_pending_signature_verification(transaction_index)
         })
     }
@@ -2595,9 +2586,7 @@ impl BlockVerificationScheduler {
         mut check_response: CheckResponse,
     ) {
         let slot = worker_check.slot;
-        let should_retain = self
-            .scheduling_states
-            .get(&slot)
+        let should_retain = find_scheduling_state(&self.scheduling_states, slot)
             .is_some_and(|state| state.allows_transaction_processing());
 
         if !should_retain {
@@ -2666,7 +2655,7 @@ impl BlockVerificationScheduler {
     }
 
     fn decrement_in_flight_worker_messages(&mut self, slot: u64) {
-        if let Some(state) = self.scheduling_states.get_mut(&slot) {
+        if let Some(state) = find_scheduling_state_mut(&mut self.scheduling_states, slot) {
             state.in_flight_worker_messages = state
                 .in_flight_worker_messages
                 .checked_sub(1)
@@ -2766,22 +2755,23 @@ impl BlockVerificationScheduler {
     }
 
     fn is_slot_accepting_work(&self, slot: u64) -> bool {
-        self.scheduling_states
-            .get(&slot)
+        self.scheduling_state(slot)
             .expect("replay ingress received for unknown slot")
             .accepts_ingress()
     }
 
     fn is_slot_ingress_complete(&self, slot: u64) -> bool {
-        self.scheduling_states
-            .get(&slot)
+        self.scheduling_state(slot)
             .expect("replay ingress received for unknown slot")
             .ingress_complete
     }
 
+    fn scheduling_state(&self, slot: u64) -> Option<&SchedulingState> {
+        find_scheduling_state(&self.scheduling_states, slot)
+    }
+
     fn scheduling_state_mut(&mut self, slot: u64) -> &mut SchedulingState {
-        self.scheduling_states
-            .get_mut(&slot)
+        find_scheduling_state_mut(&mut self.scheduling_states, slot)
             .expect("replay ingress received for unknown slot")
     }
 
@@ -2790,7 +2780,7 @@ impl BlockVerificationScheduler {
     }
 
     fn try_finish_terminal_slot(&mut self, slot: u64) -> Option<FinishedSlotStatus> {
-        let state = self.scheduling_states.get(&slot)?;
+        let state = find_scheduling_state(&self.scheduling_states, slot)?;
         let terminal_status = state.terminal_status?;
         if self
             .pending_entry
@@ -2816,8 +2806,7 @@ impl BlockVerificationScheduler {
             return None;
         }
 
-        let mut state = self.scheduling_states.remove(&slot).unwrap();
-        self.remove_slot_order(slot);
+        let mut state = remove_scheduling_state(&mut self.scheduling_states, slot).unwrap();
         state.update_work_timing(Instant::now());
         self.report_slot_work_timing(&state, terminal_status);
         self.free_scheduling_state_allocations(&mut state);
@@ -3036,7 +3025,7 @@ impl BlockVerificationScheduler {
     }
 
     fn mark_slot_failed(&mut self, slot: u64, reason: u16) {
-        let Some(state) = self.scheduling_states.get_mut(&slot) else {
+        let Some(state) = find_scheduling_state_mut(&mut self.scheduling_states, slot) else {
             return;
         };
         match state.terminal_status {
@@ -3059,7 +3048,7 @@ impl BlockVerificationScheduler {
     }
 
     fn mark_slot_terminal(&mut self, slot: u64, terminal_status: SlotTerminalStatus) {
-        let Some(state) = self.scheduling_states.get_mut(&slot) else {
+        let Some(state) = find_scheduling_state_mut(&mut self.scheduling_states, slot) else {
             return;
         };
         match state.terminal_status {
@@ -3746,9 +3735,7 @@ mod tests {
     fn wait_for_entry_verification(scheduler: &mut BlockVerificationScheduler, slot: u64) {
         for _ in 0..1000 {
             scheduler.service_entry_verification_results(1024);
-            if scheduler
-                .scheduling_states
-                .get(&slot)
+            if find_scheduling_state(&scheduler.scheduling_states, slot)
                 .is_none_or(|state| state.entry_verification.pending_jobs == 0)
             {
                 return;
@@ -3882,9 +3869,7 @@ mod tests {
         );
 
         assert_eq!(scheduler.service_ingress_queue(2), 2);
-        let stats = &scheduler
-            .scheduling_states
-            .get(&42)
+        let stats = &find_scheduling_state(&scheduler.scheduling_states, 42)
             .unwrap()
             .entry_ingest_latency;
         assert_eq!(stats.count, 1);
@@ -3916,9 +3901,7 @@ mod tests {
 
         assert_eq!(scheduler.service_ingress_queue(2), 2);
         assert_eq!(
-            scheduler
-                .scheduling_states
-                .get(&42)
+            find_scheduling_state(&scheduler.scheduling_states, 42)
                 .unwrap()
                 .entry_ingest_latency
                 .count,
@@ -3927,9 +3910,7 @@ mod tests {
 
         assert_eq!(scheduler.service_ingress_queue(1), 1);
         assert_eq!(
-            scheduler
-                .scheduling_states
-                .get(&42)
+            find_scheduling_state(&scheduler.scheduling_states, 42)
                 .unwrap()
                 .entry_ingest_latency
                 .count,
@@ -3937,9 +3918,7 @@ mod tests {
         );
 
         assert_eq!(scheduler.service_ingress_queue(1), 1);
-        let stats = &scheduler
-            .scheduling_states
-            .get(&42)
+        let stats = &find_scheduling_state(&scheduler.scheduling_states, 42)
             .unwrap()
             .entry_ingest_latency;
         assert_eq!(stats.count, 1);
@@ -3989,9 +3968,7 @@ mod tests {
 
         assert_eq!(scheduler.service_ingress_queue(3), 3);
         assert!(
-            scheduler
-                .scheduling_states
-                .get(&42)
+            find_scheduling_state(&scheduler.scheduling_states, 42)
                 .unwrap()
                 .work_timing
                 .is_active()
@@ -4022,7 +3999,9 @@ mod tests {
 
         scheduler.update_slot_work_timings(Instant::now());
 
-        let timing = &scheduler.scheduling_states.get(&42).unwrap().work_timing;
+        let timing = &find_scheduling_state(&scheduler.scheduling_states, 42)
+            .unwrap()
+            .work_timing;
         assert!(!timing.is_active());
         assert_eq!(timing.active_periods, 1);
     }
@@ -4033,12 +4012,12 @@ mod tests {
         write_replay_messages(&mut replay_stage, [begin(1), begin(2), begin(3)]);
 
         assert_eq!(scheduler.service_ingress_queue(2), 2);
-        assert!(scheduler.scheduling_states.contains_key(&1));
-        assert!(scheduler.scheduling_states.contains_key(&2));
-        assert!(!scheduler.scheduling_states.contains_key(&3));
+        assert!(find_scheduling_state(&scheduler.scheduling_states, 1).is_some());
+        assert!(find_scheduling_state(&scheduler.scheduling_states, 2).is_some());
+        assert!(find_scheduling_state(&scheduler.scheduling_states, 3).is_none());
 
         assert_eq!(scheduler.service_ingress_queue(1), 1);
-        assert!(scheduler.scheduling_states.contains_key(&3));
+        assert!(find_scheduling_state(&scheduler.scheduling_states, 3).is_some());
     }
 
     #[test]
@@ -4059,33 +4038,33 @@ mod tests {
 
         assert_eq!(scheduler.service_ingress_queue(2), 2);
         assert!(scheduler.pending_entry.is_some());
-        let state = scheduler.scheduling_states.get(&42).unwrap();
+        let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         assert!(state.entry_headers.is_empty());
         assert!(state.transactions.is_empty());
-        assert!(!scheduler.scheduling_states.contains_key(&43));
+        assert!(find_scheduling_state(&scheduler.scheduling_states, 43).is_none());
 
         assert_eq!(scheduler.service_ingress_queue(1), 1);
         assert!(scheduler.pending_entry.is_some());
-        let state = scheduler.scheduling_states.get(&42).unwrap();
+        let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         assert!(state.entry_headers.is_empty());
         assert!(
             transaction_state_regions(&scheduler.session.allocator, &state.transactions)
                 .eq([first_transaction])
         );
-        assert!(!scheduler.scheduling_states.contains_key(&43));
+        assert!(find_scheduling_state(&scheduler.scheduling_states, 43).is_none());
 
         assert_eq!(scheduler.service_ingress_queue(1), 1);
         assert!(scheduler.pending_entry.is_none());
-        let state = scheduler.scheduling_states.get(&42).unwrap();
+        let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         assert_eq!(state.entry_headers.len(), 1);
         assert!(
             transaction_state_regions(&scheduler.session.allocator, &state.transactions)
                 .eq([first_transaction, second_transaction])
         );
-        assert!(!scheduler.scheduling_states.contains_key(&43));
+        assert!(find_scheduling_state(&scheduler.scheduling_states, 43).is_none());
 
         assert_eq!(scheduler.service_ingress_queue(1), 1);
-        assert!(scheduler.scheduling_states.contains_key(&43));
+        assert!(find_scheduling_state(&scheduler.scheduling_states, 43).is_some());
     }
 
     #[test]
@@ -4104,8 +4083,8 @@ mod tests {
         );
 
         assert_eq!(scheduler.service_ingress_queue(5), 5);
-        let state_1 = scheduler.scheduling_states.get(&1).unwrap();
-        let state_2 = scheduler.scheduling_states.get(&2).unwrap();
+        let state_1 = find_scheduling_state(&scheduler.scheduling_states, 1).unwrap();
+        let state_2 = find_scheduling_state(&scheduler.scheduling_states, 2).unwrap();
         assert_eq!(state_1.entry_headers.len(), 1);
         assert!(state_1.transactions.is_empty());
         assert_eq!(state_2.entry_headers.len(), 1);
@@ -4203,7 +4182,7 @@ mod tests {
             );
         }
 
-        let state = scheduler.scheduling_states.get(&42).unwrap();
+        let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         assert!(state.pending_transaction_checks.is_empty());
         assert_eq!(state.in_flight_worker_messages, 2);
     }
@@ -4267,13 +4246,13 @@ mod tests {
             );
         }
 
-        let state = scheduler.scheduling_states.get(&42).unwrap();
+        let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         assert!(state.pending_transaction_checks.is_empty());
         assert_eq!(state.in_flight_worker_messages, TRANSACTION_COUNT);
     }
 
     #[test]
-    fn transaction_checks_iterate_ordered_slot_list() {
+    fn transaction_checks_iterate_ingress_slot_order() {
         let (mut scheduler, mut replay_stage, mut check_workers) =
             setup_scheduler_replay_stage_and_check_workers(BlockVerificationStageSetupConfig {
                 allocator_size: 64 * 1024 * 1024,
@@ -4300,18 +4279,25 @@ mod tests {
         );
 
         assert_eq!(scheduler.service_ingress_queue(9), 9);
-        assert_eq!(scheduler.slot_order, vec![41, 42, 43]);
+        assert_eq!(
+            scheduler
+                .scheduling_states
+                .iter()
+                .map(|state| state.slot)
+                .collect::<Vec<_>>(),
+            vec![43, 41, 42]
+        );
         assert_eq!(scheduler.service_transaction_check_dispatches(2), 2);
 
         let first_message = read_check_worker_request(&mut check_workers[0]).unwrap();
         let second_message = read_check_worker_request(&mut check_workers[0]).unwrap();
         assert_eq!(
             transaction_check_metadata(&replay_stage.allocator, first_message.batch).slot,
-            41,
+            43,
         );
         assert_eq!(
             transaction_check_metadata(&replay_stage.allocator, second_message.batch).slot,
-            42,
+            41,
         );
         assert!(read_check_worker_request(&mut check_workers[0]).is_none());
 
@@ -4319,7 +4305,7 @@ mod tests {
         let third_message = read_check_worker_request(&mut check_workers[0]).unwrap();
         assert_eq!(
             transaction_check_metadata(&replay_stage.allocator, third_message.batch).slot,
-            43,
+            42,
         );
     }
 
@@ -4349,7 +4335,7 @@ mod tests {
 
         assert_eq!(scheduler.service_worker_responses(1), 1);
 
-        let state = scheduler.scheduling_states.get(&42).unwrap();
+        let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         assert_eq!(state.in_flight_worker_messages, 0);
         assert!(
             transaction_state_regions(&scheduler.session.allocator, &state.transactions)
@@ -4399,7 +4385,7 @@ mod tests {
 
         assert_eq!(scheduler.service_worker_responses(1), 1);
 
-        let state = scheduler.scheduling_states.get(&42).unwrap();
+        let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         let (_, resolved_pubkeys, check_response) = checked_transaction_state(state, 0);
         let scheduling_metadata = checked_transaction_scheduling_metadata(state, 0);
         assert!(resolved_pubkeys.is_none());
@@ -4460,7 +4446,7 @@ mod tests {
         ));
         scheduler.free_transaction_state_allocations(previous_transaction_state);
 
-        let state = scheduler.scheduling_states.get(&42).unwrap();
+        let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         assert!(matches!(
             state.transactions.get(0).unwrap(),
             TransactionState::Executed,
@@ -4627,7 +4613,7 @@ mod tests {
             },
         );
 
-        let state = scheduler.scheduling_states.get(&42).unwrap();
+        let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         assert!(state.ready_transactions.is_empty());
         assert_eq!(state.in_flight_execution_messages, 1);
         assert_eq!(scheduler.in_flight_execution_messages, 1);
@@ -4663,20 +4649,18 @@ mod tests {
         );
         assert_eq!(scheduler.service_worker_responses(1), 1);
         {
-            let state = scheduler.scheduling_states.get(&42).unwrap();
+            let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
             assert_eq!(state.completed_work_to_schedule_latency.count, 0);
             assert!(state.completed_work_to_schedule_start.is_none());
         }
         assert_eq!(scheduler.service_transaction_execution_dispatches(1, 1), 1);
         {
-            let state = scheduler.scheduling_states.get(&42).unwrap();
+            let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
             assert_eq!(state.completed_work_to_schedule_latency.count, 0);
             assert!(state.completed_work_to_schedule_start.is_none());
         }
         assert_eq!(
-            scheduler
-                .scheduling_states
-                .get(&42)
+            find_scheduling_state(&scheduler.scheduling_states, 42)
                 .unwrap()
                 .transaction_ingest_to_execution_latency
                 .count,
@@ -4691,7 +4675,7 @@ mod tests {
         );
         assert_eq!(scheduler.service_worker_responses(1), 1);
 
-        let state = scheduler.scheduling_states.get(&42).unwrap();
+        let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         assert_eq!(state.in_flight_execution_messages, 0);
         assert_eq!(scheduler.in_flight_execution_messages, 0);
         assert_eq!(scheduler.in_flight_executions_per_thread, vec![0]);
@@ -4712,7 +4696,7 @@ mod tests {
         );
         queue_signature_verification_result(&scheduler, 42, 0, true);
         assert_eq!(scheduler.service_signature_verification_results(1024), 1);
-        let state = scheduler.scheduling_states.get(&42).unwrap();
+        let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         assert!(matches!(
             state.transactions.get(0).unwrap(),
             TransactionState::Executed,
@@ -5231,7 +5215,7 @@ mod tests {
         );
         assert_eq!(scheduler.service_worker_responses(1), 1);
 
-        let state = scheduler.scheduling_states.get(&42).unwrap();
+        let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         assert_eq!(
             state.terminal_status,
             Some(SlotTerminalStatus::Failed(
@@ -5250,7 +5234,7 @@ mod tests {
         );
         assert_eq!(scheduler.service_worker_responses(1), 1);
         assert_eq!(scheduler.service_terminal_slots(1), 1);
-        assert!(!scheduler.scheduling_states.contains_key(&42));
+        assert!(find_scheduling_state(&scheduler.scheduling_states, 42).is_none());
         assert_eq!(
             read_replay_block_status(&mut replay_stage),
             Some(ReplayBlockStatusMessage {
@@ -5493,7 +5477,7 @@ mod tests {
             vec![MAX_OUTSTANDING_EXECUTION_COST_UNITS_PER_WORKER],
         );
 
-        let state = scheduler.scheduling_states.get(&42).unwrap();
+        let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         assert!(state.ready_transactions.iter().copied().eq(2..3));
     }
 
@@ -5634,7 +5618,7 @@ mod tests {
             MAX_OUTSTANDING_ACCOUNT_LOCKS_PER_WORKER as usize,
         );
 
-        let state = scheduler.scheduling_states.get(&42).unwrap();
+        let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         assert_eq!(
             state.account_locks.thread_total_lock_count(0),
             MAX_OUTSTANDING_ACCOUNT_LOCKS_PER_WORKER,
@@ -5700,7 +5684,7 @@ mod tests {
         assert!(read_pack_to_worker_message(&mut workers[1]).is_none());
 
         {
-            let state = scheduler.scheduling_states.get(&42).unwrap();
+            let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
             assert!(state.ready_transactions.iter().copied().eq([1, 2]));
             assert_eq!(state.ready_scan_cursor, 2);
             assert!(state.unschedulable_write_locks.contains(&account));
@@ -5709,7 +5693,7 @@ mod tests {
         assert_eq!(scheduler.service_transaction_execution_dispatches(3, 3), 0);
         assert!(read_pack_to_worker_message(&mut workers[0]).is_none());
         assert!(read_pack_to_worker_message(&mut workers[1]).is_none());
-        let state = scheduler.scheduling_states.get(&42).unwrap();
+        let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         assert!(state.ready_transactions.iter().copied().eq([1, 2]));
         assert_eq!(state.ready_scan_cursor, 2);
     }
@@ -5768,7 +5752,7 @@ mod tests {
         );
 
         {
-            let state = scheduler.scheduling_states.get(&42).unwrap();
+            let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
             assert!(state.ready_transactions.iter().copied().eq([1]));
             assert_eq!(state.ready_scan_cursor, 1);
             assert!(state.unschedulable_write_locks.contains(&account));
@@ -5782,7 +5766,7 @@ mod tests {
         );
         assert_eq!(scheduler.service_worker_responses(1), 1);
         {
-            let state = scheduler.scheduling_states.get(&42).unwrap();
+            let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
             assert!(state.ready_transactions.iter().copied().eq([1, 2]));
             assert_eq!(state.ready_scan_cursor, 1);
         }
@@ -5790,7 +5774,7 @@ mod tests {
         assert_eq!(scheduler.service_transaction_execution_dispatches(3, 1), 0);
         assert!(read_pack_to_worker_message(&mut workers[0]).is_none());
         assert!(read_pack_to_worker_message(&mut workers[1]).is_none());
-        let state = scheduler.scheduling_states.get(&42).unwrap();
+        let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         assert!(state.ready_transactions.iter().copied().eq([1, 2]));
         assert_eq!(state.ready_scan_cursor, 2);
     }
@@ -5838,7 +5822,7 @@ mod tests {
         assert_eq!(scheduler.service_transaction_execution_dispatches(2, 2), 1);
         let first_execution = read_pack_to_worker_message(&mut workers[0]).unwrap();
         {
-            let state = scheduler.scheduling_states.get(&42).unwrap();
+            let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
             assert!(state.ready_transactions.iter().copied().eq([1]));
             assert_eq!(state.ready_scan_cursor, 1);
             assert!(state.unschedulable_write_locks.contains(&account));
@@ -5851,7 +5835,7 @@ mod tests {
         );
         assert_eq!(scheduler.service_worker_responses(1), 1);
         {
-            let state = scheduler.scheduling_states.get(&42).unwrap();
+            let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
             assert!(state.ready_transactions.iter().copied().eq([1]));
             assert_eq!(state.ready_scan_cursor, 0);
             assert!(state.unschedulable_read_locks.is_empty());
@@ -5867,7 +5851,7 @@ mod tests {
                 .transaction_index,
             1,
         );
-        let state = scheduler.scheduling_states.get(&42).unwrap();
+        let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         assert_eq!(state.completed_work_to_schedule_latency.count, 1);
         assert!(state.completed_work_to_schedule_start.is_none());
     }
@@ -6006,7 +5990,7 @@ mod tests {
             scheduler.in_flight_execution_cost_units_per_thread,
             vec![0, 0],
         );
-        let state = scheduler.scheduling_states.get(&42).unwrap();
+        let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         assert_eq!(state.ready_transactions.len(), 8);
     }
 
@@ -6082,7 +6066,7 @@ mod tests {
         assert!(read_pack_to_worker_message(&mut workers[0]).is_none());
         assert!(read_pack_to_worker_message(&mut workers[1]).is_none());
 
-        let state = scheduler.scheduling_states.get(&42).unwrap();
+        let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         assert!(
             state
                 .ready_transactions
@@ -6209,7 +6193,7 @@ mod tests {
 
         assert_eq!(scheduler.service_worker_responses(2), 2);
 
-        let state = scheduler.scheduling_states.get(&42).unwrap();
+        let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         assert!(state.ready_transactions.iter().copied().eq([0]));
         assert_eq!(state.next_ready_transaction_index, 1);
         assert_eq!(state.in_flight_worker_messages, 2);
@@ -6217,7 +6201,7 @@ mod tests {
         queue_worker_check_response(&mut workers[1], worker_1.batch, successful_check_response());
         assert_eq!(scheduler.service_worker_responses(2), 2);
 
-        let state = scheduler.scheduling_states.get(&42).unwrap();
+        let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         assert!(state.ready_transactions.iter().copied().eq([0, 1, 2, 3]));
         assert_eq!(state.next_ready_transaction_index, 4);
         assert_eq!(state.in_flight_worker_messages, 0);
@@ -6251,7 +6235,7 @@ mod tests {
 
         assert_eq!(scheduler.service_worker_responses(1), 1);
 
-        let state = scheduler.scheduling_states.get(&42).unwrap();
+        let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         assert_eq!(state.in_flight_worker_messages, 0);
         assert_eq!(
             state.terminal_status,
@@ -6264,13 +6248,13 @@ mod tests {
 
         wait_for_entry_verification(&mut scheduler, 42);
         assert_eq!(scheduler.service_terminal_slots(1), 0);
-        assert!(scheduler.scheduling_states.contains_key(&42));
+        assert!(find_scheduling_state(&scheduler.scheduling_states, 42).is_some());
         assert_eq!(read_replay_block_status(&mut replay_stage), None);
 
         write_replay_messages(&mut replay_stage, [complete(42)]);
         assert_eq!(scheduler.service_ingress_queue(1), 1);
         assert_eq!(scheduler.service_terminal_slots(1), 1);
-        assert!(!scheduler.scheduling_states.contains_key(&42));
+        assert!(find_scheduling_state(&scheduler.scheduling_states, 42).is_none());
         assert_eq!(
             read_replay_block_status(&mut replay_stage),
             Some(ReplayBlockStatusMessage {
@@ -6318,7 +6302,7 @@ mod tests {
         );
         assert_eq!(scheduler.service_worker_responses(1), 1);
 
-        let state = scheduler.scheduling_states.get(&42).unwrap();
+        let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         assert_eq!(
             state.terminal_status,
             Some(SlotTerminalStatus::Failed(
@@ -6331,7 +6315,7 @@ mod tests {
         assert_eq!(read_replay_block_status(&mut replay_stage), None);
 
         wait_for_entry_verification(&mut scheduler, 42);
-        let state = scheduler.scheduling_states.get(&42).unwrap();
+        let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         assert_eq!(state.entry_verification.pending_jobs, 0);
         assert_eq!(state.in_flight_worker_messages, 1);
         assert_eq!(scheduler.service_terminal_slots(1), 0);
@@ -6344,7 +6328,7 @@ mod tests {
         );
         assert_eq!(scheduler.service_worker_responses(1), 1);
         assert_eq!(scheduler.service_terminal_slots(1), 1);
-        assert!(!scheduler.scheduling_states.contains_key(&42));
+        assert!(find_scheduling_state(&scheduler.scheduling_states, 42).is_none());
         assert_eq!(
             read_replay_block_status(&mut replay_stage),
             Some(ReplayBlockStatusMessage {
@@ -6387,7 +6371,7 @@ mod tests {
 
         assert_eq!(scheduler.service_worker_responses(1), 1);
 
-        let state = scheduler.scheduling_states.get(&42).unwrap();
+        let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         assert_eq!(state.in_flight_worker_messages, 0);
         assert_eq!(
             state.terminal_status,
@@ -6399,7 +6383,7 @@ mod tests {
 
         wait_for_entry_verification(&mut scheduler, 42);
         assert_eq!(scheduler.service_terminal_slots(1), 1);
-        assert!(!scheduler.scheduling_states.contains_key(&42));
+        assert!(find_scheduling_state(&scheduler.scheduling_states, 42).is_none());
         assert_eq!(
             read_replay_block_status(&mut replay_stage),
             Some(ReplayBlockStatusMessage {
@@ -6442,7 +6426,7 @@ mod tests {
 
         assert_eq!(scheduler.service_worker_responses(1), 1);
 
-        let state = scheduler.scheduling_states.get(&42).unwrap();
+        let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         assert_eq!(state.in_flight_worker_messages, 0);
         assert_eq!(
             state.terminal_status,
@@ -6454,7 +6438,7 @@ mod tests {
 
         wait_for_entry_verification(&mut scheduler, 42);
         assert_eq!(scheduler.service_terminal_slots(1), 1);
-        assert!(!scheduler.scheduling_states.contains_key(&42));
+        assert!(find_scheduling_state(&scheduler.scheduling_states, 42).is_none());
         assert_eq!(
             read_replay_block_status(&mut replay_stage),
             Some(ReplayBlockStatusMessage {
@@ -6556,7 +6540,7 @@ mod tests {
         assert_eq!(scheduler.service_ingress_queue(2), 2);
         wait_for_entry_verification(&mut scheduler, 42);
 
-        let state = scheduler.scheduling_states.get(&42).unwrap();
+        let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         assert_eq!(state.entry_verification.pending_jobs, 0);
         assert_eq!(state.terminal_status, None);
         assert_eq!(read_replay_block_status(&mut replay_stage), None);
@@ -6568,13 +6552,13 @@ mod tests {
         write_replay_messages(&mut replay_stage, [begin(42), complete(42)]);
 
         assert_eq!(scheduler.service_ingress_queue(2), 2);
-        let state = scheduler.scheduling_states.get(&42).unwrap();
+        let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         assert!(state.ingress_complete);
         assert_eq!(state.terminal_status, Some(SlotTerminalStatus::Success));
         assert_eq!(read_replay_block_status(&mut replay_stage), None);
 
         assert_eq!(scheduler.service_terminal_slots(1), 1);
-        assert!(!scheduler.scheduling_states.contains_key(&42));
+        assert!(find_scheduling_state(&scheduler.scheduling_states, 42).is_none());
         assert_eq!(
             read_replay_block_status(&mut replay_stage),
             Some(ReplayBlockStatusMessage {
@@ -6628,7 +6612,7 @@ mod tests {
         );
 
         assert_eq!(scheduler.service_ingress_queue(3), 3);
-        let state = scheduler.scheduling_states.get(&42).unwrap();
+        let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         assert_eq!(state.terminal_status, Some(SlotTerminalStatus::Success));
         assert_eq!(state.entry_verification.pending_jobs, 1);
         assert_eq!(scheduler.service_terminal_slots(1), 0);
@@ -6636,7 +6620,7 @@ mod tests {
 
         wait_for_entry_verification(&mut scheduler, 42);
         assert_eq!(scheduler.service_terminal_slots(1), 1);
-        assert!(!scheduler.scheduling_states.contains_key(&42));
+        assert!(find_scheduling_state(&scheduler.scheduling_states, 42).is_none());
         assert_eq!(
             read_replay_block_status(&mut replay_stage),
             Some(ReplayBlockStatusMessage {
@@ -6710,7 +6694,7 @@ mod tests {
         );
         assert_eq!(scheduler.service_worker_responses(1), 1);
         assert_eq!(scheduler.service_terminal_slots(1), 1);
-        assert!(!scheduler.scheduling_states.contains_key(&42));
+        assert!(find_scheduling_state(&scheduler.scheduling_states, 42).is_none());
         assert_eq!(
             read_replay_block_status(&mut replay_stage),
             Some(ReplayBlockStatusMessage {
@@ -6745,7 +6729,7 @@ mod tests {
         assert_eq!(scheduler.service_ingress_queue(2), 2);
         wait_for_entry_verification(&mut scheduler, 42);
 
-        let state = scheduler.scheduling_states.get(&42).unwrap();
+        let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         assert_eq!(state.entry_verification.pending_jobs, 0);
         assert_eq!(
             state.terminal_status,
@@ -6756,11 +6740,11 @@ mod tests {
         assert_eq!(read_replay_block_status(&mut replay_stage), None);
 
         assert_eq!(scheduler.service_terminal_slots(1), 0);
-        assert!(scheduler.scheduling_states.contains_key(&42));
+        assert!(find_scheduling_state(&scheduler.scheduling_states, 42).is_some());
         write_replay_messages(&mut replay_stage, [complete(42)]);
         assert_eq!(scheduler.service_ingress_queue(1), 1);
         assert_eq!(scheduler.service_terminal_slots(1), 1);
-        assert!(!scheduler.scheduling_states.contains_key(&42));
+        assert!(find_scheduling_state(&scheduler.scheduling_states, 42).is_none());
         assert_eq!(
             read_replay_block_status(&mut replay_stage),
             Some(ReplayBlockStatusMessage {
@@ -6789,7 +6773,7 @@ mod tests {
         assert_eq!(scheduler.service_ingress_queue(3), 3);
         wait_for_entry_verification(&mut scheduler, 42);
 
-        let state = scheduler.scheduling_states.get(&42).unwrap();
+        let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         assert_eq!(state.last_entry_hash, second_entry_hash);
         assert_eq!(state.entry_verification.pending_jobs, 0);
         assert_eq!(state.terminal_status, None);
@@ -6814,7 +6798,7 @@ mod tests {
         );
 
         assert_eq!(scheduler.service_ingress_queue(4), 4);
-        let state = scheduler.scheduling_states.get(&42).unwrap();
+        let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         assert_eq!(state.terminal_status, Some(SlotTerminalStatus::Aborted));
         assert_eq!(state.entry_verification.pending_jobs, 1);
         assert!(scheduler.scheduling_state_pool.is_empty());
@@ -6822,7 +6806,7 @@ mod tests {
 
         wait_for_entry_verification(&mut scheduler, 42);
         assert_eq!(scheduler.service_terminal_slots(1), 1);
-        assert!(!scheduler.scheduling_states.contains_key(&42));
+        assert!(find_scheduling_state(&scheduler.scheduling_states, 42).is_none());
         assert_eq!(scheduler.scheduling_state_pool.len(), 1);
         assert!(scheduler.scheduling_state_pool[0].entry_headers.is_empty());
         assert!(scheduler.scheduling_state_pool[0].transactions.is_empty());
@@ -6841,21 +6825,19 @@ mod tests {
         let (mut scheduler, mut replay_stage) = setup_scheduler_and_replay_stage();
         write_replay_messages(&mut replay_stage, [begin(42)]);
         assert_eq!(scheduler.service_ingress_queue(1), 1);
-        scheduler
-            .scheduling_states
-            .get_mut(&42)
+        find_scheduling_state_mut(&mut scheduler.scheduling_states, 42)
             .unwrap()
             .in_flight_worker_messages = 1;
 
         write_replay_messages(&mut replay_stage, [abort(42)]);
         assert_eq!(scheduler.service_ingress_queue(1), 1);
-        let state = scheduler.scheduling_states.get(&42).unwrap();
+        let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         assert_eq!(state.terminal_status, Some(SlotTerminalStatus::Aborted));
         assert_eq!(state.in_flight_worker_messages, 1);
         assert!(scheduler.scheduling_state_pool.is_empty());
         assert_eq!(read_replay_block_status(&mut replay_stage), None);
         assert_eq!(scheduler.service_terminal_slots(1), 0);
-        assert!(scheduler.scheduling_states.contains_key(&42));
+        assert!(find_scheduling_state(&scheduler.scheduling_states, 42).is_some());
 
         let dropped_transaction = allocate_transaction(&replay_stage.allocator, &[9, 10, 11]);
         write_replay_messages(
@@ -6871,17 +6853,15 @@ mod tests {
             ],
         );
         assert_eq!(scheduler.service_ingress_queue(2), 2);
-        let state = scheduler.scheduling_states.get(&42).unwrap();
+        let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         assert!(state.entry_headers.is_empty());
         assert!(state.transactions.is_empty());
 
-        scheduler
-            .scheduling_states
-            .get_mut(&42)
+        find_scheduling_state_mut(&mut scheduler.scheduling_states, 42)
             .unwrap()
             .in_flight_worker_messages = 0;
         assert_eq!(scheduler.service_terminal_slots(1), 1);
-        assert!(!scheduler.scheduling_states.contains_key(&42));
+        assert!(find_scheduling_state(&scheduler.scheduling_states, 42).is_none());
         assert_eq!(scheduler.scheduling_state_pool.len(), 1);
         assert_eq!(
             read_replay_block_status(&mut replay_stage),
@@ -6923,7 +6903,7 @@ mod tests {
         assert_eq!(scheduler.service_ingress_queue(1), 1);
         wait_for_entry_verification(&mut scheduler, 42);
         assert_eq!(scheduler.service_terminal_slots(1), 0);
-        assert!(scheduler.scheduling_states.contains_key(&42));
+        assert!(find_scheduling_state(&scheduler.scheduling_states, 42).is_some());
         assert_eq!(read_replay_block_status(&mut replay_stage), None);
 
         queue_worker_check_response(
@@ -6934,7 +6914,7 @@ mod tests {
         assert_eq!(scheduler.service_worker_responses(1), 1);
         assert_eq!(scheduler.service_terminal_slots(1), 1);
 
-        assert!(!scheduler.scheduling_states.contains_key(&42));
+        assert!(find_scheduling_state(&scheduler.scheduling_states, 42).is_none());
         assert_eq!(
             read_replay_block_status(&mut replay_stage),
             Some(ReplayBlockStatusMessage {
@@ -6988,7 +6968,7 @@ mod tests {
         write_replay_messages(&mut replay_stage, [abort(42)]);
         assert_eq!(scheduler.service_ingress_queue(1), 1);
         assert_eq!(scheduler.service_terminal_slots(1), 0);
-        assert!(scheduler.scheduling_states.contains_key(&42));
+        assert!(find_scheduling_state(&scheduler.scheduling_states, 42).is_some());
         assert_eq!(read_replay_block_status(&mut replay_stage), None);
 
         queue_worker_execution_response(
@@ -6999,7 +6979,7 @@ mod tests {
         assert_eq!(scheduler.service_worker_responses(1), 1);
         assert_eq!(scheduler.service_terminal_slots(1), 1);
 
-        assert!(!scheduler.scheduling_states.contains_key(&42));
+        assert!(find_scheduling_state(&scheduler.scheduling_states, 42).is_none());
         assert_eq!(
             read_replay_block_status(&mut replay_stage),
             Some(ReplayBlockStatusMessage {
@@ -7016,7 +6996,7 @@ mod tests {
         write_replay_messages(&mut replay_stage, [begin(42), entry(42, 0), abort(42)]);
         assert_eq!(scheduler.service_ingress_queue(3), 3);
         assert_eq!(scheduler.service_terminal_slots(1), 0);
-        assert!(scheduler.scheduling_states.contains_key(&42));
+        assert!(find_scheduling_state(&scheduler.scheduling_states, 42).is_some());
         assert!(scheduler.scheduling_state_pool.is_empty());
         wait_for_entry_verification(&mut scheduler, 42);
         assert_eq!(scheduler.service_terminal_slots(1), 1);
@@ -7049,7 +7029,7 @@ mod tests {
         assert_eq!(scheduler.service_ingress_queue(1), 1);
 
         assert!(scheduler.scheduling_state_pool.is_empty());
-        let state = scheduler.scheduling_states.get(&43).unwrap();
+        let state = find_scheduling_state(&scheduler.scheduling_states, 43).unwrap();
         assert_eq!(state.slot, 43);
         assert!(state.entry_headers.is_empty());
         assert!(state.transactions.is_empty());
@@ -7086,7 +7066,7 @@ mod tests {
         write_replay_messages(&mut replay_stage, [begin(42)]);
         assert_eq!(scheduler.service_ingress_queue(1), 1);
         {
-            let state = scheduler.scheduling_states.get_mut(&42).unwrap();
+            let state = find_scheduling_state_mut(&mut scheduler.scheduling_states, 42).unwrap();
             state.entry_headers.reserve(oversized_capacity);
             state.transactions.reserve(oversized_capacity);
             state.pending_transaction_checks.reserve(oversized_capacity);
