@@ -1929,7 +1929,10 @@ pub(crate) mod external {
 
         fn install_replay_event_broadcast(
             worker: &mut ExternalWorker,
-        ) -> (shaq::broadcast::Consumer<ReplayEvent>, tempfile::TempDir) {
+        ) -> (
+            shared_memory::BroadcastConsumer<ReplayEvent>,
+            tempfile::TempDir,
+        ) {
             let temp_dir = tempfile::tempdir().unwrap();
             let event_broadcast = ReplayEventBroadcast::new(temp_dir.path()).unwrap();
             let mut event_consumer =
@@ -1942,7 +1945,7 @@ pub(crate) mod external {
         }
 
         fn drain_replay_events(
-            event_consumer: &mut shaq::broadcast::Consumer<ReplayEvent>,
+            event_consumer: &mut shared_memory::BroadcastConsumer<ReplayEvent>,
         ) -> Vec<ReplayEvent> {
             let mut events = Vec::new();
             while let Some(event) = event_consumer.try_read(Ordering::Relaxed).unwrap() {

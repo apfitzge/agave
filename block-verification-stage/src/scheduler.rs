@@ -3220,7 +3220,7 @@ mod tests {
         BlockVerificationScheduler,
         ReplayStageSession,
         Vec<BlockVerificationWorkerSession>,
-        shaq::broadcast::Consumer<ReplayEvent>,
+        shared_memory::BroadcastConsumer<ReplayEvent>,
         tempfile::TempDir,
     ) {
         let sessions = setup_sessions_with_config(config);
@@ -3248,7 +3248,7 @@ mod tests {
     }
 
     fn drain_replay_events(
-        event_consumer: &mut shaq::broadcast::Consumer<ReplayEvent>,
+        event_consumer: &mut shared_memory::BroadcastConsumer<ReplayEvent>,
     ) -> Vec<ReplayEvent> {
         let mut events = Vec::new();
         while let Some(event) = event_consumer.try_read(Ordering::Relaxed).unwrap() {

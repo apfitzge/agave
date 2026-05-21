@@ -16,6 +16,10 @@ use {
     },
 };
 
+type MpmcProducer<T> = shared_memory::MpmcProducer<T>;
+type MpmcConsumer<T> = shared_memory::MpmcConsumer<T>;
+type BroadcastProducer<T> = shared_memory::BroadcastProducer<T>;
+
 const SESSION_ALLOCATOR_HANDLES: usize = 2;
 const ALLOCATOR_SLAB_SIZE: u32 = 2 * 1024 * 1024;
 const REPLAY_EVENT_CAPACITY: usize = 1024 * 1024;
@@ -46,10 +50,10 @@ pub struct BlockVerificationStageSession {
     pub replay_to_pack: shaq::spsc::Consumer<ReplayToPackMessage>,
     pub replay_block_status: shaq::spsc::Producer<ReplayBlockStatusMessage>,
     pub workers: Vec<BlockVerificationStageWorkerSession>,
-    pub check_requests: shaq::mpmc::Producer<PackToWorkerMessage>,
-    pub check_results: shaq::mpmc::Consumer<CheckWorkerResult>,
-    pub signature_verification_requests: shaq::mpmc::Producer<SignatureVerificationRequest>,
-    pub signature_verification_results: shaq::mpmc::Consumer<SignatureVerificationResult>,
+    pub check_requests: MpmcProducer<PackToWorkerMessage>,
+    pub check_results: MpmcConsumer<CheckWorkerResult>,
+    pub signature_verification_requests: MpmcProducer<SignatureVerificationRequest>,
+    pub signature_verification_results: MpmcConsumer<SignatureVerificationResult>,
 }
 
 /// Scheduler-owned queue handles for one block verification worker.
@@ -75,15 +79,15 @@ pub struct BlockVerificationWorkerSession {
 /// Check-worker-owned queue and allocator handles.
 pub struct CheckWorkerSession {
     pub allocator: Allocator,
-    pub requests: shaq::mpmc::Consumer<PackToWorkerMessage>,
-    pub results: shaq::mpmc::Producer<CheckWorkerResult>,
+    pub requests: MpmcConsumer<PackToWorkerMessage>,
+    pub results: MpmcProducer<CheckWorkerResult>,
 }
 
 /// Sigverify-worker-owned queue and read-only allocator handles.
 pub struct SignatureVerificationWorkerSession {
     pub allocator: FreeOnlyAllocator,
-    pub requests: shaq::mpmc::Consumer<SignatureVerificationRequest>,
-    pub results: shaq::mpmc::Producer<SignatureVerificationResult>,
+    pub requests: MpmcConsumer<SignatureVerificationRequest>,
+    pub results: MpmcProducer<SignatureVerificationResult>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,7 +140,7 @@ pub struct BlockVerificationStageSessions {
 /// Locally created replay event broadcast.
 pub struct ReplayEventBroadcast {
     path: PathBuf,
-    producer: shaq::broadcast::Producer<ReplayEvent>,
+    producer: BroadcastProducer<ReplayEvent>,
 }
 
 impl ReplayEventBroadcast {
@@ -307,7 +311,7 @@ fn create_queue_pair<T>(
 fn create_mpmc_queue_pair<T>(
     capacity: usize,
     huge: bool,
-) -> Result<(shaq::mpmc::Producer<T>, shaq::mpmc::Consumer<T>), SetupError> {
+) -> Result<(MpmcProducer<T>, MpmcConsumer<T>), SetupError> {
     shared_memory::create_mpmc_queue_pair(SHMEM_NAME, capacity, huge)
 }
 
@@ -353,8 +357,8 @@ fn create_worker_sessions(
 fn create_check_worker_sessions(
     allocator_file: &File,
     worker_count: usize,
-    requests: shaq::mpmc::Consumer<PackToWorkerMessage>,
-    results: shaq::mpmc::Producer<CheckWorkerResult>,
+    requests: MpmcConsumer<PackToWorkerMessage>,
+    results: MpmcProducer<CheckWorkerResult>,
 ) -> Result<Vec<CheckWorkerSession>, SetupError> {
     (0..worker_count)
         .map(|_| {
@@ -370,8 +374,8 @@ fn create_check_worker_sessions(
 fn create_signature_verification_worker_sessions(
     allocator_file: &File,
     worker_count: usize,
-    requests: shaq::mpmc::Consumer<SignatureVerificationRequest>,
-    results: shaq::mpmc::Producer<SignatureVerificationResult>,
+    requests: MpmcConsumer<SignatureVerificationRequest>,
+    results: MpmcProducer<SignatureVerificationResult>,
 ) -> Result<Vec<SignatureVerificationWorkerSession>, SetupError> {
     (0..worker_count)
         .map(|_| {
@@ -412,7 +416,7 @@ mod tests {
     fn replay_event_broadcast_stamps_timestamp() {
         let temp_dir = tempfile::tempdir().unwrap();
         let event_broadcast = ReplayEventBroadcast::new(temp_dir.path()).unwrap();
-        let mut event_consumer: shaq::broadcast::Consumer<ReplayEvent> =
+        let mut event_consumer: shared_memory::BroadcastConsumer<ReplayEvent> =
             shared_memory::join_broadcast_consumer_at_path(event_broadcast.path()).unwrap();
         assert_eq!(event_consumer.try_read(Ordering::Relaxed).unwrap(), None);
 

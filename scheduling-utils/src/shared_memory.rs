@@ -12,6 +12,22 @@ use {
 
 const HUGE_PAGE_SIZE: usize = 2 * 1024 * 1024;
 const REGULAR_PAGE_SIZE: usize = 4096;
+const COOPERATIVE_DESCRIPTOR_CAPACITY: usize = 4096;
+
+pub type MpmcProducer<T> = shaq::mpmc::Producer<T>;
+pub type MpmcConsumer<T> = shaq::mpmc::Consumer<T>;
+pub type BroadcastProducer<T> = shaq::broadcast::CooperativeProducer<T>;
+pub type BroadcastConsumer<T> = shaq::broadcast::CooperativeConsumer<T>;
+
+const fn cooperative_descriptor_capacity(capacity: usize) -> usize {
+    if capacity == 0 {
+        1
+    } else if capacity < COOPERATIVE_DESCRIPTOR_CAPACITY {
+        capacity
+    } else {
+        COOPERATIVE_DESCRIPTOR_CAPACITY
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum SharedMemoryError {
@@ -95,7 +111,7 @@ pub fn create_mpmc_queue_pair<T>(
     name: &CStr,
     capacity: usize,
     huge: bool,
-) -> Result<(shaq::mpmc::Producer<T>, shaq::mpmc::Consumer<T>), SharedMemoryError> {
+) -> Result<(MpmcProducer<T>, MpmcConsumer<T>), SharedMemoryError> {
     let create = |huge: bool| {
         let file = create_shmem(name, huge)?;
         let minimum_file_size = shaq::mpmc::minimum_file_size::<T>(capacity);
@@ -115,14 +131,19 @@ pub fn create_mpmc_queue_pair<T>(
 pub fn create_broadcast_producer_at_path<T>(
     path: &Path,
     capacity: usize,
-) -> Result<shaq::broadcast::Producer<T>, SharedMemoryError> {
+) -> Result<BroadcastProducer<T>, SharedMemoryError> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(true)
         .open(path)?;
-    let minimum_file_size = shaq::broadcast::minimum_file_size::<T>(capacity);
+    let options = shaq::broadcast::Options::new()
+        .with_cooperative_descriptor_capacity(cooperative_descriptor_capacity(capacity));
+    let minimum_file_size = shaq::broadcast::minimum_file_size_for_mode::<
+        T,
+        { shaq::broadcast::MODE_COOPERATIVE },
+    >(capacity, options);
     let file_size = align_file_size(minimum_file_size, false);
     file.set_len(file_size.try_into().map_err(|_| {
         io::Error::new(
@@ -130,16 +151,18 @@ pub fn create_broadcast_producer_at_path<T>(
             "broadcast queue file size does not fit in u64",
         )
     })?)?;
-    let producer = unsafe { shaq::broadcast::Producer::create(&file, file_size) }?;
+    let producer = unsafe {
+        shaq::broadcast::CooperativeProducer::create_with_options(&file, file_size, options)
+    }?;
 
     Ok(producer)
 }
 
 pub fn join_broadcast_consumer_at_path<T>(
     path: &Path,
-) -> Result<shaq::broadcast::Consumer<T>, SharedMemoryError> {
+) -> Result<BroadcastConsumer<T>, SharedMemoryError> {
     let file = OpenOptions::new().read(true).write(true).open(path)?;
-    let consumer = unsafe { shaq::broadcast::Consumer::join(&file) }?;
+    let consumer = unsafe { shaq::broadcast::CooperativeConsumer::join(&file) }?;
 
     Ok(consumer)
 }
