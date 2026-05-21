@@ -80,6 +80,7 @@ enum WorkerTimelineKind {
     Execution,
     Check,
     SignatureVerification,
+    Scheduler,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,6 +120,7 @@ struct SelectedSlot {
     worker_events: Vec<WorkerTimelineEvent>,
     check_worker_events: Vec<WorkerTimelineEvent>,
     signature_verification_worker_events: Vec<WorkerTimelineEvent>,
+    scheduler_events: Vec<WorkerTimelineEvent>,
     transactions: Vec<TransactionSummary>,
     selected_transaction: Option<TransactionTimeline>,
 }
@@ -175,8 +177,8 @@ struct ActiveSession {
 struct WorkerTimelineEvent {
     delta_ns: u64,
     timestamp_ns: u64,
-    worker_id: u64,
-    transaction_index: u64,
+    worker_id: Option<u64>,
+    transaction_index: Option<u64>,
     name: &'static str,
     detail: String,
 }
@@ -400,6 +402,7 @@ fn snapshot(
                     slot_record,
                     WorkerTimelineKind::SignatureVerification,
                 ),
+                scheduler_events: worker_timeline(slot_record, WorkerTimelineKind::Scheduler),
                 transactions,
                 selected_transaction,
             }
@@ -780,6 +783,10 @@ fn worker_timeline(
     slot: &store::SlotRecord,
     worker_timeline_kind: WorkerTimelineKind,
 ) -> Vec<WorkerTimelineEvent> {
+    if worker_timeline_kind == WorkerTimelineKind::Scheduler {
+        return scheduler_timeline(slot);
+    }
+
     let base_timestamp_ns = slot
         .begin_timestamp_ns()
         .or_else(|| {
@@ -820,8 +827,8 @@ fn worker_timeline(
                     Some(WorkerTimelineEvent {
                         delta_ns: event.timestamp_ns.saturating_sub(base_timestamp_ns),
                         timestamp_ns: event.timestamp_ns,
-                        worker_id,
-                        transaction_index,
+                        worker_id: Some(worker_id),
+                        transaction_index: Some(transaction_index),
                         name: event_name(event.tag),
                         detail: worker_timeline_event_detail(event),
                     })
@@ -830,6 +837,74 @@ fn worker_timeline(
         .collect::<Vec<_>>();
     events.sort_by_key(|event| (event.timestamp_ns, event.worker_id, event.transaction_index));
     events
+}
+
+fn scheduler_timeline(slot: &store::SlotRecord) -> Vec<WorkerTimelineEvent> {
+    let base_timestamp_ns = slot
+        .begin_timestamp_ns()
+        .or_else(|| {
+            slot.slot_events
+                .iter()
+                .chain(
+                    slot.transactions
+                        .values()
+                        .flat_map(|transaction| transaction.events.iter()),
+                )
+                .filter(|event| is_scheduler_event_tag(event.tag))
+                .map(|event| event.timestamp_ns)
+                .min()
+        })
+        .unwrap_or_default();
+    let mut events = slot
+        .slot_events
+        .iter()
+        .filter(|event| is_scheduler_event_tag(event.tag))
+        .map(|event| WorkerTimelineEvent {
+            delta_ns: event.timestamp_ns.saturating_sub(base_timestamp_ns),
+            timestamp_ns: event.timestamp_ns,
+            worker_id: None,
+            transaction_index: None,
+            name: event_name(event.tag),
+            detail: timeline_event_detail(event),
+        })
+        .chain(slot.transactions.values().flat_map(|transaction| {
+            transaction
+                .events
+                .iter()
+                .filter(|event| is_scheduler_event_tag(event.tag))
+                .map(move |event| WorkerTimelineEvent {
+                    delta_ns: event.timestamp_ns.saturating_sub(base_timestamp_ns),
+                    timestamp_ns: event.timestamp_ns,
+                    worker_id: None,
+                    transaction_index: event.transaction_index(),
+                    name: event_name(event.tag),
+                    detail: timeline_event_detail(event),
+                })
+        }))
+        .collect::<Vec<_>>();
+    events.sort_by_key(|event| (event.timestamp_ns, event.transaction_index));
+    events
+}
+
+fn is_scheduler_event_tag(tag: u64) -> bool {
+    matches!(
+        tag,
+        replay_event_tags::SLOT_BEGIN
+            | replay_event_tags::SLOT_ABORT
+            | replay_event_tags::SLOT_COMPLETE
+            | replay_event_tags::SLOT_FAILED
+            | replay_event_tags::TRANSACTION_INGESTED
+            | replay_event_tags::TRANSACTION_SIGNATURES_SUBMITTED
+            | replay_event_tags::TRANSACTION_SIGNATURES_RETURNED
+            | replay_event_tags::TRANSACTION_SENT_FOR_CHECK
+            | replay_event_tags::TRANSACTION_CHECK_FAILED
+            | replay_event_tags::TRANSACTION_CHECK_PASSED
+            | replay_event_tags::TRANSACTION_READY_FOR_SCHEDULING
+            | replay_event_tags::TRANSACTION_SCHEDULING_SKIPPED
+            | replay_event_tags::TRANSACTION_SCHEDULED_FOR_EXEC
+            | replay_event_tags::TRANSACTION_FINISHED_EXEC
+            | replay_event_tags::TRANSACTION_EXEC_FAILED
+    )
 }
 
 fn worker_event_id(
@@ -850,6 +925,7 @@ fn worker_event_id(
                 .flatten()
         }
         WorkerTimelineKind::SignatureVerification => event.signature_verification_worker_id(),
+        WorkerTimelineKind::Scheduler => None,
     }
 }
 
@@ -1105,7 +1181,10 @@ impl App {
     }
 
     fn push_worker_filter_digit(&mut self, value: char) -> bool {
-        if self.focus != FocusPane::WorkerTimeline || !value.is_ascii_digit() {
+        if self.focus != FocusPane::WorkerTimeline
+            || !self.worker_timeline_kind.supports_worker_filter()
+            || !value.is_ascii_digit()
+        {
             return false;
         }
 
@@ -1121,7 +1200,9 @@ impl App {
     }
 
     fn pop_worker_filter_digit(&mut self) -> bool {
-        if self.focus != FocusPane::WorkerTimeline {
+        if self.focus != FocusPane::WorkerTimeline
+            || !self.worker_timeline_kind.supports_worker_filter()
+        {
             return false;
         }
         let Some(worker_filter) = self.worker_filter else {
@@ -1155,7 +1236,8 @@ impl App {
         self.worker_timeline_kind = match self.worker_timeline_kind {
             WorkerTimelineKind::Execution => WorkerTimelineKind::Check,
             WorkerTimelineKind::Check => WorkerTimelineKind::SignatureVerification,
-            WorkerTimelineKind::SignatureVerification => WorkerTimelineKind::Execution,
+            WorkerTimelineKind::SignatureVerification => WorkerTimelineKind::Scheduler,
+            WorkerTimelineKind::Scheduler => WorkerTimelineKind::Execution,
         };
         self.worker_timeline_scroll = 0;
     }
@@ -1475,6 +1557,7 @@ impl SelectedSlot {
             WorkerTimelineKind::Execution => &self.worker_events,
             WorkerTimelineKind::Check => &self.check_worker_events,
             WorkerTimelineKind::SignatureVerification => &self.signature_verification_worker_events,
+            WorkerTimelineKind::Scheduler => &self.scheduler_events,
         }
     }
 }
@@ -1496,7 +1579,12 @@ impl WorkerTimelineKind {
             WorkerTimelineKind::Execution => "exec",
             WorkerTimelineKind::Check => "check",
             WorkerTimelineKind::SignatureVerification => "sigverify",
+            WorkerTimelineKind::Scheduler => "scheduler",
         }
+    }
+
+    fn supports_worker_filter(self) -> bool {
+        !matches!(self, Self::Scheduler)
     }
 }
 
@@ -1968,6 +2056,17 @@ fn worker_timeline_lines(
         return vec![Line::from("waiting for replay events")];
     };
 
+    let worker_filter = worker_timeline_kind
+        .supports_worker_filter()
+        .then_some(worker_filter)
+        .flatten();
+    let worker_label = if worker_timeline_kind.supports_worker_filter() {
+        worker_filter
+            .map(|worker_id| worker_id.to_string())
+            .unwrap_or_else(|| "all".to_string())
+    } else {
+        "scheduler".to_string()
+    };
     let mut lines = vec![Line::from(format!(
         "slot={} status={} slot_duration={} transactions={} mode={} worker={}",
         slot.slot,
@@ -1977,9 +2076,7 @@ fn worker_timeline_lines(
             .unwrap_or_else(|| "-".to_string()),
         slot.transactions.len(),
         worker_timeline_kind.label(),
-        worker_filter
-            .map(|worker_id| worker_id.to_string())
-            .unwrap_or_else(|| "all".to_string())
+        worker_label
     ))];
     lines.push(Line::from(""));
     lines.push(Line::from(format!(
@@ -1993,7 +2090,7 @@ fn worker_timeline_lines(
     let worker_events = slot
         .worker_events(worker_timeline_kind)
         .iter()
-        .filter(|event| worker_filter.is_none_or(|worker_id| event.worker_id == worker_id));
+        .filter(|event| worker_filter.is_none_or(|worker_id| event.worker_id == Some(worker_id)));
     let mut has_events = false;
     for event in worker_events {
         has_events = true;
@@ -2025,7 +2122,11 @@ fn worker_timeline_title(
         WorkerTimelineKind::Execution => "Exec Timeline",
         WorkerTimelineKind::Check => "Check Timeline",
         WorkerTimelineKind::SignatureVerification => "Sigverify Timeline",
+        WorkerTimelineKind::Scheduler => "Scheduler Timeline",
     };
+    if !worker_timeline_kind.supports_worker_filter() {
+        return title.to_string();
+    }
     match worker_filter {
         Some(worker_id) => format!("{title} worker={worker_id}"),
         None => format!("{title} all"),
@@ -2077,8 +2178,14 @@ fn worker_timeline_event_line(event: &WorkerTimelineEvent) -> Line<'static> {
         "{:>14} {:>22} {:>6} {:>8} {}{}",
         format_duration_ns(event.delta_ns),
         event.timestamp_ns,
-        event.worker_id,
-        event.transaction_index,
+        event
+            .worker_id
+            .map(|worker_id| worker_id.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        event
+            .transaction_index
+            .map(|transaction_index| transaction_index.to_string())
+            .unwrap_or_else(|| "-".to_string()),
         event.name,
         detail
     ))
@@ -2437,6 +2544,8 @@ mod tests {
             WorkerTimelineKind::SignatureVerification
         );
         app.toggle_worker_timeline_kind();
+        assert_eq!(app.worker_timeline_kind, WorkerTimelineKind::Scheduler);
+        app.toggle_worker_timeline_kind();
         assert_eq!(app.worker_timeline_kind, WorkerTimelineKind::Execution);
     }
 
@@ -2470,16 +2579,16 @@ mod tests {
             WorkerTimelineEvent {
                 delta_ns: 0,
                 timestamp_ns: 10,
-                worker_id: 3,
-                transaction_index: 7,
+                worker_id: Some(3),
+                transaction_index: Some(7),
                 name: "worker-three",
                 detail: String::new(),
             },
             WorkerTimelineEvent {
                 delta_ns: 1,
                 timestamp_ns: 11,
-                worker_id: 4,
-                transaction_index: 8,
+                worker_id: Some(4),
+                transaction_index: Some(8),
                 name: "worker-four",
                 detail: String::new(),
             },
@@ -2503,16 +2612,16 @@ mod tests {
         slot.worker_events = vec![WorkerTimelineEvent {
             delta_ns: 0,
             timestamp_ns: 10,
-            worker_id: 3,
-            transaction_index: 7,
+            worker_id: Some(3),
+            transaction_index: Some(7),
             name: "regular-worker",
             detail: String::new(),
         }];
         slot.signature_verification_worker_events = vec![WorkerTimelineEvent {
             delta_ns: 1,
             timestamp_ns: 11,
-            worker_id: 4,
-            transaction_index: 8,
+            worker_id: Some(4),
+            transaction_index: Some(8),
             name: "sigverify-worker",
             detail: "verified=true".to_string(),
         }];
@@ -2535,16 +2644,16 @@ mod tests {
         slot.worker_events = vec![WorkerTimelineEvent {
             delta_ns: 0,
             timestamp_ns: 10,
-            worker_id: 3,
-            transaction_index: 7,
+            worker_id: Some(3),
+            transaction_index: Some(7),
             name: "exec-worker",
             detail: String::new(),
         }];
         slot.check_worker_events = vec![WorkerTimelineEvent {
             delta_ns: 1,
             timestamp_ns: 11,
-            worker_id: 4,
-            transaction_index: 8,
+            worker_id: Some(4),
+            transaction_index: Some(8),
             name: "check-worker",
             detail: String::new(),
         }];
@@ -2557,6 +2666,39 @@ mod tests {
 
         assert!(rendered.iter().any(|line| line.contains("mode=check")));
         assert!(rendered.iter().any(|line| line.contains("check-worker")));
+        assert!(!rendered.iter().any(|line| line.contains("exec-worker")));
+    }
+
+    #[test]
+    fn worker_timeline_lines_can_show_scheduler_events() {
+        let mut snapshot = snapshot_with_transactions(&[]);
+        let slot = snapshot.selected_slot.as_mut().unwrap();
+        slot.worker_events = vec![WorkerTimelineEvent {
+            delta_ns: 0,
+            timestamp_ns: 10,
+            worker_id: Some(3),
+            transaction_index: Some(7),
+            name: "exec-worker",
+            detail: String::new(),
+        }];
+        slot.scheduler_events = vec![WorkerTimelineEvent {
+            delta_ns: 1,
+            timestamp_ns: 11,
+            worker_id: None,
+            transaction_index: Some(8),
+            name: "tx-signatures-submitted",
+            detail: "queue_len=2".to_string(),
+        }];
+
+        let rendered = rendered_lines(worker_timeline_lines(
+            &snapshot,
+            Some(3),
+            WorkerTimelineKind::Scheduler,
+        ));
+
+        assert!(rendered.iter().any(|line| line.contains("mode=scheduler")));
+        assert!(rendered.iter().any(|line| line.contains("worker=scheduler")));
+        assert!(rendered.iter().any(|line| line.contains("tx-signatures-submitted")));
         assert!(!rendered.iter().any(|line| line.contains("exec-worker")));
     }
 
@@ -3024,6 +3166,7 @@ mod tests {
             worker_events: Vec::new(),
             check_worker_events: Vec::new(),
             signature_verification_worker_events: Vec::new(),
+            scheduler_events: Vec::new(),
             transactions: vec![
                 TransactionSummary {
                     index: 7,
@@ -3163,8 +3306,8 @@ mod tests {
 
         assert_eq!(timeline.len(), 3);
         assert_eq!(timeline[0].delta_ns, 10);
-        assert_eq!(timeline[0].worker_id, 3);
-        assert_eq!(timeline[0].transaction_index, 7);
+        assert_eq!(timeline[0].worker_id, Some(3));
+        assert_eq!(timeline[0].transaction_index, Some(7));
         assert_eq!(timeline[0].name, "tx-scheduled-for-exec");
         assert_eq!(timeline[1].name, "tx-worker-picked-up");
         assert_eq!(timeline[2].name, "tx-worker-execution-completed");
@@ -3203,8 +3346,8 @@ mod tests {
 
         assert_eq!(timeline.len(), 2);
         assert_eq!(timeline[0].delta_ns, 10);
-        assert_eq!(timeline[0].worker_id, 3);
-        assert_eq!(timeline[0].transaction_index, 7);
+        assert_eq!(timeline[0].worker_id, Some(3));
+        assert_eq!(timeline[0].transaction_index, Some(7));
         assert_eq!(timeline[0].name, "tx-worker-picked-up");
         assert_eq!(timeline[1].name, "tx-worker-check-completed");
     }
@@ -3243,10 +3386,59 @@ mod tests {
 
         assert_eq!(timeline.len(), 1);
         assert_eq!(timeline[0].delta_ns, 20);
-        assert_eq!(timeline[0].worker_id, 4);
-        assert_eq!(timeline[0].transaction_index, 7);
+        assert_eq!(timeline[0].worker_id, Some(4));
+        assert_eq!(timeline[0].transaction_index, Some(7));
         assert_eq!(timeline[0].name, "tx-sigverify-worker-result-sent");
         assert_eq!(timeline[0].detail, "verified=true");
+    }
+
+    #[test]
+    fn worker_timeline_shows_scheduler_emitted_events() {
+        let slot = store::SlotRecord {
+            slot: 42,
+            slot_events: vec![ReplayEvent::slot_begin(10, 42)],
+            transactions: std::collections::BTreeMap::from([(
+                7,
+                TransactionRecord {
+                    index: 7,
+                    signature: Some("signature-7".to_string()),
+                    events: vec![
+                        ReplayEvent::transaction_event(
+                            20,
+                            replay_event_tags::TRANSACTION_SIGNATURES_SUBMITTED,
+                            42,
+                            7,
+                        ),
+                        ReplayEvent::transaction_worker_event(
+                            30,
+                            replay_event_tags::TRANSACTION_WORKER_PICKED_UP,
+                            42,
+                            7,
+                            3,
+                        ),
+                        ReplayEvent::transaction_worker_event(
+                            40,
+                            replay_event_tags::TRANSACTION_CHECK_PASSED,
+                            42,
+                            7,
+                            3,
+                        ),
+                    ],
+                },
+            )]),
+        };
+        let timeline = worker_timeline(&slot, WorkerTimelineKind::Scheduler);
+
+        assert_eq!(timeline.len(), 3);
+        assert_eq!(timeline[0].transaction_index, None);
+        assert_eq!(timeline[0].name, "slot-begin");
+        assert_eq!(timeline[1].transaction_index, Some(7));
+        assert_eq!(timeline[1].name, "tx-signatures-submitted");
+        assert_eq!(timeline[2].transaction_index, Some(7));
+        assert_eq!(timeline[2].name, "tx-check-passed");
+        assert!(!timeline
+            .iter()
+            .any(|event| event.name == "tx-worker-picked-up"));
     }
 
     #[test]
@@ -3275,8 +3467,8 @@ mod tests {
         slot.worker_events.push(WorkerTimelineEvent {
             delta_ns: 0,
             timestamp_ns: 10,
-            worker_id: 3,
-            transaction_index: 7,
+            worker_id: Some(3),
+            transaction_index: Some(7),
             name: "tx-sent-for-check",
             detail: String::new(),
         });
@@ -3315,6 +3507,7 @@ mod tests {
                 worker_events: Vec::new(),
                 check_worker_events: Vec::new(),
                 signature_verification_worker_events: Vec::new(),
+                scheduler_events: Vec::new(),
                 transactions: indices
                     .iter()
                     .map(|index| TransactionSummary {
