@@ -3392,21 +3392,30 @@ mod tests {
         message
     }
 
-    fn read_all_pack_to_worker_messages(
-        workers: &mut [BlockVerificationWorkerSession],
-    ) -> Vec<(usize, PackToWorkerMessage)> {
+    fn read_check_worker_request(worker: &mut CheckWorkerSession) -> Option<PackToWorkerMessage> {
+        worker.requests.try_read()
+    }
+
+    fn read_transaction_check_request(
+        scheduler: &BlockVerificationScheduler,
+    ) -> Option<PackToWorkerMessage> {
+        scheduler
+            .session
+            .check_requests
+            .join_as_consumer()
+            .try_read()
+    }
+
+    fn read_all_transaction_check_requests(
+        scheduler: &BlockVerificationScheduler,
+    ) -> Vec<PackToWorkerMessage> {
+        let check_requests = scheduler.session.check_requests.join_as_consumer();
         let mut messages = Vec::new();
-        for (worker_index, worker) in workers.iter_mut().enumerate() {
-            while let Some(message) = read_pack_to_worker_message(worker) {
-                messages.push((worker_index, message));
-            }
+        while let Some(message) = check_requests.try_read() {
+            messages.push(message);
         }
 
         messages
-    }
-
-    fn read_check_worker_request(worker: &mut CheckWorkerSession) -> Option<PackToWorkerMessage> {
-        worker.requests.try_read()
     }
 
     fn queue_check_worker_result(
@@ -3428,6 +3437,89 @@ mod tests {
                 },
             })
             .unwrap();
+    }
+
+    fn queue_transaction_check_result(
+        scheduler: &BlockVerificationScheduler,
+        worker_id: usize,
+        batch: SharableTransactionBatchRegion,
+        response: CheckResponse,
+    ) {
+        let responses =
+            resolve_responses_from_iter(&scheduler.session.allocator, [response].into_iter())
+                .unwrap();
+        scheduler
+            .session
+            .check_results
+            .join_as_producer()
+            .try_write(CheckWorkerResult {
+                worker_id,
+                message: WorkerToPackMessage {
+                    batch,
+                    processed_code: processed_codes::PROCESSED,
+                    responses,
+                },
+            })
+            .unwrap();
+    }
+
+    fn queue_transaction_check_response(
+        scheduler: &BlockVerificationScheduler,
+        batch: SharableTransactionBatchRegion,
+        response: CheckResponse,
+    ) {
+        queue_transaction_check_result(scheduler, 0, batch, response);
+    }
+
+    fn queue_transaction_check_message(
+        scheduler: &BlockVerificationScheduler,
+        worker_id: usize,
+        message: WorkerToPackMessage,
+    ) {
+        scheduler
+            .session
+            .check_results
+            .join_as_producer()
+            .try_write(CheckWorkerResult { worker_id, message })
+            .unwrap();
+    }
+
+    fn queue_unprocessed_transaction_check_response(
+        scheduler: &BlockVerificationScheduler,
+        batch: SharableTransactionBatchRegion,
+    ) {
+        queue_transaction_check_message(
+            scheduler,
+            0,
+            WorkerToPackMessage {
+                batch,
+                processed_code: processed_codes::BANK_NOT_AVAILABLE,
+                responses: TransactionResponseRegion {
+                    tag: 0,
+                    num_transaction_responses: 0,
+                    transaction_responses_offset: 0,
+                },
+            },
+        );
+    }
+
+    fn queue_malformed_transaction_check_response(
+        scheduler: &BlockVerificationScheduler,
+        batch: SharableTransactionBatchRegion,
+    ) {
+        queue_transaction_check_message(
+            scheduler,
+            0,
+            WorkerToPackMessage {
+                batch,
+                processed_code: processed_codes::PROCESSED,
+                responses: TransactionResponseRegion {
+                    tag: CHECK_RESPONSE,
+                    num_transaction_responses: 0,
+                    transaction_responses_offset: 0,
+                },
+            },
+        );
     }
 
     fn queue_signature_verification_result(
@@ -3659,24 +3751,6 @@ mod tests {
         }
     }
 
-    fn queue_worker_check_response(
-        worker: &mut BlockVerificationWorkerSession,
-        batch: SharableTransactionBatchRegion,
-        response: CheckResponse,
-    ) {
-        let responses =
-            resolve_responses_from_iter(&worker.allocator, [response].into_iter()).unwrap();
-        worker
-            .worker_to_pack
-            .try_write(WorkerToPackMessage {
-                batch,
-                processed_code: processed_codes::PROCESSED,
-                responses,
-            })
-            .unwrap();
-        worker.worker_to_pack.commit();
-    }
-
     fn successful_execution_response() -> ExecutionResponse {
         ExecutionResponse {
             execution_slot: 42,
@@ -3704,25 +3778,6 @@ mod tests {
         worker.worker_to_pack.commit();
     }
 
-    fn queue_worker_unprocessed_response(
-        worker: &mut BlockVerificationWorkerSession,
-        batch: SharableTransactionBatchRegion,
-    ) {
-        worker
-            .worker_to_pack
-            .try_write(WorkerToPackMessage {
-                batch,
-                processed_code: processed_codes::BANK_NOT_AVAILABLE,
-                responses: TransactionResponseRegion {
-                    tag: 0,
-                    num_transaction_responses: 0,
-                    transaction_responses_offset: 0,
-                },
-            })
-            .unwrap();
-        worker.worker_to_pack.commit();
-    }
-
     fn queue_unsupported_worker_response(
         worker: &mut BlockVerificationWorkerSession,
         batch: SharableTransactionBatchRegion,
@@ -3734,25 +3789,6 @@ mod tests {
                 processed_code: processed_codes::PROCESSED,
                 responses: TransactionResponseRegion {
                     tag: 99,
-                    num_transaction_responses: 0,
-                    transaction_responses_offset: 0,
-                },
-            })
-            .unwrap();
-        worker.worker_to_pack.commit();
-    }
-
-    fn queue_malformed_worker_check_response(
-        worker: &mut BlockVerificationWorkerSession,
-        batch: SharableTransactionBatchRegion,
-    ) {
-        worker
-            .worker_to_pack
-            .try_write(WorkerToPackMessage {
-                batch,
-                processed_code: processed_codes::PROCESSED,
-                responses: TransactionResponseRegion {
-                    tag: CHECK_RESPONSE,
                     num_transaction_responses: 0,
                     transaction_responses_offset: 0,
                 },
@@ -4020,13 +4056,13 @@ mod tests {
         assert_eq!(scheduler.service_signature_verification_results(1024), 1);
         wait_for_entry_verification(&mut scheduler, 42);
         assert_eq!(scheduler.service_transaction_check_dispatches(1024), 1);
-        let check_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
-        queue_worker_check_response(
-            &mut workers[0],
+        let check_message = read_transaction_check_request(&scheduler).unwrap();
+        queue_transaction_check_response(
+            &scheduler,
             check_message.batch,
             successful_check_response(),
         );
-        assert_eq!(scheduler.service_worker_responses(1), 1);
+        assert_eq!(scheduler.service_transaction_check_results(1), 1);
         assert_eq!(scheduler.service_transaction_execution_dispatches(1, 1), 1);
         let execution_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
         queue_worker_execution_response(
@@ -4167,8 +4203,8 @@ mod tests {
     }
 
     #[test]
-    fn entry_transactions_are_sent_to_workers_one_by_one() {
-        let (mut scheduler, mut replay_stage, mut workers) =
+    fn entry_transactions_are_sent_to_check_queue_one_by_one() {
+        let (mut scheduler, mut replay_stage, _workers) =
             setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
                 allocator_size: 64 * 1024 * 1024,
                 replay_to_pack_capacity: 8,
@@ -4197,7 +4233,7 @@ mod tests {
             .into_iter()
             .enumerate()
         {
-            let worker_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
+            let worker_message = read_transaction_check_request(&scheduler).unwrap();
             assert_eq!(
                 worker_message.flags,
                 pack_message_flags::CHECK
@@ -4350,7 +4386,7 @@ mod tests {
 
     #[test]
     fn successful_worker_check_records_ordered_result_and_keeps_transaction() {
-        let (mut scheduler, mut replay_stage, mut workers) =
+        let (mut scheduler, mut replay_stage, _workers) =
             setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
                 allocator_size: 64 * 1024 * 1024,
                 replay_to_pack_capacity: 8,
@@ -4366,13 +4402,13 @@ mod tests {
         );
         assert_eq!(scheduler.service_ingress_queue(3), 3);
         assert_eq!(scheduler.service_transaction_check_dispatches(1024), 1);
-        let worker_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        let worker_message = read_transaction_check_request(&scheduler).unwrap();
         let mut response = successful_check_response();
         response.resolved_pubkeys =
-            allocate_pubkeys(&workers[0].allocator, &[Pubkey::new_unique()]);
-        queue_worker_check_response(&mut workers[0], worker_message.batch, response);
+            allocate_pubkeys(&scheduler.session.allocator, &[Pubkey::new_unique()]);
+        queue_transaction_check_response(&scheduler, worker_message.batch, response);
 
-        assert_eq!(scheduler.service_worker_responses(1), 1);
+        assert_eq!(scheduler.service_transaction_check_results(1), 1);
 
         let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         assert_eq!(state.in_flight_worker_messages, 0);
@@ -4391,7 +4427,7 @@ mod tests {
 
     #[test]
     fn replay_check_requests_estimated_cost_metadata_and_retains_response() {
-        let (mut scheduler, mut replay_stage, mut workers) =
+        let (mut scheduler, mut replay_stage, _workers) =
             setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
                 allocator_size: 64 * 1024 * 1024,
                 replay_to_pack_capacity: 8,
@@ -4408,7 +4444,7 @@ mod tests {
         assert_eq!(scheduler.service_ingress_queue(3), 3);
         assert_eq!(scheduler.service_transaction_check_dispatches(1024), 1);
 
-        let worker_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        let worker_message = read_transaction_check_request(&scheduler).unwrap();
         assert_eq!(worker_message.flags, REPLAY_TRANSACTION_CHECK_FLAGS);
 
         let mut response = successful_check_response();
@@ -4420,9 +4456,9 @@ mod tests {
         response.writable_account_bitfields = [0b11, 1 << 5, 0, u64::MAX];
         response.resolution_slot = 42;
         let expected_response = response;
-        queue_worker_check_response(&mut workers[0], worker_message.batch, response);
+        queue_transaction_check_response(&scheduler, worker_message.batch, response);
 
-        assert_eq!(scheduler.service_worker_responses(1), 1);
+        assert_eq!(scheduler.service_transaction_check_results(1), 1);
 
         let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         let (_, resolved_pubkeys, check_response) = checked_transaction_state(state, 0);
@@ -4446,7 +4482,7 @@ mod tests {
 
     #[test]
     fn checked_transaction_moves_to_in_flight_and_executed() {
-        let (mut scheduler, mut replay_stage, mut workers) =
+        let (mut scheduler, mut replay_stage, _workers) =
             setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
                 allocator_size: 64 * 1024 * 1024,
                 replay_to_pack_capacity: 8,
@@ -4462,13 +4498,13 @@ mod tests {
         );
         assert_eq!(scheduler.service_ingress_queue(3), 3);
         assert_eq!(scheduler.service_transaction_check_dispatches(1024), 1);
-        let worker_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
-        queue_worker_check_response(
-            &mut workers[0],
+        let worker_message = read_transaction_check_request(&scheduler).unwrap();
+        queue_transaction_check_response(
+            &scheduler,
             worker_message.batch,
             successful_check_response(),
         );
-        assert_eq!(scheduler.service_worker_responses(1), 1);
+        assert_eq!(scheduler.service_transaction_check_results(1), 1);
 
         let previous_transaction_state = {
             let state = scheduler.scheduling_state_mut(42);
@@ -4494,7 +4530,7 @@ mod tests {
 
     #[test]
     fn account_locks_force_conflicting_ready_transactions_to_same_thread() {
-        let (mut scheduler, mut replay_stage, mut workers) =
+        let (mut scheduler, mut replay_stage, _workers) =
             setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
                 allocator_size: 64 * 1024 * 1024,
                 replay_to_pack_capacity: 8,
@@ -4519,19 +4555,19 @@ mod tests {
         );
         assert_eq!(scheduler.service_ingress_queue(4), 4);
         assert_eq!(scheduler.service_transaction_check_dispatches(1024), 2);
-        let first_check = read_pack_to_worker_message(&mut workers[0]).unwrap();
-        let second_check = read_pack_to_worker_message(&mut workers[1]).unwrap();
-        queue_worker_check_response(
-            &mut workers[0],
+        let first_check = read_transaction_check_request(&scheduler).unwrap();
+        let second_check = read_transaction_check_request(&scheduler).unwrap();
+        queue_transaction_check_response(
+            &scheduler,
             first_check.batch,
             successful_check_response(),
         );
-        queue_worker_check_response(
-            &mut workers[1],
+        queue_transaction_check_response(
+            &scheduler,
             second_check.batch,
             successful_check_response(),
         );
-        assert_eq!(scheduler.service_worker_responses(2), 2);
+        assert_eq!(scheduler.service_transaction_check_results(2), 2);
 
         let state = scheduler.scheduling_state_mut(42);
         let first_thread_id = state
@@ -4558,7 +4594,7 @@ mod tests {
 
     #[test]
     fn account_locks_use_check_demoted_writable_bitfields() {
-        let (mut scheduler, mut replay_stage, mut workers) =
+        let (mut scheduler, mut replay_stage, _workers) =
             setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
                 allocator_size: 64 * 1024 * 1024,
                 replay_to_pack_capacity: 8,
@@ -4583,15 +4619,15 @@ mod tests {
         );
         assert_eq!(scheduler.service_ingress_queue(4), 4);
         assert_eq!(scheduler.service_transaction_check_dispatches(1024), 2);
-        let first_check = read_pack_to_worker_message(&mut workers[0]).unwrap();
-        let second_check = read_pack_to_worker_message(&mut workers[1]).unwrap();
+        let first_check = read_transaction_check_request(&scheduler).unwrap();
+        let second_check = read_transaction_check_request(&scheduler).unwrap();
         let mut first_response = successful_check_response();
         let mut second_response = successful_check_response();
         first_response.writable_account_bitfields = [0; 4];
         second_response.writable_account_bitfields = [0; 4];
-        queue_worker_check_response(&mut workers[0], first_check.batch, first_response);
-        queue_worker_check_response(&mut workers[1], second_check.batch, second_response);
-        assert_eq!(scheduler.service_worker_responses(2), 2);
+        queue_transaction_check_response(&scheduler, first_check.batch, first_response);
+        queue_transaction_check_response(&scheduler, second_check.batch, second_response);
+        assert_eq!(scheduler.service_transaction_check_results(2), 2);
 
         let state = scheduler.scheduling_state_mut(42);
         let first_thread_id = state
@@ -4625,13 +4661,13 @@ mod tests {
         );
         assert_eq!(scheduler.service_ingress_queue(3), 3);
         assert_eq!(scheduler.service_transaction_check_dispatches(1024), 1);
-        let check_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
-        queue_worker_check_response(
-            &mut workers[0],
+        let check_message = read_transaction_check_request(&scheduler).unwrap();
+        queue_transaction_check_response(
+            &scheduler,
             check_message.batch,
             successful_check_response(),
         );
-        assert_eq!(scheduler.service_worker_responses(1), 1);
+        assert_eq!(scheduler.service_transaction_check_results(1), 1);
 
         assert_eq!(scheduler.service_transaction_execution_dispatches(1, 1), 1);
 
@@ -4680,13 +4716,13 @@ mod tests {
         );
         assert_eq!(scheduler.service_ingress_queue(3), 3);
         assert_eq!(scheduler.service_transaction_check_dispatches(1024), 1);
-        let check_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
-        queue_worker_check_response(
-            &mut workers[0],
+        let check_message = read_transaction_check_request(&scheduler).unwrap();
+        queue_transaction_check_response(
+            &scheduler,
             check_message.batch,
             successful_check_response(),
         );
-        assert_eq!(scheduler.service_worker_responses(1), 1);
+        assert_eq!(scheduler.service_transaction_check_results(1), 1);
         {
             let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
             assert_eq!(state.completed_work_to_schedule_latency.count, 0);
@@ -4865,14 +4901,14 @@ mod tests {
         );
         assert_eq!(scheduler.service_ingress_queue(4), 4);
         assert_eq!(scheduler.service_transaction_check_dispatches(1024), 1);
-        let check_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        let check_message = read_transaction_check_request(&scheduler).unwrap();
         wait_for_entry_verification(&mut scheduler, 42);
-        queue_worker_check_response(
-            &mut workers[0],
+        queue_transaction_check_response(
+            &scheduler,
             check_message.batch,
             successful_check_response(),
         );
-        assert_eq!(scheduler.service_worker_responses(1), 1);
+        assert_eq!(scheduler.service_transaction_check_results(1), 1);
         assert_eq!(scheduler.service_transaction_execution_dispatches(1, 1), 1);
         let execution_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
         queue_worker_execution_response(
@@ -4942,19 +4978,19 @@ mod tests {
         assert_eq!(scheduler.service_ingress_queue(5), 5);
         wait_for_entry_verification(&mut scheduler, 42);
         assert_eq!(scheduler.service_transaction_check_dispatches(1024), 2);
-        let first_check = read_pack_to_worker_message(&mut workers[0]).unwrap();
-        let second_check = read_pack_to_worker_message(&mut workers[1]).unwrap();
-        queue_worker_check_response(
-            &mut workers[0],
+        let first_check = read_transaction_check_request(&scheduler).unwrap();
+        let second_check = read_transaction_check_request(&scheduler).unwrap();
+        queue_transaction_check_response(
+            &scheduler,
             first_check.batch,
             successful_check_response(),
         );
-        queue_worker_check_response(
-            &mut workers[1],
+        queue_transaction_check_response(
+            &scheduler,
             second_check.batch,
             successful_check_response(),
         );
-        assert_eq!(scheduler.service_worker_responses(2), 2);
+        assert_eq!(scheduler.service_transaction_check_results(2), 2);
 
         assert_eq!(scheduler.service_transaction_execution_dispatches(2, 2), 2);
         let first_execution = read_pack_to_worker_message(&mut workers[0]).unwrap();
@@ -5031,19 +5067,19 @@ mod tests {
         );
         assert_eq!(scheduler.service_ingress_queue(4), 4);
         assert_eq!(scheduler.service_transaction_check_dispatches(1024), 2);
-        let first_check = read_pack_to_worker_message(&mut workers[0]).unwrap();
-        let second_check = read_pack_to_worker_message(&mut workers[1]).unwrap();
-        queue_worker_check_response(
-            &mut workers[0],
+        let first_check = read_transaction_check_request(&scheduler).unwrap();
+        let second_check = read_transaction_check_request(&scheduler).unwrap();
+        queue_transaction_check_response(
+            &scheduler,
             first_check.batch,
             successful_check_response(),
         );
-        queue_worker_check_response(
-            &mut workers[1],
+        queue_transaction_check_response(
+            &scheduler,
             second_check.batch,
             successful_check_response(),
         );
-        assert_eq!(scheduler.service_worker_responses(2), 2);
+        assert_eq!(scheduler.service_transaction_check_results(2), 2);
 
         assert_eq!(scheduler.service_transaction_execution_dispatches(2, 2), 2);
 
@@ -5098,22 +5134,20 @@ mod tests {
         assert_eq!(scheduler.service_ingress_queue(5), 5);
         assert_eq!(scheduler.service_transaction_check_dispatches(1024), 3);
 
-        for worker in &mut workers {
-            while let Some(message) = read_pack_to_worker_message(worker) {
-                let metadata = transaction_check_metadata(&replay_stage.allocator, message.batch);
-                let cost_units = match metadata.transaction_index {
-                    0 => 100,
-                    1 | 2 => 1,
-                    transaction_index => panic!("unexpected transaction index {transaction_index}"),
-                };
-                queue_worker_check_response(
-                    worker,
-                    message.batch,
-                    successful_check_response_with_cost(cost_units),
-                );
-            }
+        while let Some(message) = read_transaction_check_request(&scheduler) {
+            let metadata = transaction_check_metadata(&replay_stage.allocator, message.batch);
+            let cost_units = match metadata.transaction_index {
+                0 => 100,
+                1 | 2 => 1,
+                transaction_index => panic!("unexpected transaction index {transaction_index}"),
+            };
+            queue_transaction_check_response(
+                &scheduler,
+                message.batch,
+                successful_check_response_with_cost(cost_units),
+            );
         }
-        assert_eq!(scheduler.service_worker_responses(3), 3);
+        assert_eq!(scheduler.service_transaction_check_results(3), 3);
 
         assert_eq!(scheduler.service_transaction_execution_dispatches(3, 3), 3);
 
@@ -5202,14 +5236,14 @@ mod tests {
         );
         assert_eq!(scheduler.service_ingress_queue(5), 5);
         assert_eq!(scheduler.service_transaction_check_dispatches(1024), 3);
-        while let Some(message) = read_pack_to_worker_message(&mut workers[0]) {
-            queue_worker_check_response(
-                &mut workers[0],
+        while let Some(message) = read_transaction_check_request(&scheduler) {
+            queue_transaction_check_response(
+                &scheduler,
                 message.batch,
                 successful_check_response_with_cost(2_000_000),
             );
         }
-        assert_eq!(scheduler.service_worker_responses(3), 3);
+        assert_eq!(scheduler.service_transaction_check_results(3), 3);
 
         assert_eq!(scheduler.service_transaction_execution_dispatches(3, 3), 2);
         let first_execution = read_pack_to_worker_message(&mut workers[0]).unwrap();
@@ -5417,16 +5451,16 @@ mod tests {
         );
         assert_eq!(scheduler.service_ingress_queue(5), 5);
         assert_eq!(scheduler.service_transaction_check_dispatches(1024), 3);
-        for (worker_index, message) in read_all_pack_to_worker_messages(&mut workers) {
-            queue_worker_check_response(
-                &mut workers[worker_index],
+        for message in read_all_transaction_check_requests(&scheduler) {
+            queue_transaction_check_response(
+                &scheduler,
                 message.batch,
                 successful_check_response_with_cost(
                     MAX_OUTSTANDING_EXECUTION_COST_UNITS_PER_WORKER,
                 ),
             );
         }
-        assert_eq!(scheduler.service_worker_responses(3), 3);
+        assert_eq!(scheduler.service_transaction_check_results(3), 3);
 
         assert_eq!(scheduler.service_transaction_execution_dispatches(3, 3), 1);
         let first_execution = read_pack_to_worker_message(&mut workers[0]).unwrap();
@@ -5483,20 +5517,20 @@ mod tests {
         );
         assert_eq!(scheduler.service_ingress_queue(5), 5);
         assert_eq!(scheduler.service_transaction_check_dispatches(1024), 3);
-        let mut check_messages = read_all_pack_to_worker_messages(&mut workers);
-        check_messages.sort_by_key(|(_, message)| {
+        let mut check_messages = read_all_transaction_check_requests(&scheduler);
+        check_messages.sort_by_key(|message| {
             transaction_check_metadata(&replay_stage.allocator, message.batch).transaction_index
         });
-        for (worker_index, message) in check_messages.iter().copied().take(2) {
-            queue_worker_check_response(
-                &mut workers[worker_index],
+        for message in check_messages.iter().copied().take(2) {
+            queue_transaction_check_response(
+                &scheduler,
                 message.batch,
                 successful_check_response_with_cost(
                     MAX_OUTSTANDING_EXECUTION_COST_UNITS_PER_WORKER,
                 ),
             );
         }
-        assert_eq!(scheduler.service_worker_responses(2), 2);
+        assert_eq!(scheduler.service_transaction_check_results(2), 2);
         assert_eq!(scheduler.service_transaction_execution_dispatches(3, 3), 1);
         let first_execution = read_pack_to_worker_message(&mut workers[0]).unwrap();
         assert_eq!(
@@ -5512,13 +5546,13 @@ mod tests {
             assert!(state.unschedulable_write_locks.contains(&account));
         }
 
-        let (worker_index, third_check) = check_messages[2];
-        queue_worker_check_response(
-            &mut workers[worker_index],
+        let third_check = check_messages[2];
+        queue_transaction_check_response(
+            &scheduler,
             third_check.batch,
             successful_check_response_with_cost(MAX_OUTSTANDING_EXECUTION_COST_UNITS_PER_WORKER),
         );
-        assert_eq!(scheduler.service_worker_responses(1), 1);
+        assert_eq!(scheduler.service_transaction_check_results(1), 1);
         {
             let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
             assert!(state.ready_transactions.iter().copied().eq([1, 2]));
@@ -5563,16 +5597,16 @@ mod tests {
         );
         assert_eq!(scheduler.service_ingress_queue(4), 4);
         assert_eq!(scheduler.service_transaction_check_dispatches(1024), 2);
-        for (worker_index, message) in read_all_pack_to_worker_messages(&mut workers) {
-            queue_worker_check_response(
-                &mut workers[worker_index],
+        for message in read_all_transaction_check_requests(&scheduler) {
+            queue_transaction_check_response(
+                &scheduler,
                 message.batch,
                 successful_check_response_with_cost(
                     MAX_OUTSTANDING_EXECUTION_COST_UNITS_PER_WORKER,
                 ),
             );
         }
-        assert_eq!(scheduler.service_worker_responses(2), 2);
+        assert_eq!(scheduler.service_transaction_check_results(2), 2);
         assert_eq!(scheduler.service_transaction_execution_dispatches(2, 2), 1);
         let first_execution = read_pack_to_worker_message(&mut workers[0]).unwrap();
         {
@@ -5644,15 +5678,17 @@ mod tests {
         );
         assert_eq!(scheduler.service_ingress_queue(6), 6);
         assert_eq!(scheduler.service_transaction_check_dispatches(1024), 2);
-        let mut check_message_count = 0;
-        for worker in &mut workers {
-            while let Some(message) = read_pack_to_worker_message(worker) {
-                queue_worker_check_response(worker, message.batch, successful_check_response());
-                check_message_count += 1;
-            }
+        let check_messages = read_all_transaction_check_requests(&scheduler);
+        let check_message_count = check_messages.len();
+        for message in check_messages {
+            queue_transaction_check_response(
+                &scheduler,
+                message.batch,
+                successful_check_response(),
+            );
         }
         assert_eq!(check_message_count, 2);
-        assert_eq!(scheduler.service_worker_responses(2), 2);
+        assert_eq!(scheduler.service_transaction_check_results(2), 2);
 
         assert_eq!(scheduler.service_transaction_execution_dispatches(1, 1), 1);
         let first_execution = read_pack_to_worker_message(&mut workers[0]).unwrap();
@@ -5678,7 +5714,7 @@ mod tests {
     #[test]
     fn execution_dispatch_is_bounded_by_worker_backlog() {
         const PACK_TO_WORKER_CAPACITY: usize = 8;
-        let (mut scheduler, mut replay_stage, mut workers) =
+        let (mut scheduler, mut replay_stage, _workers) =
             setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
                 allocator_size: 64 * 1024 * 1024,
                 replay_to_pack_capacity: 512,
@@ -5717,35 +5753,42 @@ mod tests {
             scheduler.service_transaction_check_dispatches(1024),
             transaction_count,
         );
-        let mut check_message_count = 0;
-        for worker in &mut workers {
-            while let Some(message) = read_pack_to_worker_message(worker) {
-                queue_worker_check_response(worker, message.batch, successful_check_response());
-                check_message_count += 1;
-            }
+        let check_messages = read_all_transaction_check_requests(&scheduler);
+        let check_message_count = check_messages.len();
+        for message in check_messages {
+            queue_transaction_check_response(
+                &scheduler,
+                message.batch,
+                successful_check_response(),
+            );
         }
         assert_eq!(check_message_count, transaction_count);
-        assert_eq!(scheduler.service_worker_responses(1024), transaction_count);
+        assert_eq!(
+            scheduler.service_transaction_check_results(1024),
+            transaction_count
+        );
 
+        let execution_queue_capacity = scheduler
+            .session
+            .workers
+            .iter()
+            .map(|worker| worker.pack_to_worker.capacity())
+            .sum::<usize>();
+        let expected_dispatched_transactions = transaction_count.min(execution_queue_capacity);
         assert_eq!(
             scheduler.service_transaction_execution_dispatches(1024, 1024),
-            PACK_TO_WORKER_CAPACITY * 2,
+            expected_dispatched_transactions,
         );
 
         assert_eq!(
             scheduler.in_flight_execution_messages,
-            PACK_TO_WORKER_CAPACITY * 2,
-        );
-        assert_eq!(
-            scheduler.in_flight_executions_per_thread,
-            vec![PACK_TO_WORKER_CAPACITY, PACK_TO_WORKER_CAPACITY],
-        );
-        assert_eq!(
-            scheduler.in_flight_execution_cost_units_per_thread,
-            vec![0, 0],
+            expected_dispatched_transactions,
         );
         let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
-        assert_eq!(state.ready_transactions.len(), 8);
+        assert_eq!(
+            state.ready_transactions.len(),
+            transaction_count - expected_dispatched_transactions,
+        );
     }
 
     #[test]
@@ -5792,15 +5835,20 @@ mod tests {
             scheduler.service_transaction_check_dispatches(1024),
             TRANSACTION_COUNT,
         );
-        let mut check_message_count = 0;
-        for worker in &mut workers {
-            while let Some(message) = read_pack_to_worker_message(worker) {
-                queue_worker_check_response(worker, message.batch, successful_check_response());
-                check_message_count += 1;
-            }
+        let check_messages = read_all_transaction_check_requests(&scheduler);
+        let check_message_count = check_messages.len();
+        for message in check_messages {
+            queue_transaction_check_response(
+                &scheduler,
+                message.batch,
+                successful_check_response(),
+            );
         }
         assert_eq!(check_message_count, TRANSACTION_COUNT);
-        assert_eq!(scheduler.service_worker_responses(1024), TRANSACTION_COUNT);
+        assert_eq!(
+            scheduler.service_transaction_check_results(1024),
+            TRANSACTION_COUNT
+        );
 
         assert_eq!(
             scheduler.service_transaction_execution_dispatches(LOCK_LIMIT, LOCK_LIMIT),
@@ -5857,19 +5905,19 @@ mod tests {
         );
         assert_eq!(scheduler.service_ingress_queue(4), 4);
         assert_eq!(scheduler.service_transaction_check_dispatches(1024), 2);
-        let first_check = read_pack_to_worker_message(&mut workers[0]).unwrap();
-        let second_check = read_pack_to_worker_message(&mut workers[1]).unwrap();
-        queue_worker_check_response(
-            &mut workers[0],
+        let first_check = read_transaction_check_request(&scheduler).unwrap();
+        let second_check = read_transaction_check_request(&scheduler).unwrap();
+        queue_transaction_check_response(
+            &scheduler,
             first_check.batch,
             successful_check_response(),
         );
-        queue_worker_check_response(
-            &mut workers[1],
+        queue_transaction_check_response(
+            &scheduler,
             second_check.batch,
             successful_check_response(),
         );
-        assert_eq!(scheduler.service_worker_responses(2), 2);
+        assert_eq!(scheduler.service_transaction_check_results(2), 2);
 
         assert_eq!(scheduler.service_transaction_execution_dispatches(2, 2), 2);
 
@@ -5887,9 +5935,9 @@ mod tests {
     }
 
     #[test]
-    fn worker_responses_are_serviced_round_robin() {
+    fn transaction_check_results_promote_ready_transactions_in_order() {
         const TRANSACTION_COUNT: usize = 4;
-        let (mut scheduler, mut replay_stage, mut workers) =
+        let (mut scheduler, mut replay_stage, _workers) =
             setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
                 allocator_size: 64 * 1024 * 1024,
                 replay_to_pack_capacity: 8,
@@ -5928,32 +5976,44 @@ mod tests {
             TRANSACTION_COUNT,
         );
 
-        let worker_0_first = read_pack_to_worker_message(&mut workers[0]).unwrap();
-        let worker_1 = read_pack_to_worker_message(&mut workers[1]).unwrap();
-        let worker_2 = read_pack_to_worker_message(&mut workers[2]).unwrap();
-        let worker_0_second = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        let mut check_messages = read_all_transaction_check_requests(&scheduler);
+        check_messages.sort_by_key(|message| {
+            transaction_check_metadata(&replay_stage.allocator, message.batch).transaction_index
+        });
+        let transaction_0 = check_messages[0];
+        let transaction_1 = check_messages[1];
+        let transaction_2 = check_messages[2];
+        let transaction_3 = check_messages[3];
 
-        queue_worker_check_response(
-            &mut workers[0],
-            worker_0_first.batch,
+        queue_transaction_check_response(
+            &scheduler,
+            transaction_0.batch,
             successful_check_response(),
         );
-        queue_worker_check_response(
-            &mut workers[0],
-            worker_0_second.batch,
+        queue_transaction_check_response(
+            &scheduler,
+            transaction_3.batch,
             successful_check_response(),
         );
-        queue_worker_check_response(&mut workers[2], worker_2.batch, successful_check_response());
+        queue_transaction_check_response(
+            &scheduler,
+            transaction_2.batch,
+            successful_check_response(),
+        );
 
-        assert_eq!(scheduler.service_worker_responses(2), 2);
+        assert_eq!(scheduler.service_transaction_check_results(2), 2);
 
         let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         assert!(state.ready_transactions.iter().copied().eq([0]));
         assert_eq!(state.next_ready_transaction_index, 1);
         assert_eq!(state.in_flight_worker_messages, 2);
 
-        queue_worker_check_response(&mut workers[1], worker_1.batch, successful_check_response());
-        assert_eq!(scheduler.service_worker_responses(2), 2);
+        queue_transaction_check_response(
+            &scheduler,
+            transaction_1.batch,
+            successful_check_response(),
+        );
+        assert_eq!(scheduler.service_transaction_check_results(2), 2);
 
         let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         assert!(state.ready_transactions.iter().copied().eq([0, 1, 2, 3]));
@@ -5964,7 +6024,7 @@ mod tests {
 
     #[test]
     fn signature_failure_sends_invalid_transaction() {
-        let (mut scheduler, mut replay_stage, mut workers) =
+        let (mut scheduler, mut replay_stage, _workers) =
             setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
                 allocator_size: 64 * 1024 * 1024,
                 replay_to_pack_capacity: 8,
@@ -5980,14 +6040,14 @@ mod tests {
         );
         assert_eq!(scheduler.service_ingress_queue(3), 3);
         assert_eq!(scheduler.service_transaction_check_dispatches(1024), 1);
-        let worker_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
-        queue_worker_check_response(
-            &mut workers[0],
+        let worker_message = read_transaction_check_request(&scheduler).unwrap();
+        queue_transaction_check_response(
+            &scheduler,
             worker_message.batch,
             signature_failed_check_response(),
         );
 
-        assert_eq!(scheduler.service_worker_responses(1), 1);
+        assert_eq!(scheduler.service_transaction_check_results(1), 1);
 
         let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         assert_eq!(state.in_flight_worker_messages, 0);
@@ -6021,7 +6081,7 @@ mod tests {
 
     #[test]
     fn failed_slot_waits_for_all_pending_work_before_status() {
-        let (mut scheduler, mut replay_stage, mut workers) =
+        let (mut scheduler, mut replay_stage, _workers) =
             setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
                 allocator_size: 64 * 1024 * 1024,
                 replay_to_pack_capacity: 8,
@@ -6046,15 +6106,15 @@ mod tests {
         );
         assert_eq!(scheduler.service_ingress_queue(5), 5);
         assert_eq!(scheduler.service_transaction_check_dispatches(1024), 2);
-        let first_worker_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
-        let second_worker_message = read_pack_to_worker_message(&mut workers[1]).unwrap();
+        let first_worker_message = read_transaction_check_request(&scheduler).unwrap();
+        let second_worker_message = read_transaction_check_request(&scheduler).unwrap();
 
-        queue_worker_check_response(
-            &mut workers[0],
+        queue_transaction_check_response(
+            &scheduler,
             first_worker_message.batch,
             signature_failed_check_response(),
         );
-        assert_eq!(scheduler.service_worker_responses(1), 1);
+        assert_eq!(scheduler.service_transaction_check_results(1), 1);
 
         let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         assert_eq!(
@@ -6075,12 +6135,12 @@ mod tests {
         assert_eq!(scheduler.service_terminal_slots(1), 0);
         assert_eq!(read_replay_block_status(&mut replay_stage), None);
 
-        queue_worker_check_response(
-            &mut workers[1],
+        queue_transaction_check_response(
+            &scheduler,
             second_worker_message.batch,
             successful_check_response(),
         );
-        assert_eq!(scheduler.service_worker_responses(1), 1);
+        assert_eq!(scheduler.service_transaction_check_results(1), 1);
         assert_eq!(scheduler.service_terminal_slots(1), 1);
         assert!(find_scheduling_state(&scheduler.scheduling_states, 42).is_none());
         assert_eq!(
@@ -6095,7 +6155,7 @@ mod tests {
 
     #[test]
     fn parsing_failure_sends_invalid_transaction() {
-        let (mut scheduler, mut replay_stage, mut workers) =
+        let (mut scheduler, mut replay_stage, _workers) =
             setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
                 allocator_size: 64 * 1024 * 1024,
                 replay_to_pack_capacity: 8,
@@ -6116,14 +6176,14 @@ mod tests {
         );
         assert_eq!(scheduler.service_ingress_queue(4), 4);
         assert_eq!(scheduler.service_transaction_check_dispatches(1024), 1);
-        let worker_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
-        queue_worker_check_response(
-            &mut workers[0],
+        let worker_message = read_transaction_check_request(&scheduler).unwrap();
+        queue_transaction_check_response(
+            &scheduler,
             worker_message.batch,
             parsing_failed_check_response(),
         );
 
-        assert_eq!(scheduler.service_worker_responses(1), 1);
+        assert_eq!(scheduler.service_transaction_check_results(1), 1);
 
         let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         assert_eq!(state.in_flight_worker_messages, 0);
@@ -6150,7 +6210,7 @@ mod tests {
 
     #[test]
     fn resolve_failure_sends_invalid_transaction() {
-        let (mut scheduler, mut replay_stage, mut workers) =
+        let (mut scheduler, mut replay_stage, _workers) =
             setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
                 allocator_size: 64 * 1024 * 1024,
                 replay_to_pack_capacity: 8,
@@ -6171,14 +6231,14 @@ mod tests {
         );
         assert_eq!(scheduler.service_ingress_queue(4), 4);
         assert_eq!(scheduler.service_transaction_check_dispatches(1024), 1);
-        let worker_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
-        queue_worker_check_response(
-            &mut workers[0],
+        let worker_message = read_transaction_check_request(&scheduler).unwrap();
+        queue_transaction_check_response(
+            &scheduler,
             worker_message.batch,
             resolve_failed_check_response(),
         );
 
-        assert_eq!(scheduler.service_worker_responses(1), 1);
+        assert_eq!(scheduler.service_transaction_check_results(1), 1);
 
         let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
         assert_eq!(state.in_flight_worker_messages, 0);
@@ -6204,9 +6264,8 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "replay worker response was not processed")]
-    fn unprocessed_worker_check_panics() {
-        let (mut scheduler, mut replay_stage, mut workers) =
+    fn unprocessed_transaction_check_requeues() {
+        let (mut scheduler, mut replay_stage, _workers) =
             setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
                 allocator_size: 64 * 1024 * 1024,
                 replay_to_pack_capacity: 8,
@@ -6222,10 +6281,20 @@ mod tests {
         );
         assert_eq!(scheduler.service_ingress_queue(3), 3);
         assert_eq!(scheduler.service_transaction_check_dispatches(1024), 1);
-        let worker_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
-        queue_worker_unprocessed_response(&mut workers[0], worker_message.batch);
+        let worker_message = read_transaction_check_request(&scheduler).unwrap();
+        queue_unprocessed_transaction_check_response(&scheduler, worker_message.batch);
 
-        scheduler.service_worker_responses(1);
+        assert_eq!(scheduler.service_transaction_check_results(1), 1);
+
+        let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
+        assert_eq!(state.in_flight_worker_messages, 0);
+        assert!(
+            state
+                .pending_transaction_checks
+                .iter()
+                .map(|check| check.transaction_index)
+                .eq([0])
+        );
     }
 
     #[test]
@@ -6247,7 +6316,7 @@ mod tests {
         );
         assert_eq!(scheduler.service_ingress_queue(3), 3);
         assert_eq!(scheduler.service_transaction_check_dispatches(1024), 1);
-        let worker_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        let worker_message = read_transaction_check_request(&scheduler).unwrap();
         queue_unsupported_worker_response(&mut workers[0], worker_message.batch);
 
         scheduler.service_worker_responses(1);
@@ -6256,7 +6325,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "malformed replay CHECK worker response")]
     fn malformed_worker_check_response_panics_before_check_metadata() {
-        let (mut scheduler, mut replay_stage, mut workers) =
+        let (mut scheduler, mut replay_stage, _workers) =
             setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
                 allocator_size: 64 * 1024 * 1024,
                 replay_to_pack_capacity: 8,
@@ -6272,10 +6341,10 @@ mod tests {
         );
         assert_eq!(scheduler.service_ingress_queue(3), 3);
         assert_eq!(scheduler.service_transaction_check_dispatches(1024), 1);
-        let worker_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
-        queue_malformed_worker_check_response(&mut workers[0], worker_message.batch);
+        let worker_message = read_transaction_check_request(&scheduler).unwrap();
+        queue_malformed_transaction_check_response(&scheduler, worker_message.batch);
 
-        scheduler.service_worker_responses(1);
+        scheduler.service_transaction_check_results(1);
     }
 
     #[test]
@@ -6422,17 +6491,17 @@ mod tests {
         queue_signature_verification_result(&scheduler, 42, 0, true);
         assert_eq!(scheduler.service_signature_verification_results(1024), 1);
         assert_eq!(scheduler.service_transaction_check_dispatches(1024), 1);
-        let worker_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        let worker_message = read_transaction_check_request(&scheduler).unwrap();
         wait_for_entry_verification(&mut scheduler, 42);
         assert_eq!(scheduler.service_terminal_slots(1), 0);
         assert_eq!(read_replay_block_status(&mut replay_stage), None);
 
-        queue_worker_check_response(
-            &mut workers[0],
+        queue_transaction_check_response(
+            &scheduler,
             worker_message.batch,
             successful_check_response(),
         );
-        assert_eq!(scheduler.service_worker_responses(1), 1);
+        assert_eq!(scheduler.service_transaction_check_results(1), 1);
         assert_eq!(scheduler.service_terminal_slots(1), 0);
         assert_eq!(read_replay_block_status(&mut replay_stage), None);
 
@@ -6628,8 +6697,8 @@ mod tests {
     }
 
     #[test]
-    fn aborted_slot_waits_for_worker_check_response_before_cleanup() {
-        let (mut scheduler, mut replay_stage, mut workers) =
+    fn aborted_slot_waits_for_check_result_before_cleanup() {
+        let (mut scheduler, mut replay_stage, _workers) =
             setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
                 allocator_size: 64 * 1024 * 1024,
                 replay_to_pack_capacity: 8,
@@ -6651,7 +6720,7 @@ mod tests {
         );
         assert_eq!(scheduler.service_ingress_queue(3), 3);
         assert_eq!(scheduler.service_transaction_check_dispatches(1024), 1);
-        let worker_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        let worker_message = read_transaction_check_request(&scheduler).unwrap();
 
         write_replay_messages(&mut replay_stage, [abort(42)]);
         assert_eq!(scheduler.service_ingress_queue(1), 1);
@@ -6660,12 +6729,12 @@ mod tests {
         assert!(find_scheduling_state(&scheduler.scheduling_states, 42).is_some());
         assert_eq!(read_replay_block_status(&mut replay_stage), None);
 
-        queue_worker_check_response(
-            &mut workers[0],
+        queue_transaction_check_response(
+            &scheduler,
             worker_message.batch,
             successful_check_response(),
         );
-        assert_eq!(scheduler.service_worker_responses(1), 1);
+        assert_eq!(scheduler.service_transaction_check_results(1), 1);
         assert_eq!(scheduler.service_terminal_slots(1), 1);
 
         assert!(find_scheduling_state(&scheduler.scheduling_states, 42).is_none());
@@ -6708,14 +6777,14 @@ mod tests {
         );
         assert_eq!(scheduler.service_ingress_queue(3), 3);
         assert_eq!(scheduler.service_transaction_check_dispatches(1024), 1);
-        let check_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        let check_message = read_transaction_check_request(&scheduler).unwrap();
         wait_for_entry_verification(&mut scheduler, 42);
-        queue_worker_check_response(
-            &mut workers[0],
+        queue_transaction_check_response(
+            &scheduler,
             check_message.batch,
             successful_check_response(),
         );
-        assert_eq!(scheduler.service_worker_responses(1), 1);
+        assert_eq!(scheduler.service_transaction_check_results(1), 1);
         assert_eq!(scheduler.service_transaction_execution_dispatches(1, 1), 1);
         let execution_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
 
