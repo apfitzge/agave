@@ -2,7 +2,9 @@ mod store;
 
 use {
     agave_scheduling_utils::{
-        replay_events::{REPLAY_EVENTS_IPC_FILE, ReplayEvent, replay_event_tags},
+        replay_events::{
+            REPLAY_EVENTS_IPC_FILE, ReplayEvent, replay_event_tags, replay_scheduling_skip_reasons,
+        },
         shared_memory,
     },
     crossterm::{
@@ -1009,6 +1011,12 @@ fn timeline_event_detail(event: &ReplayEvent) -> String {
             "unscheduled_ready_ahead={unscheduled_ready_transactions_ahead}"
         ));
     }
+    if let Some(reason) = event.scheduling_skip_reason() {
+        details.push(format!(
+            "skip_reason={}",
+            scheduling_skip_reason_detail(reason)
+        ));
+    }
     if let Some(signature_verification_queue_len) = event.signature_verification_queue_len() {
         details.push(format!("queue_len={signature_verification_queue_len}"));
     }
@@ -1048,6 +1056,12 @@ fn worker_timeline_event_detail(event: &ReplayEvent) -> String {
             "unscheduled_ready_ahead={unscheduled_ready_transactions_ahead}"
         ));
     }
+    if let Some(reason) = event.scheduling_skip_reason() {
+        details.push(format!(
+            "skip_reason={}",
+            scheduling_skip_reason_detail(reason)
+        ));
+    }
     if let Some(estimated_cost_units) = event.estimated_cost_units() {
         details.push(format!("estimated_cost_units={estimated_cost_units}"));
     }
@@ -1061,6 +1075,21 @@ fn worker_timeline_event_detail(event: &ReplayEvent) -> String {
         details.push(format!("reason={reason}"));
     }
     details.join(" ")
+}
+
+fn scheduling_skip_reason_detail(reason: u64) -> String {
+    match reason {
+        replay_scheduling_skip_reasons::MULTIPLE_LOCK_CONFLICTS => {
+            "multiple-lock-conflicts".to_string()
+        }
+        replay_scheduling_skip_reasons::TOO_MUCH_WORK_ON_THREAD => {
+            "too-much-work-on-thread".to_string()
+        }
+        replay_scheduling_skip_reasons::PREVIOUSLY_UNSCHEDULED_CONFLICT => {
+            "previously-unscheduled-conflict".to_string()
+        }
+        reason => format!("unknown({reason})"),
+    }
 }
 
 fn handle_key(app: &mut App, key: KeyEvent, snapshot: &UiSnapshot) -> bool {
@@ -2833,7 +2862,13 @@ mod tests {
             signature: Some("signature-7".to_string()),
             events: vec![
                 ReplayEvent::transaction_ingested(10, 42, 7, [1; 64]),
-                ReplayEvent::transaction_scheduling_skipped(20, 42, 7, 3),
+                ReplayEvent::transaction_scheduling_skipped(
+                    20,
+                    42,
+                    7,
+                    3,
+                    replay_scheduling_skip_reasons::MULTIPLE_LOCK_CONFLICTS,
+                ),
                 ReplayEvent::transaction_worker_dispatch_event(
                     30,
                     replay_event_tags::TRANSACTION_SCHEDULED_FOR_EXEC,
@@ -2859,6 +2894,11 @@ mod tests {
             .unwrap();
 
         assert!(skipped.detail.contains("unscheduled_ready_ahead=3"));
+        assert!(
+            skipped
+                .detail
+                .contains("skip_reason=multiple-lock-conflicts")
+        );
         assert!(scheduled.detail.contains("unscheduled_ready_ahead=4"));
     }
 
@@ -2921,7 +2961,13 @@ mod tests {
                 ),
                 ReplayEvent::transaction_check_passed(150, 42, 7, 3, 123),
                 ReplayEvent::transaction_ready_for_scheduling(180, 42, 7, 8),
-                ReplayEvent::transaction_scheduling_skipped(190, 42, 7, 2),
+                ReplayEvent::transaction_scheduling_skipped(
+                    190,
+                    42,
+                    7,
+                    2,
+                    replay_scheduling_skip_reasons::PREVIOUSLY_UNSCHEDULED_CONFLICT,
+                ),
                 ReplayEvent::transaction_worker_dispatch_event(
                     220,
                     replay_event_tags::TRANSACTION_SCHEDULED_FOR_EXEC,

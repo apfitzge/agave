@@ -14,7 +14,7 @@ pub const REPLAY_EVENTS_IPC_FILE: &str = "agave_events.ipc";
 /// Check-passed transaction events also include `estimated_cost_units: u64`.
 /// Execution result transaction events also include `cost_units: u64`.
 /// Scheduling-skipped transaction events reuse the signature bytes as:
-/// `unscheduled_ready_transactions_ahead: u64`.
+/// `unscheduled_ready_transactions_ahead: u64`, `skip_reason: u64`.
 /// Worker dispatch transaction events also include
 /// `unscheduled_ready_transactions_ahead: u64`.
 /// Signature verification submission events also include
@@ -167,7 +167,8 @@ pub mod replay_event_tags {
     pub const TRANSACTION_SIGNATURE_VERIFICATION_WORKER_RESULT_SENT: u64 = 32;
     /// Transaction could not currently be scheduled.
     ///
-    /// Payload includes `unscheduled_ready_transactions_ahead: u64`.
+    /// Payload includes `unscheduled_ready_transactions_ahead: u64` and
+    /// `skip_reason: u64`.
     pub const TRANSACTION_SCHEDULING_SKIPPED: u64 = 6;
     /// Transaction was sent to a worker for execution.
     ///
@@ -190,6 +191,12 @@ pub mod replay_event_tags {
     pub const SLOT_FAILED: u64 = 11;
 }
 
+pub mod replay_scheduling_skip_reasons {
+    pub const MULTIPLE_LOCK_CONFLICTS: u64 = 1;
+    pub const TOO_MUCH_WORK_ON_THREAD: u64 = 2;
+    pub const PREVIOUSLY_UNSCHEDULED_CONFLICT: u64 = 3;
+}
+
 const SLOT_OFFSET: usize = 0;
 const SLOT_REASON_OFFSET: usize = SLOT_OFFSET + core::mem::size_of::<u64>();
 const TRANSACTION_INDEX_OFFSET: usize = SLOT_REASON_OFFSET;
@@ -198,6 +205,8 @@ const CHECK_QUEUE_LENGTH_OFFSET: usize = SIGNATURE_OFFSET;
 const WORKER_ID_OFFSET: usize = SIGNATURE_OFFSET;
 const WORKER_QUEUE_LENGTH_OFFSET: usize = WORKER_ID_OFFSET + core::mem::size_of::<u64>();
 const SCHEDULING_SKIPPED_UNSCHEDULED_READY_AHEAD_OFFSET: usize = SIGNATURE_OFFSET;
+const SCHEDULING_SKIPPED_REASON_OFFSET: usize =
+    SCHEDULING_SKIPPED_UNSCHEDULED_READY_AHEAD_OFFSET + core::mem::size_of::<u64>();
 const WORKER_DISPATCH_UNSCHEDULED_READY_AHEAD_OFFSET: usize =
     WORKER_QUEUE_LENGTH_OFFSET + core::mem::size_of::<u64>();
 const ESTIMATED_COST_UNITS_OFFSET: usize = WORKER_QUEUE_LENGTH_OFFSET;
@@ -297,6 +306,7 @@ impl ReplayEvent {
         slot: u64,
         transaction_index: u64,
         unscheduled_ready_transactions_ahead: u64,
+        skip_reason: u64,
     ) -> Self {
         let mut event = Self::transaction_event(
             timestamp_ns,
@@ -308,6 +318,7 @@ impl ReplayEvent {
             SCHEDULING_SKIPPED_UNSCHEDULED_READY_AHEAD_OFFSET,
             unscheduled_ready_transactions_ahead,
         );
+        event.write_u64(SCHEDULING_SKIPPED_REASON_OFFSET, skip_reason);
         event
     }
 
@@ -554,6 +565,15 @@ impl ReplayEvent {
         }
     }
 
+    pub fn scheduling_skip_reason(&self) -> Option<u64> {
+        if self.tag != replay_event_tags::TRANSACTION_SCHEDULING_SKIPPED {
+            return None;
+        }
+
+        let reason = self.read_u64(SCHEDULING_SKIPPED_REASON_OFFSET);
+        (reason != 0).then_some(reason)
+    }
+
     fn slot_event(timestamp_ns: u64, tag: u64, slot: u64) -> Self {
         let mut event = Self::new(timestamp_ns, tag);
         event.write_u64(SLOT_OFFSET, slot);
@@ -689,6 +709,7 @@ mod tests {
             REPLAY_EVENT_PAYLOAD_BYTES, ReplayEvent, ReplayTransactionCheckMetadata,
             ReplayTransactionExecutionMetadata, SIGNATURE_OFFSET,
             is_transaction_worker_dispatch_event_tag, replay_event_tags,
+            replay_scheduling_skip_reasons,
         },
         core::mem,
     };
@@ -755,12 +776,22 @@ mod tests {
     }
 
     #[test]
-    fn transaction_scheduling_skipped_carries_unscheduled_ready_transactions_ahead() {
-        let event = ReplayEvent::transaction_scheduling_skipped(1, 2, 3, 4);
+    fn transaction_scheduling_skipped_carries_unscheduled_ready_transactions_ahead_and_reason() {
+        let event = ReplayEvent::transaction_scheduling_skipped(
+            1,
+            2,
+            3,
+            4,
+            replay_scheduling_skip_reasons::MULTIPLE_LOCK_CONFLICTS,
+        );
 
         assert_eq!(event.slot(), 2);
         assert_eq!(event.transaction_index(), Some(3));
         assert_eq!(event.unscheduled_ready_transactions_ahead(), Some(4));
+        assert_eq!(
+            event.scheduling_skip_reason(),
+            Some(replay_scheduling_skip_reasons::MULTIPLE_LOCK_CONFLICTS)
+        );
         assert_eq!(event.worker_id(), None);
         assert_eq!(event.signature(), None);
     }

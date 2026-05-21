@@ -27,6 +27,7 @@ use {
         replay_events::{
             ReplayEvent, ReplayTransactionCheckMetadata as PendingWorkerCheck,
             ReplayTransactionExecutionMetadata as PendingWorkerExecution, replay_event_tags,
+            replay_scheduling_skip_reasons,
         },
         responses_region::{CheckResponsesPtr, ExecutionResponsesPtr},
         thread_aware_account_locks::{ThreadAwareAccountLocks, ThreadId, ThreadSet},
@@ -443,6 +444,7 @@ impl SchedulingState {
                     slot,
                     transaction_index,
                     unscheduled_ready_transactions_ahead,
+                    replay_scheduling_skip_reasons::PREVIOUSLY_UNSCHEDULED_CONFLICT,
                 );
                 return ReadyTransactionDispatchResult::Deferred;
             }
@@ -467,6 +469,7 @@ impl SchedulingState {
                         slot,
                         transaction_index,
                         unscheduled_ready_transactions_ahead,
+                        replay_scheduling_skip_reasons::MULTIPLE_LOCK_CONFLICTS,
                     );
                     return ReadyTransactionDispatchResult::Deferred;
                 }
@@ -475,6 +478,7 @@ impl SchedulingState {
                         slot,
                         transaction_index,
                         unscheduled_ready_transactions_ahead,
+                        replay_scheduling_skip_reasons::TOO_MUCH_WORK_ON_THREAD,
                     );
                     return ReadyTransactionDispatchResult::Unavailable;
                 }
@@ -914,6 +918,7 @@ impl ExecutionDispatchContext<'_> {
         slot: u64,
         transaction_index: usize,
         unscheduled_ready_transactions_ahead: usize,
+        reason: u64,
     ) {
         self.event_buffer
             .push(ReplayEvent::transaction_scheduling_skipped(
@@ -922,6 +927,7 @@ impl ExecutionDispatchContext<'_> {
                 u64::try_from(transaction_index).expect("transaction index must fit in u64"),
                 u64::try_from(unscheduled_ready_transactions_ahead)
                     .expect("unscheduled ready transaction count must fit in u64"),
+                reason,
             ));
     }
 
