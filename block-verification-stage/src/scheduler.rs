@@ -1569,33 +1569,37 @@ impl BlockVerificationScheduler {
         ));
     }
 
-    fn emit_transaction_signatures_submitted_event(
-        &self,
+    fn emit_transaction_signatures_submitted_event_to(
+        event_broadcast: Option<&ReplayEventBroadcast>,
         slot: u64,
         transaction_index: usize,
         signature_verification_queue_len: usize,
     ) {
-        self.emit_event(ReplayEvent::transaction_signatures_submitted(
-            0,
-            slot,
-            u64::try_from(transaction_index).expect("transaction index must fit in u64"),
-            u64::try_from(signature_verification_queue_len)
-                .expect("signature verification queue length must fit in u64"),
-        ));
+        if let Some(event_broadcast) = event_broadcast {
+            event_broadcast.emit(ReplayEvent::transaction_signatures_submitted(
+                0,
+                slot,
+                u64::try_from(transaction_index).expect("transaction index must fit in u64"),
+                u64::try_from(signature_verification_queue_len)
+                    .expect("signature verification queue length must fit in u64"),
+            ));
+        }
     }
 
-    fn emit_transaction_sent_for_check_event(
-        &self,
+    fn emit_transaction_sent_for_check_event_to(
+        event_broadcast: Option<&ReplayEventBroadcast>,
         slot: u64,
         transaction_index: usize,
         check_queue_len: usize,
     ) {
-        self.emit_event(ReplayEvent::transaction_sent_for_check(
-            0,
-            slot,
-            u64::try_from(transaction_index).expect("transaction index must fit in u64"),
-            u64::try_from(check_queue_len).expect("check queue length must fit in u64"),
-        ));
+        if let Some(event_broadcast) = event_broadcast {
+            event_broadcast.emit(ReplayEvent::transaction_sent_for_check(
+                0,
+                slot,
+                u64::try_from(transaction_index).expect("transaction index must fit in u64"),
+                u64::try_from(check_queue_len).expect("check queue length must fit in u64"),
+            ));
+        }
     }
 
     fn emit_transaction_worker_event(
@@ -1946,15 +1950,27 @@ impl BlockVerificationScheduler {
             return 0;
         }
 
+        let allocator = &self.session.allocator;
+        let check_requests = &mut self.session.check_requests;
+        let event_broadcast = self.event_broadcast.as_deref();
+        let in_flight_transaction_checks = &mut self.in_flight_transaction_checks;
+        let scheduling_states = &mut self.scheduling_states;
         let mut dispatched = 0;
-        for slot_index in 0..self.slot_order.len() {
-            let slot = self.slot_order[slot_index];
-            while dispatched < max_checks && self.has_pending_transaction_checks(slot) {
-                let Some(pending_check) = self.pending_transaction_check(slot) else {
+        for slot in self.slot_order.iter().copied() {
+            let Some(state) = scheduling_states.get_mut(&slot) else {
+                continue;
+            };
+            if !state.allows_transaction_processing() {
+                continue;
+            }
+            while dispatched < max_checks {
+                let Some(pending_check) = state.pending_transaction_checks.front().copied() else {
                     break;
                 };
 
-                let Some(batch) = self.allocate_transaction_check_batch(slot, pending_check) else {
+                let Some(batch) =
+                    Self::allocate_transaction_check_batch(allocator, state, pending_check)
+                else {
                     return dispatched;
                 };
 
@@ -1963,21 +1979,22 @@ impl BlockVerificationScheduler {
                     max_working_slot: slot,
                     batch,
                 };
-                if let Err(returned_message) = self.session.check_requests.try_write(message) {
-                    self.free_transaction_batch_allocation(returned_message.batch);
+                if let Err(returned_message) = check_requests.try_write(message) {
+                    Self::free_transaction_batch_allocation_with_allocator(
+                        allocator,
+                        returned_message.batch,
+                    );
                     return dispatched;
                 }
 
-                {
-                    let state = self.scheduling_state_mut(slot);
-                    state.pending_transaction_checks.pop_front();
-                    state.in_flight_worker_messages += 1;
-                }
-                self.in_flight_transaction_checks += 1;
-                self.emit_transaction_sent_for_check_event(
+                state.pending_transaction_checks.pop_front();
+                state.in_flight_worker_messages += 1;
+                *in_flight_transaction_checks += 1;
+                Self::emit_transaction_sent_for_check_event_to(
+                    event_broadcast,
                     slot,
                     pending_check.transaction_index,
-                    self.in_flight_transaction_checks,
+                    *in_flight_transaction_checks,
                 );
                 dispatched += 1;
             }
@@ -1989,57 +2006,46 @@ impl BlockVerificationScheduler {
         dispatched
     }
 
-    fn has_pending_transaction_checks(&self, slot: u64) -> bool {
-        self.scheduling_states
-            .get(&slot)
-            .filter(|state| state.allows_transaction_processing())
-            .is_some_and(|state| !state.pending_transaction_checks.is_empty())
-    }
-
-    fn pending_transaction_check(&self, slot: u64) -> Option<PendingTransactionCheck> {
-        let state = self.scheduling_states.get(&slot)?;
-        if !state.allows_transaction_processing() {
-            return None;
-        }
-
-        state.pending_transaction_checks.front().copied()
-    }
-
     fn service_signature_verification_submissions(&mut self, max_submissions: usize) -> usize {
         if max_submissions == 0 {
             return 0;
         }
 
+        let allocator = &self.session.allocator;
+        let signature_verification_requests = &mut self.session.signature_verification_requests;
+        let event_broadcast = self.event_broadcast.as_deref();
+        let in_flight_signature_verifications = &mut self.in_flight_signature_verifications;
+        let scheduling_states = &mut self.scheduling_states;
         let mut submitted = 0;
-        for slot_index in 0..self.slot_order.len() {
-            let slot = self.slot_order[slot_index];
-            while submitted < max_submissions
-                && self.has_pending_signature_verification_requests(slot)
-            {
-                let Some(pending_request) = self.pending_signature_verification_request(slot)
+        for slot in self.slot_order.iter().copied() {
+            let Some(state) = scheduling_states.get_mut(&slot) else {
+                continue;
+            };
+            if !state.allows_transaction_processing() {
+                continue;
+            }
+            while submitted < max_submissions {
+                let Some(pending_request) = state
+                    .pending_signature_verification_requests
+                    .front()
+                    .copied()
                 else {
                     break;
                 };
-                let request = self.signature_verification_request(slot, pending_request);
-                if self
-                    .session
-                    .signature_verification_requests
-                    .try_write(request)
-                    .is_err()
-                {
+                let request =
+                    Self::signature_verification_request(allocator, state, pending_request);
+                if signature_verification_requests.try_write(request).is_err() {
                     return submitted;
                 }
 
-                {
-                    let state = self.scheduling_state_mut(slot);
-                    state.pending_signature_verification_requests.pop_front();
-                    state.in_flight_signature_verifications += 1;
-                }
-                self.in_flight_signature_verifications += 1;
-                self.emit_transaction_signatures_submitted_event(
+                state.pending_signature_verification_requests.pop_front();
+                state.in_flight_signature_verifications += 1;
+                *in_flight_signature_verifications += 1;
+                Self::emit_transaction_signatures_submitted_event_to(
+                    event_broadcast,
                     slot,
                     pending_request.transaction_index,
-                    self.in_flight_signature_verifications,
+                    *in_flight_signature_verifications,
                 );
                 submitted += 1;
             }
@@ -2051,50 +2057,24 @@ impl BlockVerificationScheduler {
         submitted
     }
 
-    fn has_pending_signature_verification_requests(&self, slot: u64) -> bool {
-        self.scheduling_states
-            .get(&slot)
-            .filter(|state| state.allows_transaction_processing())
-            .is_some_and(|state| !state.pending_signature_verification_requests.is_empty())
-    }
-
-    fn pending_signature_verification_request(
-        &self,
-        slot: u64,
-    ) -> Option<PendingSignatureVerificationRequest> {
-        let state = self.scheduling_states.get(&slot)?;
-        if !state.allows_transaction_processing() {
-            return None;
-        }
-
-        state
-            .pending_signature_verification_requests
-            .front()
-            .copied()
-    }
-
     fn signature_verification_request(
-        &self,
-        slot: u64,
+        allocator: &rts_alloc::Allocator,
+        state: &SchedulingState,
         pending_request: PendingSignatureVerificationRequest,
     ) -> SignatureVerificationRequest {
-        let state = self
-            .scheduling_states
-            .get(&slot)
-            .expect("signature verification dispatch for unknown slot");
         let transaction = state
             .transactions
             .get(pending_request.transaction_index)
             .expect("signature verification dispatch for unknown transaction");
 
         SignatureVerificationRequest {
-            slot,
+            slot: state.slot,
             bank_id: state.bank_id,
             transaction_index: pending_request.transaction_index,
             transaction: unsafe {
                 transaction
                     .transaction_ptr()
-                    .to_sharable_transaction_region(&self.session.allocator)
+                    .to_sharable_transaction_region(allocator)
             },
         }
     }
@@ -2166,16 +2146,13 @@ impl BlockVerificationScheduler {
     }
 
     fn allocate_transaction_check_batch(
-        &self,
-        slot: u64,
+        allocator: &rts_alloc::Allocator,
+        state: &SchedulingState,
         pending_check: PendingTransactionCheck,
     ) -> Option<SharableTransactionBatchRegion> {
-        let ptr = self
-            .session
-            .allocator
-            .allocate(CHECK_TRANSACTION_BATCH_ALLOCATION_SIZE)?;
+        let ptr = allocator.allocate(CHECK_TRANSACTION_BATCH_ALLOCATION_SIZE)?;
         // SAFETY: `ptr` was allocated by this scheduler's allocator above.
-        let transactions_offset = unsafe { self.session.allocator.offset(ptr) };
+        let transactions_offset = unsafe { allocator.offset(ptr) };
         let batch_ptr = ptr.cast::<SharableTransactionRegion>();
 
         // SAFETY: The allocation size is
@@ -2191,7 +2168,7 @@ impl BlockVerificationScheduler {
         // batch allocation. CHECK dispatches intentionally send one transaction
         // per worker message, so writing the first transaction region is
         // in-bounds.
-        let transaction = self.transaction_region_for_check(slot, pending_check);
+        let transaction = Self::transaction_region_for_check(allocator, state, pending_check);
         unsafe {
             batch_ptr.as_ptr().write(transaction);
         }
@@ -2199,7 +2176,7 @@ impl BlockVerificationScheduler {
         // metadata slot computed from `TransactionPtrBatch`'s layout.
         unsafe {
             meta_ptr.as_ptr().write(PendingWorkerCheck {
-                slot,
+                slot: state.slot,
                 transaction_index: pending_check.transaction_index,
                 thread_id: 0,
             });
@@ -2212,14 +2189,10 @@ impl BlockVerificationScheduler {
     }
 
     fn transaction_region_for_check(
-        &self,
-        slot: u64,
+        allocator: &rts_alloc::Allocator,
+        state: &SchedulingState,
         pending_check: PendingTransactionCheck,
     ) -> SharableTransactionRegion {
-        let state = self
-            .scheduling_states
-            .get(&slot)
-            .expect("transaction check dispatch for unknown slot");
         let transaction = state
             .transactions
             .get(pending_check.transaction_index)
@@ -2230,7 +2203,7 @@ impl BlockVerificationScheduler {
         unsafe {
             transaction
                 .transaction_ptr()
-                .to_sharable_transaction_region(&self.session.allocator)
+                .to_sharable_transaction_region(allocator)
         }
     }
 
@@ -3023,13 +2996,18 @@ impl BlockVerificationScheduler {
     }
 
     fn free_transaction_batch_allocation(&mut self, batch: SharableTransactionBatchRegion) {
+        Self::free_transaction_batch_allocation_with_allocator(&self.session.allocator, batch);
+    }
+
+    fn free_transaction_batch_allocation_with_allocator(
+        allocator: &rts_alloc::Allocator,
+        batch: SharableTransactionBatchRegion,
+    ) {
         // SAFETY: Transaction batch regions are allocated by this scheduler
         // and remain scheduler-owned until a worker response returns them or
         // a dispatch attempt fails before handing the batch to a worker.
         unsafe {
-            self.session
-                .allocator
-                .free_offset(batch.transactions_offset);
+            allocator.free_offset(batch.transactions_offset);
         }
     }
 
@@ -3200,6 +3178,25 @@ mod tests {
         );
 
         (scheduler, sessions.replay_stage, sessions.workers)
+    }
+
+    fn setup_scheduler_replay_stage_and_check_workers(
+        config: BlockVerificationStageSetupConfig,
+    ) -> (
+        BlockVerificationScheduler,
+        ReplayStageSession,
+        Vec<CheckWorkerSession>,
+    ) {
+        let sessions = setup_sessions_with_config(config);
+        let exit = Arc::new(AtomicBool::new(false));
+        let scheduler = BlockVerificationScheduler::new(
+            exit,
+            sessions.block_verification_stage,
+            NonZeroUsize::new(1).unwrap(),
+            None,
+        );
+
+        (scheduler, sessions.replay_stage, sessions.check_workers)
     }
 
     fn setup_scheduler_replay_stage_workers_and_events(
@@ -4212,10 +4209,10 @@ mod tests {
     }
 
     #[test]
-    fn transaction_checks_round_robin_across_available_workers() {
+    fn transaction_checks_dispatch_to_check_queue() {
         const TRANSACTION_COUNT: usize = 8;
-        let (mut scheduler, mut replay_stage, mut workers) =
-            setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
+        let (mut scheduler, mut replay_stage, mut check_workers) =
+            setup_scheduler_replay_stage_and_check_workers(BlockVerificationStageSetupConfig {
                 allocator_size: 64 * 1024 * 1024,
                 replay_to_pack_capacity: 16,
                 replay_block_status_capacity: 8,
@@ -4253,23 +4250,21 @@ mod tests {
             TRANSACTION_COUNT,
         );
 
-        for (worker_index, worker) in workers.iter_mut().enumerate().take(4) {
-            for transaction_index in [worker_index, worker_index + 4] {
-                let worker_message = read_pack_to_worker_message(worker).unwrap();
-                assert_eq!(worker_message.batch.num_transactions, 1);
-                assert_eq!(
-                    transaction_batch_regions(&replay_stage.allocator, worker_message.batch),
-                    &[transactions[transaction_index]],
-                );
-                assert_eq!(
-                    transaction_check_metadata(&replay_stage.allocator, worker_message.batch),
-                    PendingWorkerCheck {
-                        slot: 42,
-                        transaction_index,
-                        thread_id: worker_index,
-                    },
-                );
-            }
+        for (transaction_index, transaction) in transactions.iter().copied().enumerate() {
+            let worker_message = read_check_worker_request(&mut check_workers[0]).unwrap();
+            assert_eq!(worker_message.batch.num_transactions, 1);
+            assert_eq!(
+                transaction_batch_regions(&replay_stage.allocator, worker_message.batch),
+                &[transaction],
+            );
+            assert_eq!(
+                transaction_check_metadata(&replay_stage.allocator, worker_message.batch),
+                PendingWorkerCheck {
+                    slot: 42,
+                    transaction_index,
+                    thread_id: 0,
+                },
+            );
         }
 
         let state = scheduler.scheduling_states.get(&42).unwrap();
@@ -4279,8 +4274,8 @@ mod tests {
 
     #[test]
     fn transaction_checks_iterate_ordered_slot_list() {
-        let (mut scheduler, mut replay_stage, mut workers) =
-            setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
+        let (mut scheduler, mut replay_stage, mut check_workers) =
+            setup_scheduler_replay_stage_and_check_workers(BlockVerificationStageSetupConfig {
                 allocator_size: 64 * 1024 * 1024,
                 replay_to_pack_capacity: 16,
                 replay_block_status_capacity: 8,
@@ -4308,8 +4303,8 @@ mod tests {
         assert_eq!(scheduler.slot_order, vec![41, 42, 43]);
         assert_eq!(scheduler.service_transaction_check_dispatches(2), 2);
 
-        let first_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
-        let second_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        let first_message = read_check_worker_request(&mut check_workers[0]).unwrap();
+        let second_message = read_check_worker_request(&mut check_workers[0]).unwrap();
         assert_eq!(
             transaction_check_metadata(&replay_stage.allocator, first_message.batch).slot,
             41,
@@ -4318,10 +4313,10 @@ mod tests {
             transaction_check_metadata(&replay_stage.allocator, second_message.batch).slot,
             42,
         );
-        assert!(read_pack_to_worker_message(&mut workers[0]).is_none());
+        assert!(read_check_worker_request(&mut check_workers[0]).is_none());
 
         assert_eq!(scheduler.service_transaction_check_dispatches(1024), 1);
-        let third_message = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        let third_message = read_check_worker_request(&mut check_workers[0]).unwrap();
         assert_eq!(
             transaction_check_metadata(&replay_stage.allocator, third_message.batch).slot,
             43,
