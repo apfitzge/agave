@@ -12,6 +12,7 @@ use {
         execute,
         terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
     },
+    crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded},
     ratatui::{
         Frame, Terminal,
         backend::CrosstermBackend,
@@ -37,9 +38,14 @@ use {
 };
 
 const DEFAULT_RETAINED_SLOTS: usize = 64;
-const DEFAULT_POLL_MS: u64 = 10;
+const DEFAULT_POLL_MS: u64 = 0;
 const DEFAULT_UI_TICK_MS: u64 = 100;
+const EVENT_READER_BATCH_SIZE: usize = 4096;
+const EVENT_BATCH_POOL_SIZE: usize = 16;
+const EVENT_PROCESSOR_WAIT_MS: u64 = 10;
 const PAGE_STEP: usize = 10;
+
+type EventBatch = Vec<ReplayEvent>;
 
 struct Args {
     ledger_path: PathBuf,
@@ -50,6 +56,7 @@ struct Args {
 #[derive(Default)]
 struct ReaderStats {
     received_events: AtomicU64,
+    processed_events: AtomicU64,
     skipped_events: AtomicU64,
 }
 
@@ -93,6 +100,7 @@ enum ReplayWorkerStage {
 
 struct UiSnapshot {
     received_events: u64,
+    processed_events: u64,
     skipped_events: u64,
     slots: Vec<SlotSummary>,
     selected_slot: Option<SelectedSlot>,
@@ -200,13 +208,28 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut consumer = shared_memory::join_broadcast_consumer_at_path::<ReplayEvent>(&events_path)?;
     let store = Arc::new(Mutex::new(EventStore::new(args.retained_slots)));
     let stats = Arc::new(ReaderStats::default());
+    let (event_batch_sender, event_batch_receiver) = unbounded();
+    let (free_batch_sender, free_batch_receiver) = bounded(EVENT_BATCH_POOL_SIZE);
+    for _ in 0..EVENT_BATCH_POOL_SIZE {
+        free_batch_sender
+            .send(Vec::with_capacity(EVENT_READER_BATCH_SIZE))
+            .map_err(|_| "failed to initialize replay event batch pool")?;
+    }
     let exit = Arc::new(AtomicBool::new(false));
     let reader = spawn_reader(
         move || consumer.try_read(Ordering::Relaxed),
-        Arc::clone(&store),
+        event_batch_sender,
+        free_batch_receiver,
         Arc::clone(&stats),
         Arc::clone(&exit),
         args.poll_interval,
+    );
+    let processor = spawn_processor(
+        event_batch_receiver,
+        free_batch_sender,
+        Arc::clone(&store),
+        Arc::clone(&stats),
+        Arc::clone(&exit),
     );
 
     let tui_result = run_tui(&store, &stats);
@@ -215,6 +238,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     reader
         .join()
         .map_err(|_| "replay event reader thread panicked")?;
+    processor
+        .join()
+        .map_err(|_| "replay event processor thread panicked")?;
     tui_result?;
     Ok(())
 }
@@ -274,7 +300,8 @@ fn print_usage() {
 
 fn spawn_reader<F>(
     mut read_next: F,
-    store: Arc<Mutex<EventStore>>,
+    event_batch_sender: Sender<EventBatch>,
+    free_batch_receiver: Receiver<EventBatch>,
     stats: Arc<ReaderStats>,
     exit: Arc<AtomicBool>,
     poll_interval: Duration,
@@ -283,18 +310,32 @@ where
     F: FnMut() -> Result<Option<ReplayEvent>, usize> + Send + 'static,
 {
     thread::spawn(move || {
+        let mut events = empty_event_batch(&free_batch_receiver);
         while !exit.load(Ordering::Relaxed) {
             let mut read_any = false;
             loop {
                 if exit.load(Ordering::Relaxed) {
+                    flush_read_events(
+                        &event_batch_sender,
+                        &free_batch_receiver,
+                        &stats,
+                        &mut events,
+                    );
                     return;
                 }
 
                 match read_next() {
                     Ok(Some(event)) => {
                         read_any = true;
-                        stats.received_events.fetch_add(1, Ordering::Relaxed);
-                        store.lock().unwrap().apply_event(event);
+                        events.push(event);
+                        if events.len() >= EVENT_READER_BATCH_SIZE {
+                            flush_read_events(
+                                &event_batch_sender,
+                                &free_batch_receiver,
+                                &stats,
+                                &mut events,
+                            );
+                        }
                     }
                     Ok(None) => break,
                     Err(skipped) => {
@@ -304,12 +345,100 @@ where
                     }
                 }
             }
+            flush_read_events(
+                &event_batch_sender,
+                &free_batch_receiver,
+                &stats,
+                &mut events,
+            );
 
             if !read_any {
-                thread::sleep(poll_interval);
+                if poll_interval.is_zero() {
+                    thread::yield_now();
+                } else {
+                    thread::sleep(poll_interval);
+                }
             }
         }
     })
+}
+
+fn flush_read_events(
+    event_batch_sender: &Sender<EventBatch>,
+    free_batch_receiver: &Receiver<EventBatch>,
+    stats: &ReaderStats,
+    events: &mut Vec<ReplayEvent>,
+) {
+    if events.is_empty() {
+        return;
+    }
+
+    let event_count = u64::try_from(events.len()).unwrap_or(u64::MAX);
+    let mut next_events = empty_event_batch(free_batch_receiver);
+    std::mem::swap(events, &mut next_events);
+    if event_batch_sender.send(next_events).is_ok() {
+        stats
+            .received_events
+            .fetch_add(event_count, Ordering::Relaxed);
+    }
+}
+
+fn empty_event_batch(free_batch_receiver: &Receiver<EventBatch>) -> EventBatch {
+    free_batch_receiver
+        .try_recv()
+        .unwrap_or_else(|_| Vec::with_capacity(EVENT_READER_BATCH_SIZE))
+}
+
+fn spawn_processor(
+    event_batch_receiver: Receiver<EventBatch>,
+    free_batch_sender: Sender<EventBatch>,
+    store: Arc<Mutex<EventStore>>,
+    stats: Arc<ReaderStats>,
+    exit: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        loop {
+            let event_batch =
+                match event_batch_receiver.recv_timeout(Duration::from_millis(EVENT_PROCESSOR_WAIT_MS)) {
+                    Ok(event_batch) => event_batch,
+                    Err(RecvTimeoutError::Timeout) => {
+                        if exit.load(Ordering::Relaxed) && event_batch_receiver.is_empty() {
+                            return;
+                        }
+                        continue;
+                    }
+                    Err(RecvTimeoutError::Disconnected) => return,
+                };
+
+            process_event_batch(event_batch, &free_batch_sender, &store, &stats);
+            while let Ok(event_batch) = event_batch_receiver.try_recv() {
+                process_event_batch(event_batch, &free_batch_sender, &store, &stats);
+                if exit.load(Ordering::Relaxed) && event_batch_receiver.is_empty() {
+                    return;
+                }
+            }
+        }
+    })
+}
+
+fn process_event_batch(
+    mut events: EventBatch,
+    free_batch_sender: &Sender<EventBatch>,
+    store: &Mutex<EventStore>,
+    stats: &ReaderStats,
+) {
+    let event_count = u64::try_from(events.len()).unwrap_or(u64::MAX);
+    {
+        let mut store = store.lock().unwrap();
+        for event in events.drain(..) {
+            store.apply_event(event);
+        }
+    }
+    stats
+        .processed_events
+        .fetch_add(event_count, Ordering::Relaxed);
+    events.clear();
+    let _ = free_batch_sender.try_send(events);
 }
 
 fn run_tui(store: &Arc<Mutex<EventStore>>, stats: &Arc<ReaderStats>) -> io::Result<()> {
@@ -444,6 +573,7 @@ fn snapshot(
 
     UiSnapshot {
         received_events: stats.received_events.load(Ordering::Relaxed),
+        processed_events: stats.processed_events.load(Ordering::Relaxed),
         skipped_events: stats.skipped_events.load(Ordering::Relaxed),
         slots,
         selected_slot,
@@ -1703,8 +1833,12 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App, snapshot: &UiSnap
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!(
-            "  received={} skipped={} retained={} selected_slot={} focus={}{}",
+            "  received={} processed={} queued={} skipped={} retained={} selected_slot={} focus={}{}",
             snapshot.received_events,
+            snapshot.processed_events,
+            snapshot
+                .received_events
+                .saturating_sub(snapshot.processed_events),
             snapshot.skipped_events,
             snapshot.slots.len(),
             selected_slot,
@@ -2411,6 +2545,7 @@ mod tests {
         };
         let snapshot = UiSnapshot {
             received_events: 0,
+            processed_events: 0,
             skipped_events: 0,
             slots: (0..15).map(slot_summary).collect(),
             selected_slot: None,
@@ -2611,6 +2746,7 @@ mod tests {
     fn worker_filter_resets_when_slot_changes() {
         let snapshot = UiSnapshot {
             received_events: 0,
+            processed_events: 0,
             skipped_events: 0,
             slots: (0..3).map(slot_summary).collect(),
             selected_slot: None,
@@ -3577,6 +3713,7 @@ mod tests {
     fn snapshot_with_transactions(indices: &[u64]) -> UiSnapshot {
         UiSnapshot {
             received_events: 0,
+            processed_events: 0,
             skipped_events: 0,
             slots: vec![slot_summary(42)],
             selected_slot: Some(SelectedSlot {
