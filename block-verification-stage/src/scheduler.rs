@@ -385,6 +385,7 @@ impl SchedulingState {
             return ExecutionDispatchCounts::default();
         }
 
+        let start_timestamp_ns = replay_event_timestamp_ns();
         let mut counts = ExecutionDispatchCounts::default();
         while self.ready_scan_cursor < self.ready_transactions.len()
             && counts.scanned < max_scanned_transactions
@@ -407,6 +408,7 @@ impl SchedulingState {
                 ReadyTransactionDispatchResult::Deferred => {
                     self.unscheduled_ready_transactions_before_cursor += 1;
                     counts.scanned += 1;
+                    counts.conflicts += 1;
                 }
                 ReadyTransactionDispatchResult::Unavailable => {
                     counts.scanned += 1;
@@ -421,6 +423,14 @@ impl SchedulingState {
         }
 
         self.prune_scheduled_ready_prefix();
+        if counts.scanned != 0 {
+            dispatch_context.emit_scheduling_summary_event(
+                self.slot,
+                start_timestamp_ns,
+                replay_event_timestamp_ns(),
+                counts,
+            );
+        }
 
         counts
     }
@@ -835,10 +845,11 @@ struct ExecutionDispatchContext<'a> {
     event_buffer: &'a mut ReplayEventBuffer,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct ExecutionDispatchCounts {
     scheduled: usize,
     scanned: usize,
+    conflicts: usize,
 }
 
 #[derive(Default)]
@@ -935,6 +946,25 @@ enum ExecutionDispatchResult {
 }
 
 impl ExecutionDispatchContext<'_> {
+    fn emit_scheduling_summary_event(
+        &mut self,
+        slot: u64,
+        start_timestamp_ns: u64,
+        end_timestamp_ns: u64,
+        counts: ExecutionDispatchCounts,
+    ) {
+        self.event_buffer
+            .push_timestamped(ReplayEvent::slot_scheduling_summary(
+                start_timestamp_ns,
+                slot,
+                end_timestamp_ns,
+                u64::try_from(counts.scanned).expect("scanned transaction count must fit in u64"),
+                u64::try_from(counts.scheduled)
+                    .expect("scheduled transaction count must fit in u64"),
+                u64::try_from(counts.conflicts).expect("conflict count must fit in u64"),
+            ));
+    }
+
     fn emit_transaction_scheduling_skipped_event(
         &mut self,
         slot: u64,
@@ -4834,6 +4864,52 @@ mod tests {
         assert_eq!(
             events.iter().map(|event| event.tag).collect::<Vec<_>>(),
             vec![replay_event_tags::SLOT_BEGIN],
+        );
+    }
+
+    #[test]
+    fn replay_event_broadcast_records_scheduling_summary() {
+        let (mut scheduler, mut replay_stage, _workers, mut event_consumer, _temp_dir) =
+            setup_scheduler_replay_stage_workers_and_events(BlockVerificationStageSetupConfig {
+                allocator_size: 64 * 1024 * 1024,
+                replay_to_pack_capacity: 8,
+                replay_block_status_capacity: 8,
+                worker_count: 1,
+                pack_to_worker_capacity: 8,
+                worker_to_pack_capacity: 8,
+            });
+        let transaction = allocate_minimal_transaction_region(&replay_stage.allocator, 1);
+        write_replay_messages(
+            &mut replay_stage,
+            [begin(42), entry(42, 1), transaction_message(transaction)],
+        );
+        assert_eq!(scheduler.service_ingress_queue(3), 3);
+        assert_eq!(scheduler.service_transaction_check_dispatches(1024), 1);
+        let check_message = read_transaction_check_request(&scheduler).unwrap();
+        queue_transaction_check_response(
+            &scheduler,
+            check_message.batch,
+            successful_check_response(),
+        );
+        assert_eq!(scheduler.service_transaction_check_results(1), 1);
+        drain_replay_events(&mut event_consumer);
+
+        assert_eq!(scheduler.service_transaction_execution_dispatches(1, 1), 1);
+
+        let events = drain_replay_events(&mut event_consumer);
+        let scheduling_summary = events
+            .iter()
+            .find(|event| event.tag == replay_event_tags::SLOT_SCHEDULING_SUMMARY)
+            .expect("scheduling summary event must be emitted");
+        assert_eq!(scheduling_summary.slot(), 42);
+        assert_eq!(scheduling_summary.scheduling_summary_scanned(), Some(1));
+        assert_eq!(scheduling_summary.scheduling_summary_scheduled(), Some(1));
+        assert_eq!(scheduling_summary.scheduling_summary_conflicts(), Some(0));
+        assert!(
+            scheduling_summary
+                .scheduling_summary_end_timestamp_ns()
+                .unwrap()
+                >= scheduling_summary.timestamp_ns
         );
     }
 

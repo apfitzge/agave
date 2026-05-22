@@ -24,6 +24,8 @@ pub const REPLAY_EVENTS_IPC_FILE: &str = "agave_events.ipc";
 /// `signature_verification_worker_id: u64`.
 /// Ready-for-scheduling transaction events reuse the signature bytes as:
 /// `ready_released_by_transaction_index: u64`.
+/// Scheduling summary slot events reuse the reason and signature bytes as:
+/// `end_timestamp_ns: u64`, `scanned: u64`, `scheduled: u64`, `conflicts: u64`.
 pub const REPLAY_EVENT_PAYLOAD_BYTES: usize = 80;
 
 use crate::thread_aware_account_locks::ThreadId;
@@ -166,6 +168,12 @@ pub mod replay_event_tags {
     ///
     /// Payload includes `signature_verification_worker_id: u64` and `verified: u64`.
     pub const TRANSACTION_SIGNATURE_VERIFICATION_WORKER_RESULT_SENT: u64 = 32;
+    /// Scheduler completed a transaction scheduling scan for a slot.
+    ///
+    /// Event timestamp is the scan start timestamp. Payload includes
+    /// `end_timestamp_ns: u64`, `scanned: u64`, `scheduled: u64`, and
+    /// `conflicts: u64`.
+    pub const SLOT_SCHEDULING_SUMMARY: u64 = 33;
     /// Transaction could not currently be scheduled.
     ///
     /// Payload includes `unscheduled_ready_transactions_ahead: u64`,
@@ -220,6 +228,13 @@ const SIGNATURE_VERIFICATION_WORKER_ID_OFFSET: usize = SIGNATURE_OFFSET;
 const SIGNATURE_VERIFICATION_WORKER_RESULT_OFFSET: usize =
     SIGNATURE_VERIFICATION_WORKER_ID_OFFSET + core::mem::size_of::<u64>();
 const READY_RELEASED_BY_TRANSACTION_INDEX_OFFSET: usize = SIGNATURE_OFFSET;
+const SCHEDULING_SUMMARY_END_TIMESTAMP_OFFSET: usize = SLOT_REASON_OFFSET;
+const SCHEDULING_SUMMARY_SCANNED_OFFSET: usize =
+    SCHEDULING_SUMMARY_END_TIMESTAMP_OFFSET + core::mem::size_of::<u64>();
+const SCHEDULING_SUMMARY_SCHEDULED_OFFSET: usize =
+    SCHEDULING_SUMMARY_SCANNED_OFFSET + core::mem::size_of::<u64>();
+const SCHEDULING_SUMMARY_CONFLICTS_OFFSET: usize =
+    SCHEDULING_SUMMARY_SCHEDULED_OFFSET + core::mem::size_of::<u64>();
 
 impl ReplayEvent {
     pub fn slot_begin(timestamp_ns: u64, slot: u64) -> Self {
@@ -237,6 +252,26 @@ impl ReplayEvent {
     pub fn slot_failed(timestamp_ns: u64, slot: u64, reason: u16) -> Self {
         let mut event = Self::slot_event(timestamp_ns, replay_event_tags::SLOT_FAILED, slot);
         event.write_u64(SLOT_REASON_OFFSET, u64::from(reason));
+        event
+    }
+
+    pub fn slot_scheduling_summary(
+        start_timestamp_ns: u64,
+        slot: u64,
+        end_timestamp_ns: u64,
+        scanned: u64,
+        scheduled: u64,
+        conflicts: u64,
+    ) -> Self {
+        let mut event = Self::slot_event(
+            start_timestamp_ns,
+            replay_event_tags::SLOT_SCHEDULING_SUMMARY,
+            slot,
+        );
+        event.write_u64(SCHEDULING_SUMMARY_END_TIMESTAMP_OFFSET, end_timestamp_ns);
+        event.write_u64(SCHEDULING_SUMMARY_SCANNED_OFFSET, scanned);
+        event.write_u64(SCHEDULING_SUMMARY_SCHEDULED_OFFSET, scheduled);
+        event.write_u64(SCHEDULING_SUMMARY_CONFLICTS_OFFSET, conflicts);
         event
     }
 
@@ -486,6 +521,26 @@ impl ReplayEvent {
         self.read_u64(SLOT_REASON_OFFSET).try_into().ok()
     }
 
+    pub fn scheduling_summary_end_timestamp_ns(&self) -> Option<u64> {
+        (self.tag == replay_event_tags::SLOT_SCHEDULING_SUMMARY)
+            .then(|| self.read_u64(SCHEDULING_SUMMARY_END_TIMESTAMP_OFFSET))
+    }
+
+    pub fn scheduling_summary_scanned(&self) -> Option<u64> {
+        (self.tag == replay_event_tags::SLOT_SCHEDULING_SUMMARY)
+            .then(|| self.read_u64(SCHEDULING_SUMMARY_SCANNED_OFFSET))
+    }
+
+    pub fn scheduling_summary_scheduled(&self) -> Option<u64> {
+        (self.tag == replay_event_tags::SLOT_SCHEDULING_SUMMARY)
+            .then(|| self.read_u64(SCHEDULING_SUMMARY_SCHEDULED_OFFSET))
+    }
+
+    pub fn scheduling_summary_conflicts(&self) -> Option<u64> {
+        (self.tag == replay_event_tags::SLOT_SCHEDULING_SUMMARY)
+            .then(|| self.read_u64(SCHEDULING_SUMMARY_CONFLICTS_OFFSET))
+    }
+
     pub fn worker_id(&self) -> Option<u64> {
         if is_transaction_worker_event_tag(self.tag) {
             Some(self.read_u64(WORKER_ID_OFFSET))
@@ -696,6 +751,7 @@ pub const fn is_slot_event_tag(tag: u64) -> bool {
             | replay_event_tags::SLOT_ABORT
             | replay_event_tags::SLOT_COMPLETE
             | replay_event_tags::SLOT_FAILED
+            | replay_event_tags::SLOT_SCHEDULING_SUMMARY
     )
 }
 
@@ -739,7 +795,7 @@ mod tests {
     use {
         super::{
             REPLAY_EVENT_PAYLOAD_BYTES, ReplayEvent, ReplayTransactionCheckMetadata,
-            ReplayTransactionExecutionMetadata, SIGNATURE_OFFSET,
+            ReplayTransactionExecutionMetadata, SIGNATURE_OFFSET, is_slot_event_tag,
             is_transaction_worker_dispatch_event_tag, replay_event_tags,
             replay_scheduling_skip_reasons,
         },
@@ -778,6 +834,21 @@ mod tests {
         assert_eq!(event.transaction_index(), Some(3));
         assert_eq!(event.worker_id(), None);
         assert_eq!(event.signature(), Some(signature));
+    }
+
+    #[test]
+    fn slot_scheduling_summary_carries_counts() {
+        let event = ReplayEvent::slot_scheduling_summary(10, 42, 25, 7, 3, 4);
+
+        assert_eq!(event.timestamp_ns, 10);
+        assert_eq!(event.tag, replay_event_tags::SLOT_SCHEDULING_SUMMARY);
+        assert!(is_slot_event_tag(event.tag));
+        assert_eq!(event.slot(), 42);
+        assert_eq!(event.transaction_index(), None);
+        assert_eq!(event.scheduling_summary_end_timestamp_ns(), Some(25));
+        assert_eq!(event.scheduling_summary_scanned(), Some(7));
+        assert_eq!(event.scheduling_summary_scheduled(), Some(3));
+        assert_eq!(event.scheduling_summary_conflicts(), Some(4));
     }
 
     #[test]

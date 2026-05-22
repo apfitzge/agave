@@ -508,6 +508,7 @@ pub(crate) fn event_name(tag: u64) -> &'static str {
         replay_event_tags::TRANSACTION_SCHEDULED_FOR_EXEC => "tx-scheduled-for-exec",
         replay_event_tags::TRANSACTION_FINISHED_EXEC => "tx-finished-exec",
         replay_event_tags::TRANSACTION_EXEC_FAILED => "tx-exec-failed",
+        replay_event_tags::SLOT_SCHEDULING_SUMMARY => "slot-scheduling-summary",
         replay_event_tags::SLOT_COMPLETE => "slot-complete",
         replay_event_tags::SLOT_FAILED => "slot-failed",
         _ => "unknown",
