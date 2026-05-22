@@ -251,6 +251,7 @@ pub(crate) mod external {
         shared_leader_state: SharedLeaderState,
         bank_forks: Arc<RwLock<BankForks>>,
         sharable_banks: SharableBanks,
+        cached_replay_bank: Option<Arc<Bank>>,
         metrics: Arc<ConsumeWorkerMetrics>,
     }
 
@@ -306,6 +307,7 @@ pub(crate) mod external {
                 shared_leader_state,
                 bank_forks,
                 sharable_banks,
+                cached_replay_bank: None,
                 metrics: Arc::new(ConsumeWorkerMetrics::new(id)),
             }
         }
@@ -342,6 +344,7 @@ pub(crate) mod external {
                         Err(shaq::error::WaitError::Timeout)
                     )
                 {
+                    self.cached_replay_bank = None;
                     return Ok(IterationResult::Idle);
                 }
             }
@@ -361,7 +364,10 @@ pub(crate) mod external {
 
                     Ok(IterationResult::ProcessedMessage)
                 }
-                None => Ok(IterationResult::Idle),
+                None => {
+                    self.cached_replay_bank = None;
+                    Ok(IterationResult::Idle)
+                }
             }
         }
 
@@ -574,23 +580,18 @@ pub(crate) mod external {
         }
 
         fn bank_for_execute(
-            &self,
+            &mut self,
             message: &PackToWorkerMessage,
             should_drain_executes: bool,
         ) -> ExecutionBank {
             if Self::is_replay_message(message) {
-                return self
-                    .bank_forks
-                    .read()
-                    .unwrap()
-                    .get(message.max_working_slot)
-                    .map_or(
-                        ExecutionBank::Unavailable {
-                            execution_slot: 0,
-                            should_drain_executes: false,
-                        },
-                        ExecutionBank::Available,
-                    );
+                return self.replay_bank_for_slot(message.max_working_slot).map_or(
+                    ExecutionBank::Unavailable {
+                        execution_slot: 0,
+                        should_drain_executes: false,
+                    },
+                    ExecutionBank::Available,
+                );
             }
 
             if should_drain_executes {
@@ -790,19 +791,17 @@ pub(crate) mod external {
             })
         }
 
-        fn bank_for_check(&self, message: &PackToWorkerMessage) -> CheckBankResult {
+        fn bank_for_check(&mut self, message: &PackToWorkerMessage) -> CheckBankResult {
             if Self::is_replay_check_message(message) {
-                return self
-                    .bank_forks
-                    .read()
-                    .unwrap()
-                    .get(message.max_working_slot)
-                    .map_or(CheckBankResult::BankNotAvailable, |bank| {
+                return self.replay_bank_for_slot(message.max_working_slot).map_or(
+                    CheckBankResult::BankNotAvailable,
+                    |bank| {
                         CheckBankResult::Available(CheckBanks {
                             parse_and_resolve_bank: bank.clone(),
                             working_bank: bank,
                         })
-                    });
+                    },
+                );
             }
 
             let BankPair {
@@ -818,6 +817,22 @@ pub(crate) mod external {
                 parse_and_resolve_bank: root_bank,
                 working_bank,
             })
+        }
+
+        fn replay_bank_for_slot(&mut self, slot: Slot) -> Option<Arc<Bank>> {
+            if let Some(bank) = self
+                .cached_replay_bank
+                .as_ref()
+                .filter(|bank| bank.slot() == slot)
+                .cloned()
+            {
+                return Some(bank);
+            }
+
+            self.cached_replay_bank = None;
+            let bank = self.bank_forks.read().unwrap().get(slot)?;
+            self.cached_replay_bank = Some(bank.clone());
+            Some(bank)
         }
 
         fn send_execution_response(
@@ -1605,6 +1620,7 @@ pub(crate) mod external {
         worker_id: u32,
         allocator: &rts_alloc::Allocator,
         bank_forks: &Arc<RwLock<BankForks>>,
+        cached_bank: &mut Option<Arc<Bank>>,
         event_buffer: &mut ReplayEventBuffer,
         message: &PackToWorkerMessage,
     ) -> Result<WorkerToPackMessage, ExternalConsumeWorkerError> {
@@ -1617,7 +1633,8 @@ pub(crate) mod external {
             ));
         }
 
-        let Some(bank) = bank_forks.read().unwrap().get(message.max_working_slot) else {
+        let Some(bank) = cached_replay_bank(bank_forks, cached_bank, message.max_working_slot)
+        else {
             return Ok(ExternalWorker::unprocessed_response_message(
                 message,
                 processed_codes::BANK_NOT_AVAILABLE,
@@ -1648,6 +1665,25 @@ pub(crate) mod external {
             }
             Err(err) => Err(err),
         }
+    }
+
+    fn cached_replay_bank(
+        bank_forks: &Arc<RwLock<BankForks>>,
+        cached_bank: &mut Option<Arc<Bank>>,
+        slot: Slot,
+    ) -> Option<Arc<Bank>> {
+        if let Some(bank) = cached_bank
+            .as_ref()
+            .filter(|bank| bank.slot() == slot)
+            .cloned()
+        {
+            return Some(bank);
+        }
+
+        *cached_bank = None;
+        let bank = bank_forks.read().unwrap().get(slot)?;
+        *cached_bank = Some(bank.clone());
+        Some(bank)
     }
 
     #[cfg(test)]

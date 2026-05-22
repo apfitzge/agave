@@ -8,7 +8,7 @@ use {
     },
     agave_scheduler_bindings::processed_codes,
     agave_scheduling_utils::replay_events::replay_event_tags,
-    solana_runtime::bank_forks::BankForks,
+    solana_runtime::{bank::Bank, bank_forks::BankForks},
     std::{
         sync::{
             Arc, RwLock,
@@ -55,12 +55,16 @@ fn run_check_worker(
     event_broadcast: Option<Arc<ReplayEventBroadcast>>,
 ) {
     let mut event_buffer = ReplayEventBuffer::new(event_broadcast);
+    let mut cached_bank: Option<Arc<Bank>> = None;
 
     while !exit.load(Ordering::Relaxed) {
         worker.allocator.clean_remote_free_lists();
         let message = match worker.requests.read_timeout(REQUEST_WAIT_TIMEOUT) {
             Ok(message) => message,
-            Err(shaq::error::WaitError::Timeout) => continue,
+            Err(shaq::error::WaitError::Timeout) => {
+                cached_bank = None;
+                continue;
+            }
         };
 
         emit_replay_check_worker_transaction_event(
@@ -78,6 +82,7 @@ fn run_check_worker(
                 .expect("check worker id must fit in u32"),
             &worker.allocator,
             &bank_forks,
+            &mut cached_bank,
             &mut event_buffer,
             &message,
         ) {
