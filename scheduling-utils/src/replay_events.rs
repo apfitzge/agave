@@ -14,7 +14,8 @@ pub const REPLAY_EVENTS_IPC_FILE: &str = "agave_events.ipc";
 /// Check-passed transaction events also include `estimated_cost_units: u64`.
 /// Execution result transaction events also include `cost_units: u64`.
 /// Scheduling-skipped transaction events reuse the signature bytes as:
-/// `unscheduled_ready_transactions_ahead: u64`, `skip_reason: u64`.
+/// `unscheduled_ready_transactions_ahead: u64`, `skip_reason: u64`,
+/// `blocked_by_transaction_index_plus_one: u64`.
 /// Worker dispatch transaction events also include
 /// `unscheduled_ready_transactions_ahead: u64`.
 /// Signature verification submission events also include
@@ -167,8 +168,8 @@ pub mod replay_event_tags {
     pub const TRANSACTION_SIGNATURE_VERIFICATION_WORKER_RESULT_SENT: u64 = 32;
     /// Transaction could not currently be scheduled.
     ///
-    /// Payload includes `unscheduled_ready_transactions_ahead: u64` and
-    /// `skip_reason: u64`.
+    /// Payload includes `unscheduled_ready_transactions_ahead: u64`,
+    /// `skip_reason: u64`, and `blocked_by_transaction_index_plus_one: u64`.
     pub const TRANSACTION_SCHEDULING_SKIPPED: u64 = 6;
     /// Transaction was sent to a worker for execution.
     ///
@@ -207,6 +208,8 @@ const WORKER_QUEUE_LENGTH_OFFSET: usize = WORKER_ID_OFFSET + core::mem::size_of:
 const SCHEDULING_SKIPPED_UNSCHEDULED_READY_AHEAD_OFFSET: usize = SIGNATURE_OFFSET;
 const SCHEDULING_SKIPPED_REASON_OFFSET: usize =
     SCHEDULING_SKIPPED_UNSCHEDULED_READY_AHEAD_OFFSET + core::mem::size_of::<u64>();
+const SCHEDULING_SKIPPED_BLOCKED_BY_TRANSACTION_INDEX_OFFSET: usize =
+    SCHEDULING_SKIPPED_REASON_OFFSET + core::mem::size_of::<u64>();
 const WORKER_DISPATCH_UNSCHEDULED_READY_AHEAD_OFFSET: usize =
     WORKER_QUEUE_LENGTH_OFFSET + core::mem::size_of::<u64>();
 const ESTIMATED_COST_UNITS_OFFSET: usize = WORKER_QUEUE_LENGTH_OFFSET;
@@ -307,6 +310,7 @@ impl ReplayEvent {
         transaction_index: u64,
         unscheduled_ready_transactions_ahead: u64,
         skip_reason: u64,
+        blocked_by_transaction_index: Option<u64>,
     ) -> Self {
         let mut event = Self::transaction_event(
             timestamp_ns,
@@ -319,6 +323,10 @@ impl ReplayEvent {
             unscheduled_ready_transactions_ahead,
         );
         event.write_u64(SCHEDULING_SKIPPED_REASON_OFFSET, skip_reason);
+        event.write_u64(
+            SCHEDULING_SKIPPED_BLOCKED_BY_TRANSACTION_INDEX_OFFSET,
+            Self::optional_transaction_index_to_payload(blocked_by_transaction_index),
+        );
         event
     }
 
@@ -574,6 +582,16 @@ impl ReplayEvent {
         (reason != 0).then_some(reason)
     }
 
+    pub fn scheduling_blocked_by_transaction_index(&self) -> Option<u64> {
+        if self.tag != replay_event_tags::TRANSACTION_SCHEDULING_SKIPPED {
+            return None;
+        }
+
+        Self::payload_to_optional_transaction_index(
+            self.read_u64(SCHEDULING_SKIPPED_BLOCKED_BY_TRANSACTION_INDEX_OFFSET),
+        )
+    }
+
     fn slot_event(timestamp_ns: u64, tag: u64, slot: u64) -> Self {
         let mut event = Self::new(timestamp_ns, tag);
         event.write_u64(SLOT_OFFSET, slot);
@@ -600,6 +618,20 @@ impl ReplayEvent {
             .get_mut(offset..end)
             .unwrap()
             .copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn optional_transaction_index_to_payload(transaction_index: Option<u64>) -> u64 {
+        transaction_index
+            .map(|transaction_index| {
+                transaction_index
+                    .checked_add(1)
+                    .expect("transaction index payload must fit in u64")
+            })
+            .unwrap_or(0)
+    }
+
+    fn payload_to_optional_transaction_index(payload: u64) -> Option<u64> {
+        payload.checked_sub(1)
     }
 }
 
@@ -783,6 +815,7 @@ mod tests {
             3,
             4,
             replay_scheduling_skip_reasons::MULTIPLE_LOCK_CONFLICTS,
+            Some(5),
         );
 
         assert_eq!(event.slot(), 2);
@@ -792,6 +825,7 @@ mod tests {
             event.scheduling_skip_reason(),
             Some(replay_scheduling_skip_reasons::MULTIPLE_LOCK_CONFLICTS)
         );
+        assert_eq!(event.scheduling_blocked_by_transaction_index(), Some(5));
         assert_eq!(event.worker_id(), None);
         assert_eq!(event.signature(), None);
     }

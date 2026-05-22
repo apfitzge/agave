@@ -43,7 +43,7 @@ use {
     solana_metrics::datapoint_info,
     solana_pubkey::{Pubkey, PubkeyHasherBuilder},
     std::{
-        collections::{HashSet, VecDeque},
+        collections::{HashMap, HashSet, VecDeque},
         hash::BuildHasher,
         num::NonZeroUsize,
         sync::{
@@ -81,7 +81,7 @@ const REPLAY_TRANSACTION_CHECK_FLAGS: u16 = pack_message_flags::CHECK
 const REPLAY_TRANSACTION_EXECUTION_FLAGS: u16 =
     pack_message_flags::EXECUTE | execution_flags::REPLAY;
 
-type PubkeyHashSet = HashSet<Pubkey, PubkeyHasherBuilder>;
+type PubkeyHashMap<T> = HashMap<Pubkey, T, PubkeyHasherBuilder>;
 
 fn reserve_vec_capacity<T>(values: &mut Vec<T>, min_capacity: usize) {
     if values.capacity() < min_capacity {
@@ -97,6 +97,15 @@ fn reserve_vec_deque_capacity<T>(values: &mut VecDeque<T>, min_capacity: usize) 
 
 fn reserve_hash_set_capacity<T: Eq + std::hash::Hash, S: BuildHasher>(
     values: &mut HashSet<T, S>,
+    min_capacity: usize,
+) {
+    if values.capacity() < min_capacity {
+        values.reserve(min_capacity.saturating_sub(values.len()));
+    }
+}
+
+fn reserve_hash_map_capacity<K: Eq + std::hash::Hash, V, S: BuildHasher>(
+    values: &mut HashMap<K, V, S>,
     min_capacity: usize,
 ) {
     if values.capacity() < min_capacity {
@@ -171,8 +180,8 @@ struct SchedulingState {
     ready_transactions: VecDeque<usize>,
     ready_scan_cursor: usize,
     unscheduled_ready_transactions_before_cursor: usize,
-    unschedulable_read_locks: PubkeyHashSet,
-    unschedulable_write_locks: PubkeyHashSet,
+    unschedulable_read_lock_owners: PubkeyHashMap<usize>,
+    unschedulable_write_lock_owners: PubkeyHashMap<usize>,
     ingress_complete: bool,
     entry_verification: EntryVerificationProgress,
     in_flight_worker_messages: usize,
@@ -203,8 +212,12 @@ impl SchedulingState {
             ready_transactions: VecDeque::new(),
             ready_scan_cursor: 0,
             unscheduled_ready_transactions_before_cursor: 0,
-            unschedulable_read_locks: PubkeyHashSet::with_hasher(PubkeyHasherBuilder::default()),
-            unschedulable_write_locks: PubkeyHashSet::with_hasher(PubkeyHasherBuilder::default()),
+            unschedulable_read_lock_owners: PubkeyHashMap::with_hasher(
+                PubkeyHasherBuilder::default(),
+            ),
+            unschedulable_write_lock_owners: PubkeyHashMap::with_hasher(
+                PubkeyHasherBuilder::default(),
+            ),
             ingress_complete: false,
             entry_verification: EntryVerificationProgress::default(),
             in_flight_worker_messages: 0,
@@ -282,14 +295,14 @@ impl SchedulingState {
         reserve_vec_deque_capacity(&mut self.ready_transactions, POOLED_SLOT_WORK_CAPACITY);
         self.ready_scan_cursor = 0;
         self.unscheduled_ready_transactions_before_cursor = 0;
-        self.unschedulable_read_locks.clear();
-        reserve_hash_set_capacity(
-            &mut self.unschedulable_read_locks,
+        self.unschedulable_read_lock_owners.clear();
+        reserve_hash_map_capacity(
+            &mut self.unschedulable_read_lock_owners,
             POOLED_SLOT_WORK_CAPACITY,
         );
-        self.unschedulable_write_locks.clear();
-        reserve_hash_set_capacity(
-            &mut self.unschedulable_write_locks,
+        self.unschedulable_write_lock_owners.clear();
+        reserve_hash_map_capacity(
+            &mut self.unschedulable_write_lock_owners,
             POOLED_SLOT_WORK_CAPACITY,
         );
         self.ingress_complete = false;
@@ -333,8 +346,8 @@ impl SchedulingState {
     fn reset_ready_scan(&mut self) {
         self.ready_scan_cursor = 0;
         self.unscheduled_ready_transactions_before_cursor = 0;
-        self.unschedulable_read_locks.clear();
-        self.unschedulable_write_locks.clear();
+        self.unschedulable_read_lock_owners.clear();
+        self.unschedulable_write_lock_owners.clear();
     }
 
     fn has_transaction_scheduling_work(&self) -> bool {
@@ -433,19 +446,21 @@ impl SchedulingState {
                 "ready transaction must be checked or already scheduled",
             );
 
-            if transaction.conflicts_with_unschedulable_locks(
-                &self.unschedulable_read_locks,
-                &self.unschedulable_write_locks,
+            if let Some(blocking_transaction_index) = transaction.blocking_lock_owner(
+                &self.unschedulable_read_lock_owners,
+                &self.unschedulable_write_lock_owners,
             ) {
                 transaction.record_unschedulable_locks(
-                    &mut self.unschedulable_read_locks,
-                    &mut self.unschedulable_write_locks,
+                    transaction_index,
+                    &mut self.unschedulable_read_lock_owners,
+                    &mut self.unschedulable_write_lock_owners,
                 );
                 dispatch_context.emit_transaction_scheduling_skipped_event(
                     slot,
                     transaction_index,
                     unscheduled_ready_transactions_ahead,
                     replay_scheduling_skip_reasons::PREVIOUSLY_UNSCHEDULED_CONFLICT,
+                    Some(blocking_transaction_index),
                 );
                 return ReadyTransactionDispatchResult::Deferred;
             }
@@ -464,14 +479,16 @@ impl SchedulingState {
                 } => (thread_id, worker_queue_len, timestamp_ns),
                 ExecutionDispatchResult::AccountConflict => {
                     transaction.record_unschedulable_locks(
-                        &mut self.unschedulable_read_locks,
-                        &mut self.unschedulable_write_locks,
+                        transaction_index,
+                        &mut self.unschedulable_read_lock_owners,
+                        &mut self.unschedulable_write_lock_owners,
                     );
                     dispatch_context.emit_transaction_scheduling_skipped_event(
                         slot,
                         transaction_index,
                         unscheduled_ready_transactions_ahead,
                         replay_scheduling_skip_reasons::MULTIPLE_LOCK_CONFLICTS,
+                        None,
                     );
                     return ReadyTransactionDispatchResult::Deferred;
                 }
@@ -481,6 +498,7 @@ impl SchedulingState {
                         transaction_index,
                         unscheduled_ready_transactions_ahead,
                         replay_scheduling_skip_reasons::TOO_MUCH_WORK_ON_THREAD,
+                        None,
                     );
                     return ReadyTransactionDispatchResult::Unavailable;
                 }
@@ -923,6 +941,7 @@ impl ExecutionDispatchContext<'_> {
         transaction_index: usize,
         unscheduled_ready_transactions_ahead: usize,
         reason: u64,
+        blocked_by_transaction_index: Option<usize>,
     ) {
         self.event_buffer
             .push(ReplayEvent::transaction_scheduling_skipped(
@@ -932,6 +951,9 @@ impl ExecutionDispatchContext<'_> {
                 u64::try_from(unscheduled_ready_transactions_ahead)
                     .expect("unscheduled ready transaction count must fit in u64"),
                 reason,
+                blocked_by_transaction_index.map(|transaction_index| {
+                    u64::try_from(transaction_index).expect("transaction index must fit in u64")
+                }),
             ));
     }
 
@@ -1454,26 +1476,40 @@ impl TransactionState {
             .map(|(_, key)| key)
     }
 
-    fn conflicts_with_unschedulable_locks(
+    fn blocking_lock_owner(
         &self,
-        unschedulable_read_locks: &PubkeyHashSet,
-        unschedulable_write_locks: &PubkeyHashSet,
-    ) -> bool {
-        self.write_locks().any(|write_lock| {
-            unschedulable_write_locks.contains(write_lock)
-                || unschedulable_read_locks.contains(write_lock)
-        }) || self
-            .read_locks()
-            .any(|read_lock| unschedulable_write_locks.contains(read_lock))
+        read_lock_owners: &PubkeyHashMap<usize>,
+        write_lock_owners: &PubkeyHashMap<usize>,
+    ) -> Option<usize> {
+        self.write_locks()
+            .find_map(|write_lock| {
+                write_lock_owners
+                    .get(write_lock)
+                    .copied()
+                    .or_else(|| read_lock_owners.get(write_lock).copied())
+            })
+            .or_else(|| {
+                self.read_locks()
+                    .find_map(|read_lock| write_lock_owners.get(read_lock).copied())
+            })
     }
 
     fn record_unschedulable_locks(
         &self,
-        unschedulable_read_locks: &mut PubkeyHashSet,
-        unschedulable_write_locks: &mut PubkeyHashSet,
+        transaction_index: usize,
+        unschedulable_read_lock_owners: &mut PubkeyHashMap<usize>,
+        unschedulable_write_lock_owners: &mut PubkeyHashMap<usize>,
     ) {
-        unschedulable_write_locks.extend(self.write_locks().copied());
-        unschedulable_read_locks.extend(self.read_locks().copied());
+        for write_lock in self.write_locks() {
+            unschedulable_write_lock_owners
+                .entry(*write_lock)
+                .or_insert(transaction_index);
+        }
+        for read_lock in self.read_locks() {
+            unschedulable_read_lock_owners
+                .entry(*read_lock)
+                .or_insert(transaction_index);
+        }
     }
 
     fn is_writable(&self, index: usize) -> bool {
@@ -5475,7 +5511,7 @@ mod tests {
             let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
             assert!(state.ready_transactions.iter().copied().eq([1, 2]));
             assert_eq!(state.ready_scan_cursor, 2);
-            assert!(state.unschedulable_write_locks.contains(&account));
+            assert!(state.unschedulable_write_lock_owners.contains_key(&account));
         }
 
         assert_eq!(scheduler.service_transaction_execution_dispatches(3, 3), 0);
@@ -5543,7 +5579,7 @@ mod tests {
             let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
             assert!(state.ready_transactions.iter().copied().eq([1]));
             assert_eq!(state.ready_scan_cursor, 1);
-            assert!(state.unschedulable_write_locks.contains(&account));
+            assert!(state.unschedulable_write_lock_owners.contains_key(&account));
         }
 
         let third_check = check_messages[2];
@@ -5613,7 +5649,7 @@ mod tests {
             let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
             assert!(state.ready_transactions.iter().copied().eq([1]));
             assert_eq!(state.ready_scan_cursor, 1);
-            assert!(state.unschedulable_write_locks.contains(&account));
+            assert!(state.unschedulable_write_lock_owners.contains_key(&account));
         }
 
         queue_worker_execution_response(
@@ -5626,8 +5662,8 @@ mod tests {
             let state = find_scheduling_state(&scheduler.scheduling_states, 42).unwrap();
             assert!(state.ready_transactions.iter().copied().eq([1]));
             assert_eq!(state.ready_scan_cursor, 0);
-            assert!(state.unschedulable_read_locks.is_empty());
-            assert!(state.unschedulable_write_locks.is_empty());
+            assert!(state.unschedulable_read_lock_owners.is_empty());
+            assert!(state.unschedulable_write_lock_owners.is_empty());
             assert_eq!(state.completed_work_to_schedule_latency.count, 0);
             assert!(state.completed_work_to_schedule_start.is_some());
         }

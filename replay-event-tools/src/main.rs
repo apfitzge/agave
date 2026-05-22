@@ -1149,6 +1149,9 @@ fn timeline_event_detail(event: &ReplayEvent) -> String {
             scheduling_skip_reason_detail(reason)
         ));
     }
+    if let Some(transaction_index) = event.scheduling_blocked_by_transaction_index() {
+        details.push(format!("blocked_by_tx={transaction_index}"));
+    }
     if let Some(signature_verification_queue_len) = event.signature_verification_queue_len() {
         details.push(format!("queue_len={signature_verification_queue_len}"));
     }
@@ -1193,6 +1196,9 @@ fn worker_timeline_event_detail(event: &ReplayEvent) -> String {
             "skip_reason={}",
             scheduling_skip_reason_detail(reason)
         ));
+    }
+    if let Some(transaction_index) = event.scheduling_blocked_by_transaction_index() {
+        details.push(format!("blocked_by_tx={transaction_index}"));
     }
     if let Some(estimated_cost_units) = event.estimated_cost_units() {
         details.push(format!("estimated_cost_units={estimated_cost_units}"));
@@ -3033,6 +3039,7 @@ mod tests {
                     7,
                     3,
                     replay_scheduling_skip_reasons::MULTIPLE_LOCK_CONFLICTS,
+                    Some(5),
                 ),
                 ReplayEvent::transaction_worker_dispatch_event(
                     30,
@@ -3064,6 +3071,7 @@ mod tests {
                 .detail
                 .contains("skip_reason=multiple-lock-conflicts")
         );
+        assert!(skipped.detail.contains("blocked_by_tx=5"));
         assert!(scheduled.detail.contains("unscheduled_ready_ahead=4"));
     }
 
@@ -3132,6 +3140,7 @@ mod tests {
                     7,
                     2,
                     replay_scheduling_skip_reasons::PREVIOUSLY_UNSCHEDULED_CONFLICT,
+                    None,
                 ),
                 ReplayEvent::transaction_worker_dispatch_event(
                     220,
