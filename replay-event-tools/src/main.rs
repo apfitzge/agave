@@ -113,6 +113,7 @@ struct SlotSummary {
     estimated_cost_units: Option<u64>,
     cost_units: Option<u64>,
     duration_ns: Option<u64>,
+    tail_latency_ns: Option<u64>,
     active_duration_ns: Option<u64>,
     active_session_count: usize,
     active_pending_transactions: usize,
@@ -124,6 +125,7 @@ struct SelectedSlot {
     status: &'static str,
     slot_event_count: usize,
     duration_ns: Option<u64>,
+    tail_latency_ns: Option<u64>,
     active_duration_ns: Option<u64>,
     active_pending_transactions: usize,
     active_sessions: Vec<ActiveSessionSummary>,
@@ -527,6 +529,7 @@ fn snapshot(
                 status: slot_record.status(),
                 slot_event_count: slot_record.slot_events.len(),
                 duration_ns: slot_record.duration_ns(),
+                tail_latency_ns: slot_record.tail_latency_ns(),
                 active_duration_ns,
                 active_pending_transactions,
                 active_sessions,
@@ -561,6 +564,7 @@ fn snapshot(
                 estimated_cost_units: slot_estimated_cost_units(slot_record),
                 cost_units: slot_cost_units(slot_record),
                 duration_ns: slot_record.duration_ns(),
+                tail_latency_ns: slot_record.tail_latency_ns(),
                 active_duration_ns: selected_slot_summary
                     .and_then(|selected_slot| selected_slot.active_duration_ns)
                     .or(active_stats.active_duration_ns),
@@ -1066,6 +1070,7 @@ fn is_scheduler_event_tag(tag: u64) -> bool {
             | replay_event_tags::SLOT_ABORT
             | replay_event_tags::SLOT_COMPLETE
             | replay_event_tags::SLOT_FAILED
+            | replay_event_tags::SLOT_INGRESS_COMPLETE
             | replay_event_tags::TRANSACTION_INGESTED
             | replay_event_tags::TRANSACTION_SIGNATURES_SUBMITTED
             | replay_event_tags::TRANSACTION_SIGNATURES_RETURNED
@@ -1918,7 +1923,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App, snapshot: &UiSnap
 
 fn render_slots(frame: &mut Frame<'_>, area: Rect, app: &App, snapshot: &UiSnapshot) {
     let rows = if snapshot.slots.is_empty() {
-        vec![Row::new(["waiting", "", "", "", "", "", "", ""])]
+        vec![Row::new(["waiting", "", "", "", "", "", "", "", ""])]
     } else {
         snapshot
             .slots
@@ -1931,6 +1936,11 @@ fn render_slots(frame: &mut Frame<'_>, area: Rect, app: &App, snapshot: &UiSnaps
                     Cell::from(format_optional_cost_units(slot.cost_units)),
                     Cell::from(
                         slot.duration_ns
+                            .map(format_duration_ns)
+                            .unwrap_or_else(|| "-".to_string()),
+                    ),
+                    Cell::from(
+                        slot.tail_latency_ns
                             .map(format_duration_ns)
                             .unwrap_or_else(|| "-".to_string()),
                     ),
@@ -1961,6 +1971,7 @@ fn render_slots(frame: &mut Frame<'_>, area: Rect, app: &App, snapshot: &UiSnaps
             Constraint::Length(10),
             Constraint::Length(10),
             Constraint::Length(12),
+            Constraint::Length(10),
             Constraint::Length(12),
             Constraint::Length(8),
             Constraint::Min(8),
@@ -1968,7 +1979,8 @@ fn render_slots(frame: &mut Frame<'_>, area: Rect, app: &App, snapshot: &UiSnaps
     )
     .header(
         Row::new([
-            "slot", "txs", "est CUs", "cost CUs", "block", "active", "sessions", "status",
+            "slot", "txs", "est CUs", "cost CUs", "block", "tail", "active", "sessions",
+            "status",
         ])
         .style(
             Style::default()
@@ -2004,9 +2016,12 @@ fn render_transactions(frame: &mut Frame<'_>, area: Rect, app: &App, snapshot: &
         .as_ref()
         .map(|slot| {
             format!(
-                "Transactions slot={} status={} active={} sessions={} pending={} slot_events={}",
+                "Transactions slot={} status={} tail={} active={} sessions={} pending={} slot_events={}",
                 slot.slot,
                 slot.status,
+                slot.tail_latency_ns
+                    .map(format_duration_ns)
+                    .unwrap_or_else(|| "-".to_string()),
                 slot.active_duration_ns
                     .map(format_duration_ns)
                     .unwrap_or_else(|| "-".to_string()),
@@ -2213,10 +2228,13 @@ fn tx_timeline_lines(snapshot: &UiSnapshot) -> Vec<Line<'static>> {
 
     let mut lines = vec![
         Line::from(format!(
-            "slot={} status={} slot_duration={} active={} sessions={} pending={} transactions={}",
+            "slot={} status={} slot_duration={} tail={} active={} sessions={} pending={} transactions={}",
             slot.slot,
             slot.status,
             slot.duration_ns
+                .map(format_duration_ns)
+                .unwrap_or_else(|| "-".to_string()),
+            slot.tail_latency_ns
                 .map(format_duration_ns)
                 .unwrap_or_else(|| "-".to_string()),
             slot.active_duration_ns
@@ -2301,10 +2319,13 @@ fn worker_timeline_lines(
         worker_timeline_kind.label().to_string()
     };
     let mut lines = vec![Line::from(format!(
-        "slot={} status={} slot_duration={} transactions={} mode={} worker={}",
+        "slot={} status={} slot_duration={} tail={} transactions={} mode={} worker={}",
         slot.slot,
         slot.status,
         slot.duration_ns
+            .map(format_duration_ns)
+            .unwrap_or_else(|| "-".to_string()),
+        slot.tail_latency_ns
             .map(format_duration_ns)
             .unwrap_or_else(|| "-".to_string()),
         slot.transactions.len(),
@@ -2568,6 +2589,24 @@ mod tests {
         assert_eq!(unselected_slot.active_duration_ns, Some(40));
         assert_eq!(unselected_slot.active_session_count, 1);
         assert_eq!(unselected_slot.active_pending_transactions, 0);
+    }
+
+    #[test]
+    fn snapshot_includes_slot_tail_latency() {
+        let mut event_store = EventStore::new(4);
+        event_store.apply_event(ReplayEvent::slot_begin(10, 42));
+        event_store.apply_event(ReplayEvent::slot_ingress_complete(30, 42));
+        event_store.apply_event(ReplayEvent::slot_complete(55, 42));
+        let store = Arc::new(Mutex::new(event_store));
+        let stats = ReaderStats::default();
+
+        let snapshot = snapshot(&store, &stats, Some(42), None);
+
+        assert_eq!(snapshot.slots[0].tail_latency_ns, Some(25));
+        assert_eq!(
+            snapshot.selected_slot.as_ref().unwrap().tail_latency_ns,
+            Some(25)
+        );
     }
 
     #[test]
@@ -3484,6 +3523,7 @@ mod tests {
             status: "running",
             slot_event_count: 0,
             duration_ns: None,
+            tail_latency_ns: None,
             active_duration_ns: Some(60),
             active_pending_transactions: 0,
             active_sessions: vec![ActiveSessionSummary {
@@ -3873,6 +3913,7 @@ mod tests {
                 status: "running",
                 slot_event_count: 0,
                 duration_ns: None,
+                tail_latency_ns: None,
                 active_duration_ns: None,
                 active_pending_transactions: 0,
                 active_sessions: Vec::new(),
@@ -3924,6 +3965,7 @@ mod tests {
             estimated_cost_units: None,
             cost_units: None,
             duration_ns: None,
+            tail_latency_ns: None,
             active_duration_ns: None,
             active_session_count: 0,
             active_pending_transactions: 0,

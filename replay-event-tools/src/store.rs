@@ -223,6 +223,20 @@ impl SlotRecord {
         Some(end.saturating_sub(start))
     }
 
+    pub(crate) fn tail_latency_ns(&self) -> Option<u64> {
+        let ingress_complete = self
+            .slot_events
+            .iter()
+            .find(|event| event.tag == replay_event_tags::SLOT_INGRESS_COMPLETE)
+            .map(|event| event.timestamp_ns)?;
+        let complete = self
+            .slot_events
+            .iter()
+            .find(|event| event.tag == replay_event_tags::SLOT_COMPLETE)
+            .map(|event| event.timestamp_ns)?;
+        Some(complete.saturating_sub(ingress_complete))
+    }
+
     pub(crate) fn begin_timestamp_ns(&self) -> Option<u64> {
         self.slot_events
             .iter()
@@ -509,6 +523,7 @@ pub(crate) fn event_name(tag: u64) -> &'static str {
         replay_event_tags::TRANSACTION_FINISHED_EXEC => "tx-finished-exec",
         replay_event_tags::TRANSACTION_EXEC_FAILED => "tx-exec-failed",
         replay_event_tags::SLOT_SCHEDULING_SUMMARY => "slot-scheduling-summary",
+        replay_event_tags::SLOT_INGRESS_COMPLETE => "slot-ingress-complete",
         replay_event_tags::SLOT_COMPLETE => "slot-complete",
         replay_event_tags::SLOT_FAILED => "slot-failed",
         _ => "unknown",
@@ -668,6 +683,17 @@ mod tests {
         store.apply_event(ReplayEvent::slot_complete(30, 42));
 
         assert_eq!(store.slot(42).unwrap().duration_ns(), Some(20));
+    }
+
+    #[test]
+    fn slot_tail_latency_uses_ingress_complete_to_slot_complete() {
+        let mut store = EventStore::new(2);
+
+        store.apply_event(ReplayEvent::slot_begin(10, 42));
+        store.apply_event(ReplayEvent::slot_ingress_complete(30, 42));
+        store.apply_event(ReplayEvent::slot_complete(50, 42));
+
+        assert_eq!(store.slot(42).unwrap().tail_latency_ns(), Some(20));
     }
 
     #[test]

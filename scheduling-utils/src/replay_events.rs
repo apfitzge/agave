@@ -168,6 +168,8 @@ pub mod replay_event_tags {
     ///
     /// Payload includes `signature_verification_worker_id: u64` and `verified: u64`.
     pub const TRANSACTION_SIGNATURE_VERIFICATION_WORKER_RESULT_SENT: u64 = 32;
+    /// Scheduler received replay ingress completion for a slot.
+    pub const SLOT_INGRESS_COMPLETE: u64 = 34;
     /// Scheduler completed a transaction scheduling scan for a slot.
     ///
     /// Event timestamp is the scan start timestamp. Payload includes
@@ -247,6 +249,10 @@ impl ReplayEvent {
 
     pub fn slot_complete(timestamp_ns: u64, slot: u64) -> Self {
         Self::slot_event(timestamp_ns, replay_event_tags::SLOT_COMPLETE, slot)
+    }
+
+    pub fn slot_ingress_complete(timestamp_ns: u64, slot: u64) -> Self {
+        Self::slot_event(timestamp_ns, replay_event_tags::SLOT_INGRESS_COMPLETE, slot)
     }
 
     pub fn slot_failed(timestamp_ns: u64, slot: u64, reason: u16) -> Self {
@@ -751,6 +757,7 @@ pub const fn is_slot_event_tag(tag: u64) -> bool {
             | replay_event_tags::SLOT_ABORT
             | replay_event_tags::SLOT_COMPLETE
             | replay_event_tags::SLOT_FAILED
+            | replay_event_tags::SLOT_INGRESS_COMPLETE
             | replay_event_tags::SLOT_SCHEDULING_SUMMARY
     )
 }
@@ -849,6 +856,17 @@ mod tests {
         assert_eq!(event.scheduling_summary_scanned(), Some(7));
         assert_eq!(event.scheduling_summary_scheduled(), Some(3));
         assert_eq!(event.scheduling_summary_conflicts(), Some(4));
+    }
+
+    #[test]
+    fn slot_ingress_complete_is_slot_event() {
+        let event = ReplayEvent::slot_ingress_complete(10, 42);
+
+        assert_eq!(event.timestamp_ns, 10);
+        assert_eq!(event.tag, replay_event_tags::SLOT_INGRESS_COMPLETE);
+        assert!(is_slot_event_tag(event.tag));
+        assert_eq!(event.slot(), 42);
+        assert_eq!(event.transaction_index(), None);
     }
 
     #[test]

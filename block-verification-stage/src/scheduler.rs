@@ -1619,6 +1619,7 @@ impl BlockVerificationScheduler {
             replay_event_tags::SLOT_BEGIN => ReplayEvent::slot_begin(0, slot),
             replay_event_tags::SLOT_ABORT => ReplayEvent::slot_abort(0, slot),
             replay_event_tags::SLOT_COMPLETE => ReplayEvent::slot_complete(0, slot),
+            replay_event_tags::SLOT_INGRESS_COMPLETE => ReplayEvent::slot_ingress_complete(0, slot),
             _ => panic!("unsupported replay slot event tag: {tag}"),
         };
         self.emit_event(event);
@@ -1927,14 +1928,20 @@ impl BlockVerificationScheduler {
     }
 
     fn handle_bank_complete(&mut self, slot: u64) {
-        let state = find_scheduling_state_mut(&mut self.scheduling_states, slot)
-            .expect("complete received for unknown slot");
-        assert!(
-            !state.ingress_complete,
-            "duplicate complete received for slot: {slot}",
-        );
-        state.ingress_complete = true;
-        if state.terminal_status.is_none() {
+        let should_queue_terminal = {
+            let state = find_scheduling_state_mut(&mut self.scheduling_states, slot)
+                .expect("complete received for unknown slot");
+            assert!(
+                !state.ingress_complete,
+                "duplicate complete received for slot: {slot}",
+            );
+            state.ingress_complete = true;
+            state.terminal_status.is_none()
+        };
+        self.emit_slot_event(replay_event_tags::SLOT_INGRESS_COMPLETE, slot);
+        if should_queue_terminal {
+            let state = find_scheduling_state_mut(&mut self.scheduling_states, slot)
+                .expect("complete received for unknown slot");
             state.terminal_status = Some(SlotTerminalStatus::Success);
             self.terminal_slot_queue.push_back(slot);
         }
@@ -4932,6 +4939,12 @@ mod tests {
             events.iter().map(|event| event.tag).collect::<Vec<_>>(),
             vec![replay_event_tags::SLOT_BEGIN],
         );
+        assert!(events.iter().all(|event| event.slot() == 42));
+        assert!(
+            events
+                .iter()
+                .all(|event| event.transaction_index().is_none())
+        );
 
         assert_eq!(scheduler.service_terminal_slots(1), 1);
 
@@ -4965,7 +4978,16 @@ mod tests {
         let events = drain_replay_events(&mut event_consumer);
         assert_eq!(
             events.iter().map(|event| event.tag).collect::<Vec<_>>(),
-            vec![replay_event_tags::SLOT_BEGIN],
+            vec![
+                replay_event_tags::SLOT_BEGIN,
+                replay_event_tags::SLOT_INGRESS_COMPLETE,
+            ],
+        );
+        assert!(events.iter().all(|event| event.slot() == 42));
+        assert!(
+            events
+                .iter()
+                .all(|event| event.transaction_index().is_none())
         );
 
         assert_eq!(scheduler.service_terminal_slots(1), 1);
