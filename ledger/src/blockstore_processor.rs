@@ -1293,6 +1293,10 @@ pub struct ConfirmationTiming {
     /// include the case when the blockstore load failed.  In microseconds.
     pub fetch_elapsed: u64,
 
+    /// Wall clock time spent waiting for block verification to report the final slot status. In
+    /// microseconds.
+    pub block_verification_status_wait_us: u64,
+
     /// Same as `fetch_elapsed` above, but for the case when the blockstore load fails.  In
     /// microseconds.
     pub fetch_fail_elapsed: u64,
@@ -1310,6 +1314,7 @@ impl Default for ConfirmationTiming {
             poh_verify_elapsed: 0,
             transaction_verify_elapsed: 0,
             fetch_elapsed: 0,
+            block_verification_status_wait_us: 0,
             fetch_fail_elapsed: 0,
             batch_execute: BatchExecutionTiming::default(),
         }
@@ -1459,6 +1464,11 @@ impl ReplaySlotStats {
                 (
                     "fetch_entries_fail_time",
                     self.fetch_fail_elapsed as i64,
+                    i64
+                ),
+                (
+                    "block_verification_status_wait_us",
+                    self.block_verification_status_wait_us as i64,
                     i64
                 ),
                 (

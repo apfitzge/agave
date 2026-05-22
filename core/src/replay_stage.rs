@@ -2598,6 +2598,7 @@ impl ReplayStage {
         w_replay_stats.confirmation_elapsed += confirmation_elapsed
             .as_us()
             .saturating_sub(block_verification_status_wait_us);
+        w_replay_stats.block_verification_status_wait_us += block_verification_status_wait_us;
         replay_result?;
 
         let tx_count_after = w_replay_progress.num_txs;
