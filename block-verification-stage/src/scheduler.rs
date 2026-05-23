@@ -43,6 +43,7 @@ use {
     solana_metrics::datapoint_info,
     solana_pubkey::{Pubkey, PubkeyHasherBuilder},
     std::{
+        cmp::Reverse,
         collections::{HashMap, HashSet, VecDeque},
         hash::BuildHasher,
         num::NonZeroUsize,
@@ -180,6 +181,7 @@ struct SchedulingState {
     ready_transactions: VecDeque<usize>,
     ready_scan_cursor: usize,
     unscheduled_ready_transactions_before_cursor: usize,
+    account_affinity: PubkeyHashMap<ThreadId>,
     unschedulable_read_lock_owners: PubkeyHashMap<usize>,
     unschedulable_write_lock_owners: PubkeyHashMap<usize>,
     ingress_complete: bool,
@@ -212,6 +214,7 @@ impl SchedulingState {
             ready_transactions: VecDeque::new(),
             ready_scan_cursor: 0,
             unscheduled_ready_transactions_before_cursor: 0,
+            account_affinity: PubkeyHashMap::with_hasher(PubkeyHasherBuilder::default()),
             unschedulable_read_lock_owners: PubkeyHashMap::with_hasher(
                 PubkeyHasherBuilder::default(),
             ),
@@ -252,6 +255,7 @@ impl SchedulingState {
         self.next_ready_transaction_index = 0;
         self.ready_transactions.clear();
         self.reset_ready_scan();
+        self.account_affinity.clear();
         self.ingress_complete = false;
         self.entry_verification = EntryVerificationProgress::default();
         self.in_flight_worker_messages = 0;
@@ -295,6 +299,8 @@ impl SchedulingState {
         reserve_vec_deque_capacity(&mut self.ready_transactions, POOLED_SLOT_WORK_CAPACITY);
         self.ready_scan_cursor = 0;
         self.unscheduled_ready_transactions_before_cursor = 0;
+        self.account_affinity.clear();
+        reserve_hash_map_capacity(&mut self.account_affinity, POOLED_SLOT_WORK_CAPACITY);
         self.unschedulable_read_lock_owners.clear();
         reserve_hash_map_capacity(
             &mut self.unschedulable_read_lock_owners,
@@ -480,6 +486,7 @@ impl SchedulingState {
                 transaction_index,
                 transaction,
                 &mut self.account_locks,
+                &self.account_affinity,
             );
             match dispatch_result {
                 ExecutionDispatchResult::Scheduled {
@@ -515,6 +522,7 @@ impl SchedulingState {
             }
         };
 
+        self.record_transaction_account_affinity(transaction_index, thread_id);
         self.move_checked_transaction_to_in_flight(transaction_index, thread_id);
         self.record_completed_work_to_schedule_latency(Instant::now());
         dispatch_context.emit_transaction_worker_dispatch_event(
@@ -527,6 +535,20 @@ impl SchedulingState {
             timestamp_ns,
         );
         ReadyTransactionDispatchResult::Scheduled
+    }
+
+    fn record_transaction_account_affinity(
+        &mut self,
+        transaction_index: usize,
+        thread_id: ThreadId,
+    ) {
+        let transaction = self
+            .transactions
+            .get(transaction_index)
+            .expect("affined transaction must exist");
+        for write_lock in transaction.write_locks() {
+            self.account_affinity.insert(*write_lock, thread_id);
+        }
     }
 
     fn prune_scheduled_ready_prefix(&mut self) {
@@ -821,11 +843,13 @@ fn select_execution_thread(
     in_flight_executions_per_thread: &[usize],
     in_flight_execution_cost_units_per_thread: &[u64],
     account_locks: &ThreadAwareAccountLocks,
+    account_affinity_score: impl Fn(ThreadId) -> usize,
 ) -> ThreadId {
     thread_set
         .contained_threads_iter()
         .min_by_key(|thread_id| {
             (
+                Reverse(account_affinity_score(*thread_id)),
                 in_flight_execution_cost_units_per_thread[*thread_id],
                 account_locks.thread_total_lock_count(*thread_id),
                 in_flight_executions_per_thread[*thread_id],
@@ -1029,6 +1053,7 @@ impl ExecutionDispatchContext<'_> {
         transaction_index: usize,
         transaction: &TransactionState,
         account_locks: &mut ThreadAwareAccountLocks,
+        account_affinity: &PubkeyHashMap<ThreadId>,
     ) -> ExecutionDispatchResult {
         if !self.has_capacity() {
             return ExecutionDispatchResult::Unavailable;
@@ -1049,6 +1074,7 @@ impl ExecutionDispatchContext<'_> {
                     self.in_flight_executions_per_thread,
                     self.in_flight_execution_cost_units_per_thread,
                     account_locks,
+                    |thread_id| transaction.account_affinity_score(account_affinity, thread_id),
                 )
             },
         ) else {
@@ -1540,6 +1566,16 @@ impl TransactionState {
                 .entry(*read_lock)
                 .or_insert(transaction_index);
         }
+    }
+
+    fn account_affinity_score(
+        &self,
+        account_affinity: &PubkeyHashMap<ThreadId>,
+        thread_id: ThreadId,
+    ) -> usize {
+        self.write_locks()
+            .filter(|write_lock| account_affinity.get(*write_lock).copied() == Some(thread_id))
+            .count()
     }
 
     fn is_writable(&self, index: usize) -> bool {
@@ -3781,6 +3817,22 @@ mod tests {
         }
     }
 
+    fn successful_check_response_with_writable_account_count(
+        writable_account_count: usize,
+    ) -> CheckResponse {
+        let mut response = successful_check_response();
+        response.writable_account_bitfields = [0; 4];
+        for index in 0..writable_account_count {
+            *response
+                .writable_account_bitfields
+                .get_mut(index / 64)
+                .expect("test writable account index must fit in bitfields") |=
+                1u64 << (index % 64);
+        }
+
+        response
+    }
+
     fn parsing_failed_check_response() -> CheckResponse {
         CheckResponse {
             parsing_and_sanitization_flags: parsing_and_sanitization_flags::FAILED,
@@ -3906,6 +3958,13 @@ mod tests {
         signature: Signature,
         account_key: Pubkey,
     ) -> VersionedTransaction {
+        minimal_transaction_with_accounts(signature, &[account_key])
+    }
+
+    fn minimal_transaction_with_accounts(
+        signature: Signature,
+        account_keys: &[Pubkey],
+    ) -> VersionedTransaction {
         VersionedTransaction {
             signatures: vec![signature],
             message: VersionedMessage::Legacy(Message {
@@ -3914,7 +3973,7 @@ mod tests {
                     num_readonly_signed_accounts: 0,
                     num_readonly_unsigned_accounts: 0,
                 },
-                account_keys: vec![account_key],
+                account_keys: account_keys.to_vec(),
                 recent_blockhash: Hash::default(),
                 instructions: vec![],
             }),
@@ -3941,11 +4000,19 @@ mod tests {
         signature_byte: u8,
         account_key: Pubkey,
     ) -> SharableTransactionRegion {
+        allocate_minimal_transaction_region_with_accounts(allocator, signature_byte, &[account_key])
+    }
+
+    fn allocate_minimal_transaction_region_with_accounts(
+        allocator: &rts_alloc::Allocator,
+        signature_byte: u8,
+        account_keys: &[Pubkey],
+    ) -> SharableTransactionRegion {
         allocate_transaction(
             allocator,
-            &wincode::serialize(&minimal_transaction_with_account(
+            &wincode::serialize(&minimal_transaction_with_accounts(
                 Signature::from([signature_byte; SIGNATURE_BYTES]),
-                account_key,
+                account_keys,
             ))
             .unwrap(),
         )
@@ -5341,6 +5408,149 @@ mod tests {
     }
 
     #[test]
+    fn execution_dispatch_prefers_affined_worker_after_lock_released() {
+        let (mut scheduler, mut replay_stage, mut workers) =
+            setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
+                allocator_size: 64 * 1024 * 1024,
+                replay_to_pack_capacity: 8,
+                replay_block_status_capacity: 8,
+                worker_count: 2,
+                pack_to_worker_capacity: 8,
+                worker_to_pack_capacity: 8,
+            });
+        let first_account = Pubkey::new_unique();
+        let shared_account = Pubkey::new_unique();
+        let second_account = Pubkey::new_unique();
+        let unrelated_account = Pubkey::new_unique();
+        let first_transaction = allocate_minimal_transaction_region_with_accounts(
+            &replay_stage.allocator,
+            1,
+            &[first_account, shared_account],
+        );
+        let second_transaction = allocate_minimal_transaction_region_with_accounts(
+            &replay_stage.allocator,
+            2,
+            &[shared_account, second_account],
+        );
+        write_replay_messages(
+            &mut replay_stage,
+            [
+                begin(42),
+                entry(42, 2),
+                transaction_message(first_transaction),
+                transaction_message(second_transaction),
+            ],
+        );
+        assert_eq!(scheduler.service_ingress_queue(4), 4);
+        assert_eq!(scheduler.service_transaction_check_dispatches(1024), 2);
+        for message in read_all_transaction_check_requests(&scheduler) {
+            queue_transaction_check_response(
+                &scheduler,
+                message.batch,
+                successful_check_response_with_writable_account_count(2),
+            );
+        }
+        assert_eq!(scheduler.service_transaction_check_results(2), 2);
+
+        assert_eq!(scheduler.service_transaction_execution_dispatches(1, 1), 1);
+        let first_execution = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        assert_eq!(
+            transaction_execution_metadata(&replay_stage.allocator, first_execution.batch),
+            PendingWorkerExecution {
+                slot: 42,
+                transaction_index: 0,
+                thread_id: 0,
+            },
+        );
+        assert!(read_pack_to_worker_message(&mut workers[1]).is_none());
+
+        queue_worker_execution_response(
+            &mut workers[0],
+            first_execution.batch,
+            successful_execution_response(),
+        );
+        assert_eq!(scheduler.service_worker_responses(1), 1);
+        {
+            let state = find_scheduling_state_mut(&mut scheduler.scheduling_states, 42).unwrap();
+            assert_eq!(
+                state.account_affinity.get(&shared_account).copied(),
+                Some(0)
+            );
+            state
+                .account_locks
+                .try_lock_accounts(
+                    [&unrelated_account].into_iter(),
+                    std::iter::empty(),
+                    ThreadSet::any(2),
+                    |_| 0,
+                )
+                .unwrap();
+        }
+
+        assert_eq!(scheduler.service_transaction_execution_dispatches(1, 1), 1);
+        let second_execution = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        assert!(read_pack_to_worker_message(&mut workers[1]).is_none());
+        assert_eq!(
+            transaction_execution_metadata(&replay_stage.allocator, second_execution.batch),
+            PendingWorkerExecution {
+                slot: 42,
+                transaction_index: 1,
+                thread_id: 0,
+            },
+        );
+    }
+
+    #[test]
+    fn execution_dispatch_obeys_active_locks_over_account_affinity() {
+        let (mut scheduler, mut replay_stage, mut workers) =
+            setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
+                allocator_size: 64 * 1024 * 1024,
+                replay_to_pack_capacity: 8,
+                replay_block_status_capacity: 8,
+                worker_count: 2,
+                pack_to_worker_capacity: 8,
+                worker_to_pack_capacity: 8,
+            });
+        let account = Pubkey::new_unique();
+        let transaction =
+            allocate_minimal_transaction_region_with_account(&replay_stage.allocator, 1, account);
+        write_replay_messages(
+            &mut replay_stage,
+            [begin(42), entry(42, 1), transaction_message(transaction)],
+        );
+        assert_eq!(scheduler.service_ingress_queue(3), 3);
+        assert_eq!(scheduler.service_transaction_check_dispatches(1024), 1);
+        let check = read_transaction_check_request(&scheduler).unwrap();
+        queue_transaction_check_response(&scheduler, check.batch, successful_check_response());
+        assert_eq!(scheduler.service_transaction_check_results(1), 1);
+        {
+            let state = find_scheduling_state_mut(&mut scheduler.scheduling_states, 42).unwrap();
+            state.account_affinity.insert(account, 1);
+            state
+                .account_locks
+                .try_lock_accounts(
+                    [&account].into_iter(),
+                    std::iter::empty(),
+                    ThreadSet::any(2),
+                    |_| 0,
+                )
+                .unwrap();
+        }
+
+        assert_eq!(scheduler.service_transaction_execution_dispatches(1, 1), 1);
+        let execution = read_pack_to_worker_message(&mut workers[0]).unwrap();
+        assert!(read_pack_to_worker_message(&mut workers[1]).is_none());
+        assert_eq!(
+            transaction_execution_metadata(&replay_stage.allocator, execution.batch),
+            PendingWorkerExecution {
+                slot: 42,
+                transaction_index: 0,
+                thread_id: 0,
+            },
+        );
+    }
+
+    #[test]
     fn execution_dispatch_is_bounded_by_worker_cost() {
         let (mut scheduler, mut replay_stage, mut workers) =
             setup_scheduler_replay_stage_and_workers(BlockVerificationStageSetupConfig {
@@ -5444,12 +5654,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            select_execution_thread(ThreadSet::any(2), &[0, 0], &[0, 1], &account_locks),
+            select_execution_thread(ThreadSet::any(2), &[0, 0], &[0, 1], &account_locks, |_| 0,),
             0,
             "cost should dominate lock count",
         );
         assert_eq!(
-            select_execution_thread(ThreadSet::any(2), &[10, 0], &[0, 0], &account_locks),
+            select_execution_thread(ThreadSet::any(2), &[10, 0], &[0, 0], &account_locks, |_| 0,),
             1,
             "lock count should dominate tx count",
         );
@@ -5463,9 +5673,34 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            select_execution_thread(ThreadSet::any(2), &[10, 0], &[0, 0], &account_locks),
+            select_execution_thread(ThreadSet::any(2), &[10, 0], &[0, 0], &account_locks, |_| 0,),
             1,
             "tx count should break ties after lock count",
+        );
+    }
+
+    #[test]
+    fn execution_thread_selection_prefers_affinity_before_load() {
+        let account = Pubkey::new_unique();
+        let mut account_locks = ThreadAwareAccountLocks::new(2);
+        account_locks
+            .try_lock_accounts(
+                [&account].into_iter(),
+                std::iter::empty(),
+                ThreadSet::any(2),
+                |_| 0,
+            )
+            .unwrap();
+
+        assert_eq!(
+            select_execution_thread(
+                ThreadSet::any(2),
+                &[0, 0],
+                &[100, 0],
+                &account_locks,
+                |thread_id| if thread_id == 0 { 1 } else { 0 },
+            ),
+            0,
         );
     }
 
@@ -6775,6 +7010,34 @@ mod tests {
                 reason: replay_block_status_reasons::NONE,
             }),
         );
+    }
+
+    #[test]
+    fn account_affinity_is_cleared_when_slot_state_is_reused() {
+        let (mut scheduler, mut replay_stage) = setup_scheduler_and_replay_stage();
+        let account = Pubkey::new_unique();
+        write_replay_messages(&mut replay_stage, [begin(42)]);
+        assert_eq!(scheduler.service_ingress_queue(1), 1);
+        find_scheduling_state_mut(&mut scheduler.scheduling_states, 42)
+            .unwrap()
+            .account_affinity
+            .insert(account, 0);
+
+        write_replay_messages(&mut replay_stage, [abort(42)]);
+        assert_eq!(scheduler.service_ingress_queue(1), 1);
+        assert_eq!(scheduler.service_terminal_slots(1), 1);
+        assert!(find_scheduling_state(&scheduler.scheduling_states, 42).is_none());
+        assert_eq!(scheduler.scheduling_state_pool.len(), 1);
+        assert!(
+            scheduler.scheduling_state_pool[0]
+                .account_affinity
+                .is_empty()
+        );
+
+        write_replay_messages(&mut replay_stage, [begin(43)]);
+        assert_eq!(scheduler.service_ingress_queue(1), 1);
+        let state = find_scheduling_state(&scheduler.scheduling_states, 43).unwrap();
+        assert!(state.account_affinity.is_empty());
     }
 
     #[test]
