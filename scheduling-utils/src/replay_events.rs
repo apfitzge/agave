@@ -188,11 +188,13 @@ pub mod replay_event_tags {
     pub const TRANSACTION_SCHEDULED_FOR_EXEC: u64 = 7;
     /// Worker execution response completed.
     ///
-    /// Payload includes `worker_id: u64` and `cost_units: u64`.
+    /// Payload includes `worker_id: u64`, `cost_units: u64`, and
+    /// `execution_status: u64` (`0` success, `1` rollback failure).
     pub const TRANSACTION_FINISHED_EXEC: u64 = 8;
     /// Worker execution response reported the transaction was not included.
     ///
-    /// Payload includes `worker_id: u64` and `cost_units: u64`.
+    /// Payload includes `worker_id: u64`, `cost_units: u64`, and
+    /// `execution_status: u64` (`0` success, `1` rollback failure).
     pub const TRANSACTION_EXEC_FAILED: u64 = 9;
     /// Replay block verification sent a successful final status for the slot.
     pub const SLOT_COMPLETE: u64 = 10;
@@ -224,6 +226,7 @@ const WORKER_DISPATCH_UNSCHEDULED_READY_AHEAD_OFFSET: usize =
     WORKER_QUEUE_LENGTH_OFFSET + core::mem::size_of::<u64>();
 const ESTIMATED_COST_UNITS_OFFSET: usize = WORKER_QUEUE_LENGTH_OFFSET;
 const COST_UNITS_OFFSET: usize = WORKER_QUEUE_LENGTH_OFFSET;
+const EXECUTION_STATUS_OFFSET: usize = COST_UNITS_OFFSET + core::mem::size_of::<u64>();
 const SIGNATURE_VERIFICATION_QUEUE_LENGTH_OFFSET: usize = SIGNATURE_OFFSET;
 const SIGNATURE_VERIFICATION_RESULT_OFFSET: usize = SIGNATURE_OFFSET;
 const SIGNATURE_VERIFICATION_WORKER_ID_OFFSET: usize = SIGNATURE_OFFSET;
@@ -444,11 +447,13 @@ impl ReplayEvent {
         transaction_index: u64,
         worker_id: u64,
         cost_units: u64,
+        execution_status: u64,
     ) -> Self {
         debug_assert!(is_transaction_execution_result_event_tag(tag));
         let mut event =
             Self::transaction_worker_event(timestamp_ns, tag, slot, transaction_index, worker_id);
         event.write_u64(COST_UNITS_OFFSET, cost_units);
+        event.write_u64(EXECUTION_STATUS_OFFSET, execution_status);
         event
     }
 
@@ -573,6 +578,11 @@ impl ReplayEvent {
     pub fn cost_units(&self) -> Option<u64> {
         is_transaction_execution_result_event_tag(self.tag)
             .then(|| self.read_u64(COST_UNITS_OFFSET))
+    }
+
+    pub fn execution_status(&self) -> Option<u64> {
+        is_transaction_execution_result_event_tag(self.tag)
+            .then(|| self.read_u64(EXECUTION_STATUS_OFFSET))
     }
 
     pub fn signature_verification_worker_id(&self) -> Option<u64> {
@@ -1012,13 +1022,14 @@ mod tests {
             replay_event_tags::TRANSACTION_FINISHED_EXEC,
             replay_event_tags::TRANSACTION_EXEC_FAILED,
         ] {
-            let event = ReplayEvent::transaction_execution_result(1, tag, 2, 3, 4, 5);
+            let event = ReplayEvent::transaction_execution_result(1, tag, 2, 3, 4, 5, 1);
 
             assert_eq!(event.tag, tag);
             assert_eq!(event.slot(), 2);
             assert_eq!(event.transaction_index(), Some(3));
             assert_eq!(event.worker_id(), Some(4));
             assert_eq!(event.cost_units(), Some(5));
+            assert_eq!(event.execution_status(), Some(1));
             assert_eq!(event.signature(), None);
         }
     }

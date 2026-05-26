@@ -10,8 +10,8 @@ use {
         SharableTransactionRegion, TpuToPackMessage, TransactionResponseRegion,
         WorkerToPackMessage, pack_message_flags, processed_codes,
         worker_message_types::{
-            CheckResponse, ExecutionResponse, fee_payer_balance_flags, not_included_reasons,
-            resolve_flags, status_check_flags,
+            CheckResponse, ExecutionResponse, execution_statuses, fee_payer_balance_flags,
+            not_included_reasons, resolve_flags, status_check_flags,
         },
     },
     solana_pubkey::Pubkey,
@@ -302,6 +302,7 @@ where
         ExecutionResponse {
             execution_slot: self.bridge.progress().current_slot,
             not_included_reason: not_included_reasons::NONE,
+            execution_status: execution_statuses::SUCCESS,
             cost_units: 0,
             fee_payer_balance: u64::from(u32::MAX),
         }
@@ -312,6 +313,7 @@ where
         ExecutionResponse {
             execution_slot: self.bridge.progress().current_slot,
             not_included_reason: reason,
+            execution_status: execution_statuses::SUCCESS,
             cost_units: 0,
             fee_payer_balance: u64::from(u32::MAX),
         }

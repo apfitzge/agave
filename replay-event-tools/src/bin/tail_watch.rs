@@ -41,6 +41,8 @@ struct TransactionAnalysis {
     index: u64,
     status: &'static str,
     signature: Option<String>,
+    execution_status: Option<u64>,
+    cost_units: Option<u64>,
     first_event_timestamp_ns: Option<u64>,
     ingest_timestamp_ns: Option<u64>,
     ready_timestamp_ns: Option<u64>,
@@ -53,6 +55,15 @@ struct TransactionAnalysis {
     skip_count: usize,
     skip_events: Vec<SkipEvent>,
     blockers: Vec<BlockerEdge>,
+}
+
+struct ChainExecutionStatusSummary {
+    success: usize,
+    rollback_failure: usize,
+    unknown: usize,
+    success_cost_units: u64,
+    rollback_failure_cost_units: u64,
+    unknown_cost_units: u64,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -345,6 +356,25 @@ fn print_tail_report(slot: &SlotRecord, threshold_ns: u64) {
         format_duration_ns(chain_span_ns),
         format_duration_ns(tail_overlap_ns)
     );
+    let execution_status = chain_execution_status_summary(&chain, &analysis);
+    let chain_transaction_count = execution_status
+        .success
+        .saturating_add(execution_status.rollback_failure)
+        .saturating_add(execution_status.unknown);
+    let chain_cost_units = execution_status
+        .success_cost_units
+        .saturating_add(execution_status.rollback_failure_cost_units)
+        .saturating_add(execution_status.unknown_cost_units);
+    println!(
+        "  chain_execution_status success={} rollback_failure={} unknown={} rollback_tx_pct={:.1}% rollback_cu={} total_cu={} rollback_cu_pct={:.1}%",
+        execution_status.success,
+        execution_status.rollback_failure,
+        execution_status.unknown,
+        percent(execution_status.rollback_failure as u64, chain_transaction_count as u64),
+        execution_status.rollback_failure_cost_units,
+        chain_cost_units,
+        percent(execution_status.rollback_failure_cost_units, chain_cost_units)
+    );
     if let Some(parallelism) = chain_parallelism_summary(&chain, &analysis) {
         let estimated_optimal_percent = if parallelism.scheduled_to_done_ns == 0 {
             100.0
@@ -507,10 +537,11 @@ fn print_tail_report(slot: &SlotRecord, threshold_ns: u64) {
             .get(&transaction_index)
             .expect("selected chain memo entry must exist");
         println!(
-            "  {:>2}. tx={} status={} total={} chain_to_here={} tail_overlap={} skips={}{}",
+            "  {:>2}. tx={} status={} exec_status={} total={} chain_to_here={} tail_overlap={} skips={}{}",
             position + 1,
             transaction.index,
             transaction.status,
+            format_optional_u64(transaction.execution_status),
             format_optional_duration(transaction.total_duration_ns),
             format_duration_ns(memo_entry.span_ns),
             format_duration_ns(transaction_tail_overlap_ns(
@@ -585,6 +616,8 @@ fn transaction_analysis(
         index,
         status: transaction.status(),
         signature: transaction.signature.clone(),
+        execution_status: transaction_execution_status(transaction),
+        cost_units: transaction_cost_units(transaction),
         first_event_timestamp_ns: transaction.events.first().map(|event| event.timestamp_ns),
         ingest_timestamp_ns: transaction.ingest_timestamp_ns(),
         ready_timestamp_ns: first_event_timestamp(
@@ -604,6 +637,44 @@ fn transaction_analysis(
         skip_events,
         blockers,
     }
+}
+
+fn chain_execution_status_summary(
+    chain: &[u64],
+    transactions: &BTreeMap<u64, TransactionAnalysis>,
+) -> ChainExecutionStatusSummary {
+    let mut summary = ChainExecutionStatusSummary {
+        success: 0,
+        rollback_failure: 0,
+        unknown: 0,
+        success_cost_units: 0,
+        rollback_failure_cost_units: 0,
+        unknown_cost_units: 0,
+    };
+    for transaction_index in chain {
+        let Some(transaction) = transactions.get(transaction_index) else {
+            summary.unknown = summary.unknown.saturating_add(1);
+            continue;
+        };
+        let cost_units = transaction.cost_units.unwrap_or_default();
+        match transaction.execution_status {
+            Some(0) => {
+                summary.success = summary.success.saturating_add(1);
+                summary.success_cost_units = summary.success_cost_units.saturating_add(cost_units);
+            }
+            Some(1) => {
+                summary.rollback_failure = summary.rollback_failure.saturating_add(1);
+                summary.rollback_failure_cost_units = summary
+                    .rollback_failure_cost_units
+                    .saturating_add(cost_units);
+            }
+            _ => {
+                summary.unknown = summary.unknown.saturating_add(1);
+                summary.unknown_cost_units = summary.unknown_cost_units.saturating_add(cost_units);
+            }
+        }
+    }
+    summary
 }
 
 fn infer_multiple_lock_blockers(transactions: &mut BTreeMap<u64, TransactionAnalysis>) {
@@ -1200,6 +1271,17 @@ fn first_event_timestamp(transaction: &TransactionRecord, tag: u64) -> Option<u6
         .map(|event| event.timestamp_ns)
 }
 
+fn transaction_execution_status(transaction: &TransactionRecord) -> Option<u64> {
+    transaction
+        .events
+        .iter()
+        .find_map(ReplayEvent::execution_status)
+}
+
+fn transaction_cost_units(transaction: &TransactionRecord) -> Option<u64> {
+    transaction.events.iter().find_map(ReplayEvent::cost_units)
+}
+
 fn execution_terminal_timestamp_ns(transaction: &TransactionRecord) -> Option<u64> {
     transaction
         .events
@@ -1355,6 +1437,14 @@ fn format_optional_u64(value: Option<u64>) -> String {
     value
         .map(|value| value.to_string())
         .unwrap_or_else(|| "-".to_string())
+}
+
+fn percent(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        (numerator as f64 / denominator as f64) * 100.0
+    }
 }
 
 fn execution_stage_delay_detail(stages: &ExecutionStageTimestamps) -> String {
@@ -1675,6 +1765,7 @@ mod tests {
                     1,
                     3,
                     123,
+                    0,
                 ),
             ],
         );
@@ -1690,6 +1781,37 @@ mod tests {
         assert!(detail.contains("complete=2ns"));
         assert!(detail.contains("response=8ns"));
         assert!(detail.contains("total=45ns"));
+    }
+
+    #[test]
+    fn chain_execution_status_counts_rollback_failures() {
+        let slot = slot_with_transactions([
+            execution_transaction(1, 0, 10, 10, 20, 20, vec![]),
+            transaction(
+                2,
+                [
+                    ReplayEvent::transaction_ingested(11, 42, 2, [2; 64]),
+                    ReplayEvent::transaction_execution_result(
+                        30,
+                        replay_event_tags::TRANSACTION_FINISHED_EXEC,
+                        42,
+                        2,
+                        0,
+                        100,
+                        1,
+                    ),
+                ],
+            ),
+        ]);
+        let analysis = analyze_transactions(&slot);
+        let summary = chain_execution_status_summary(&[1, 2, 3], &analysis);
+
+        assert_eq!(summary.success, 1);
+        assert_eq!(summary.rollback_failure, 1);
+        assert_eq!(summary.unknown, 1);
+        assert_eq!(summary.success_cost_units, 0);
+        assert_eq!(summary.rollback_failure_cost_units, 100);
+        assert_eq!(summary.unknown_cost_units, 0);
     }
 
     #[test]
@@ -1831,6 +1953,7 @@ mod tests {
                 42,
                 index,
                 worker_id,
+                0,
                 0,
             ),
         ]);

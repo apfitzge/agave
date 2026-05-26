@@ -146,6 +146,7 @@ struct TransactionSummary {
     slot_ingest_delta_ns: Option<u64>,
     estimated_cost_units: Option<u64>,
     cost_units: Option<u64>,
+    execution_status: Option<u64>,
     check_wait_ns: Option<u64>,
     ready_wait_ns: Option<u64>,
     scheduling_wait_ns: Option<u64>,
@@ -724,6 +725,7 @@ fn transaction_summary(
             .map(|(slot_begin, ingest)| ingest.saturating_sub(slot_begin)),
         estimated_cost_units: transaction_estimated_cost_units(transaction),
         cost_units: transaction_cost_units(transaction),
+        execution_status: transaction_execution_status(transaction),
         check_wait_ns: transaction_check_wait_ns(transaction),
         ready_wait_ns: transaction_ready_wait_ns(transaction),
         scheduling_wait_ns: transaction_scheduling_wait_ns(transaction),
@@ -746,6 +748,13 @@ fn transaction_estimated_cost_units(transaction: &TransactionRecord) -> Option<u
 
 fn transaction_cost_units(transaction: &TransactionRecord) -> Option<u64> {
     transaction.events.iter().find_map(ReplayEvent::cost_units)
+}
+
+fn transaction_execution_status(transaction: &TransactionRecord) -> Option<u64> {
+    transaction
+        .events
+        .iter()
+        .find_map(ReplayEvent::execution_status)
 }
 
 fn slot_estimated_cost_units(slot: &store::SlotRecord) -> Option<u64> {
@@ -1205,6 +1214,9 @@ fn timeline_event_detail(event: &ReplayEvent) -> String {
     if let Some(cost_units) = event.cost_units() {
         details.push(format!("cost_units={cost_units}"));
     }
+    if let Some(execution_status) = event.execution_status() {
+        details.push(format!("exec_status={execution_status}"));
+    }
     if let Some(verified) = event.signature_verification_result() {
         details.push(format!("verified={verified}"));
     }
@@ -1265,6 +1277,9 @@ fn worker_timeline_event_detail(event: &ReplayEvent) -> String {
     }
     if let Some(cost_units) = event.cost_units() {
         details.push(format!("cost_units={cost_units}"));
+    }
+    if let Some(execution_status) = event.execution_status() {
+        details.push(format!("exec_status={execution_status}"));
     }
     if let Some(verified) = event.signature_verification_worker_result() {
         details.push(format!("verified={verified}"));
@@ -2036,6 +2051,7 @@ fn render_transactions(frame: &mut Frame<'_>, area: Rect, app: &App, snapshot: &
         [
             Constraint::Length(8),
             Constraint::Length(12),
+            Constraint::Length(7),
             Constraint::Length(12),
             Constraint::Length(9),
             Constraint::Length(9),
@@ -2053,6 +2069,7 @@ fn render_transactions(frame: &mut Frame<'_>, area: Rect, app: &App, snapshot: &
         Row::new([
             "index",
             "status",
+            "exec-st",
             "ingest",
             "est-cost",
             "cost",
@@ -2121,6 +2138,7 @@ fn transaction_table_row(transaction: &TransactionSummary, fresh_start: bool) ->
     Row::new([
         transaction.index.to_string(),
         transaction.status.to_string(),
+        format_optional_u64(transaction.execution_status),
         transaction
             .slot_ingest_delta_ns
             .map(format_duration_ns)
@@ -2166,6 +2184,7 @@ fn transaction_table_row(transaction: &TransactionSummary, fresh_start: bool) ->
 fn placeholder_transaction_row(label: &str) -> Row<'static> {
     Row::new([
         label.to_string(),
+        String::new(),
         String::new(),
         String::new(),
         String::new(),
@@ -3314,6 +3333,7 @@ mod tests {
                     7,
                     3,
                     456,
+                    0,
                 ),
             ],
         };
@@ -3369,6 +3389,7 @@ mod tests {
                                 1,
                                 0,
                                 70,
+                                0,
                             ),
                         ],
                     },
@@ -3387,6 +3408,7 @@ mod tests {
                                 2,
                                 0,
                                 80,
+                                0,
                             ),
                         ],
                     },
@@ -3548,6 +3570,7 @@ mod tests {
                     slot_ingest_delta_ns: Some(10),
                     estimated_cost_units: None,
                     cost_units: None,
+                    execution_status: None,
                     check_wait_ns: None,
                     ready_wait_ns: None,
                     scheduling_wait_ns: None,
@@ -3563,6 +3586,7 @@ mod tests {
                     slot_ingest_delta_ns: Some(30),
                     estimated_cost_units: None,
                     cost_units: None,
+                    execution_status: None,
                     check_wait_ns: None,
                     ready_wait_ns: None,
                     scheduling_wait_ns: None,
@@ -3599,7 +3623,7 @@ mod tests {
     }
 
     #[test]
-    fn transaction_timeline_includes_cost_units() {
+    fn transaction_timeline_includes_cost_units_and_execution_status() {
         let transaction = TransactionRecord {
             index: 7,
             signature: Some("signature-7".to_string()),
@@ -3613,6 +3637,7 @@ mod tests {
                     7,
                     3,
                     456,
+                    1,
                 ),
             ],
         };
@@ -3635,6 +3660,7 @@ mod tests {
                 .contains("estimated_cost_units=123")
         );
         assert!(finished_exec.detail.contains("cost_units=456"));
+        assert!(finished_exec.detail.contains("exec_status=1"));
     }
 
     #[test]
@@ -3932,6 +3958,7 @@ mod tests {
                         slot_ingest_delta_ns: None,
                         estimated_cost_units: None,
                         cost_units: None,
+                        execution_status: None,
                         check_wait_ns: None,
                         ready_wait_ns: None,
                         scheduling_wait_ns: None,

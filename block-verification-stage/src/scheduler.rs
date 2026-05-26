@@ -1780,6 +1780,7 @@ impl BlockVerificationScheduler {
         transaction_index: usize,
         worker_id: ThreadId,
         cost_units: u64,
+        execution_status: u8,
     ) {
         self.emit_event(ReplayEvent::transaction_execution_result(
             0,
@@ -1788,6 +1789,7 @@ impl BlockVerificationScheduler {
             u64::try_from(transaction_index).expect("transaction index must fit in u64"),
             u64::try_from(worker_id).expect("worker id must fit in u64"),
             cost_units,
+            u64::from(execution_status),
         ));
     }
 
@@ -2590,6 +2592,7 @@ impl BlockVerificationScheduler {
                 worker_execution.transaction_index,
                 worker_execution.thread_id,
                 execution_response.cost_units,
+                execution_response.execution_status,
             );
             self.mark_slot_failed(slot, replay_block_status_reasons::INVALID_TRANSACTION);
         } else {
@@ -2599,6 +2602,7 @@ impl BlockVerificationScheduler {
                 worker_execution.transaction_index,
                 worker_execution.thread_id,
                 execution_response.cost_units,
+                execution_response.execution_status,
             );
         }
     }
@@ -3880,6 +3884,8 @@ mod tests {
         ExecutionResponse {
             execution_slot: 42,
             not_included_reason: not_included_reasons::NONE,
+            execution_status:
+                agave_scheduler_bindings::worker_message_types::execution_statuses::SUCCESS,
             cost_units: 0,
             fee_payer_balance: 0,
         }

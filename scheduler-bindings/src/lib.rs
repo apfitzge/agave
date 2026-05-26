@@ -552,10 +552,25 @@ pub mod worker_message_types {
         /// Indicates if the transaction was included in the block or not.
         /// If [`not_included_reasons::NONE`], the transaction was included.
         pub not_included_reason: u8,
+        /// Transaction execution status.
+        ///
+        /// See [`execution_statuses`] for accepted values. This is a rollback
+        /// failure bit: transactions that were not included did not roll back
+        /// and report [`execution_statuses::SUCCESS`].
+        pub execution_status: u8,
         /// If included, cost units used by the transaction.
         pub cost_units: u64,
         /// If included, the fee-payer balance after execution.
         pub fee_payer_balance: u64,
+    }
+
+    pub mod execution_statuses {
+        /// The transaction executed and committed successfully, or was not
+        /// included and therefore did not roll back.
+        pub const SUCCESS: u8 = 0;
+        /// The transaction was included, failed execution, and account changes
+        /// were rolled back.
+        pub const FAILURE: u8 = 1;
     }
 
     pub mod not_included_reasons {
