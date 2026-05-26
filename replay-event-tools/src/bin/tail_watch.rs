@@ -66,6 +66,21 @@ struct ChainExecutionStatusSummary {
     unknown_cost_units: u64,
 }
 
+struct PossibleSpeculativeChainTime {
+    actual_chain_exec_wall_ns: Option<u64>,
+    possible_chain_time_ns: Option<u64>,
+    saved_vs_actual_ns: Option<i128>,
+    speculative_edges: usize,
+    speculative_restarts: usize,
+    missing_worker_service_txs: usize,
+    missing_execution_status_txs: usize,
+}
+
+struct SpeculativeTransactionTiming {
+    worker_service_ns: u64,
+    failed: bool,
+}
+
 #[derive(Clone, Copy, Default)]
 struct ExecutionStageTimestamps {
     worker_id: Option<u64>,
@@ -375,6 +390,21 @@ fn print_tail_report(slot: &SlotRecord, threshold_ns: u64) {
         chain_cost_units,
         percent(execution_status.rollback_failure_cost_units, chain_cost_units)
     );
+    let speculative = possible_speculative_chain_time(&chain, &analysis);
+    println!(
+        "  possible_speculative_chain_time={} actual_chain_exec_wall={} saved_vs_actual={} saved_vs_actual_pct={} speculative_edges={} speculative_restarts={} missing_worker_service_txs={} missing_execution_status_txs={}",
+        format_optional_duration(speculative.possible_chain_time_ns),
+        format_optional_duration(speculative.actual_chain_exec_wall_ns),
+        format_optional_duration_delta(speculative.saved_vs_actual_ns),
+        format_optional_percent_delta(
+            speculative.saved_vs_actual_ns,
+            speculative.actual_chain_exec_wall_ns
+        ),
+        speculative.speculative_edges,
+        speculative.speculative_restarts,
+        speculative.missing_worker_service_txs,
+        speculative.missing_execution_status_txs
+    );
     if let Some(parallelism) = chain_parallelism_summary(&chain, &analysis) {
         let estimated_optimal_percent = if parallelism.scheduled_to_done_ns == 0 {
             100.0
@@ -675,6 +705,148 @@ fn chain_execution_status_summary(
         }
     }
     summary
+}
+
+fn possible_speculative_chain_time(
+    chain: &[u64],
+    transactions: &BTreeMap<u64, TransactionAnalysis>,
+) -> PossibleSpeculativeChainTime {
+    let actual_chain_exec_wall_ns = actual_chain_exec_wall_ns(chain, transactions);
+    let speculative_edges = chain.len().saturating_sub(1);
+    let missing_worker_service_txs = chain
+        .iter()
+        .filter(|transaction_index| {
+            transactions
+                .get(transaction_index)
+                .and_then(transaction_worker_service_ns)
+                .is_none()
+        })
+        .count();
+    let missing_execution_status_txs = chain
+        .iter()
+        .filter(|transaction_index| {
+            transactions
+                .get(transaction_index)
+                .and_then(transaction_execution_failed)
+                .is_none()
+        })
+        .count();
+    if missing_worker_service_txs != 0 || missing_execution_status_txs != 0 || chain.is_empty() {
+        return PossibleSpeculativeChainTime {
+            actual_chain_exec_wall_ns,
+            possible_chain_time_ns: None,
+            saved_vs_actual_ns: None,
+            speculative_edges,
+            speculative_restarts: 0,
+            missing_worker_service_txs,
+            missing_execution_status_txs,
+        };
+    }
+
+    let timings: Vec<_> = chain
+        .iter()
+        .map(|transaction_index| {
+            let transaction = transactions
+                .get(transaction_index)
+                .expect("missing counts should cover missing transactions");
+            SpeculativeTransactionTiming {
+                worker_service_ns: transaction_worker_service_ns(transaction)
+                    .expect("missing count should cover missing worker timing"),
+                failed: transaction_execution_failed(transaction)
+                    .expect("missing count should cover missing execution status"),
+            }
+        })
+        .collect();
+    let mut start_timestamps_ns: Vec<Option<u64>> = vec![None; timings.len()];
+    start_timestamps_ns[0] = Some(0);
+    if start_timestamps_ns.len() > 1 {
+        start_timestamps_ns[1] = Some(0);
+    }
+    let mut base_timestamp_ns = 0;
+    let mut speculative_restarts = 0;
+
+    for index in 0..timings.len() {
+        if index > 0 && !timings[index - 1].failed {
+            if start_timestamps_ns[index].is_some_and(|start_timestamp_ns| {
+                start_timestamp_ns != base_timestamp_ns
+            }) {
+                speculative_restarts += 1;
+            }
+            start_timestamps_ns[index] = Some(base_timestamp_ns);
+        } else if start_timestamps_ns[index].is_none() {
+            start_timestamps_ns[index] = Some(base_timestamp_ns);
+        }
+
+        let start_timestamp_ns = start_timestamps_ns[index]
+            .expect("current transaction start should be initialized");
+        let finish_timestamp_ns =
+            start_timestamp_ns.saturating_add(timings[index].worker_service_ns);
+        let valid_finish_timestamp_ns = finish_timestamp_ns.max(base_timestamp_ns);
+
+        if index + 2 < start_timestamps_ns.len() && start_timestamps_ns[index + 2].is_none() {
+            start_timestamps_ns[index + 2] = Some(valid_finish_timestamp_ns);
+        };
+        base_timestamp_ns = valid_finish_timestamp_ns;
+    }
+
+    let modeled_possible_chain_time_ns = base_timestamp_ns;
+    let possible_chain_time_ns = actual_chain_exec_wall_ns
+        .map(|actual_chain_exec_wall_ns| modeled_possible_chain_time_ns.min(actual_chain_exec_wall_ns))
+        .unwrap_or(modeled_possible_chain_time_ns);
+    PossibleSpeculativeChainTime {
+        actual_chain_exec_wall_ns,
+        possible_chain_time_ns: Some(possible_chain_time_ns),
+        saved_vs_actual_ns: actual_chain_exec_wall_ns.map(|actual_chain_exec_wall_ns| {
+            actual_chain_exec_wall_ns as i128 - possible_chain_time_ns as i128
+        }),
+        speculative_edges,
+        speculative_restarts,
+        missing_worker_service_txs,
+        missing_execution_status_txs,
+    }
+}
+
+fn actual_chain_exec_wall_ns(
+    chain: &[u64],
+    transactions: &BTreeMap<u64, TransactionAnalysis>,
+) -> Option<u64> {
+    let mut first_picked_up_timestamp_ns = None;
+    let mut last_finished_timestamp_ns = None;
+    for transaction_index in chain {
+        let transaction = transactions.get(transaction_index)?;
+        let picked_up_timestamp_ns = transaction.execution_stages.picked_up_timestamp_ns?;
+        let finished_timestamp_ns = transaction
+            .execution_stages
+            .scheduler_finished_timestamp_ns
+            .or(transaction.execution_terminal_timestamp_ns)?;
+        first_picked_up_timestamp_ns = Some(
+            first_picked_up_timestamp_ns
+                .map_or(picked_up_timestamp_ns, |timestamp_ns: u64| {
+                    timestamp_ns.min(picked_up_timestamp_ns)
+                }),
+        );
+        last_finished_timestamp_ns = Some(
+            last_finished_timestamp_ns.map_or(finished_timestamp_ns, |timestamp_ns: u64| {
+                timestamp_ns.max(finished_timestamp_ns)
+            }),
+        );
+    }
+    Some(last_finished_timestamp_ns?.saturating_sub(first_picked_up_timestamp_ns?))
+}
+
+fn transaction_worker_service_ns(transaction: &TransactionAnalysis) -> Option<u64> {
+    stage_delay_ns(
+        transaction.execution_stages.picked_up_timestamp_ns,
+        transaction.execution_stages.scheduler_finished_timestamp_ns,
+    )
+}
+
+fn transaction_execution_failed(transaction: &TransactionAnalysis) -> Option<bool> {
+    match transaction.execution_status {
+        Some(0) => Some(false),
+        Some(1) => Some(true),
+        _ => None,
+    }
 }
 
 fn infer_multiple_lock_blockers(transactions: &mut BTreeMap<u64, TransactionAnalysis>) {
@@ -1447,6 +1619,25 @@ fn percent(numerator: u64, denominator: u64) -> f64 {
     }
 }
 
+fn format_optional_duration_delta(duration_ns: Option<i128>) -> String {
+    match duration_ns {
+        Some(duration_ns) if duration_ns < 0 => {
+            format!("-{}", format_duration_ns((-duration_ns) as u64))
+        }
+        Some(duration_ns) => format_duration_ns(duration_ns as u64),
+        None => "-".to_string(),
+    }
+}
+
+fn format_optional_percent_delta(numerator: Option<i128>, denominator: Option<u64>) -> String {
+    match (numerator, denominator) {
+        (_, Some(0)) | (None, _) | (_, None) => "-".to_string(),
+        (Some(numerator), Some(denominator)) => {
+            format!("{:.1}%", (numerator as f64 / denominator as f64) * 100.0)
+        }
+    }
+}
+
 fn execution_stage_delay_detail(stages: &ExecutionStageTimestamps) -> String {
     format!(
         "exec_stage worker={} pickup={} bank={} translate={} process={} commit={} complete={} response={} total={}",
@@ -1815,6 +2006,157 @@ mod tests {
     }
 
     #[test]
+    fn possible_speculative_chain_time_overlaps_failed_transaction_with_successor() {
+        let slot = slot_with_transactions([
+            execution_transaction_with_status(
+                1,
+                0,
+                execution_timing(10, 10, 20, 20),
+                vec![],
+                1,
+            ),
+            execution_transaction_with_status(
+                2,
+                1,
+                execution_timing(20, 20, 50, 50),
+                vec![],
+                0,
+            ),
+            execution_transaction_with_status(
+                3,
+                2,
+                execution_timing(50, 50, 55, 55),
+                vec![],
+                0,
+            ),
+        ]);
+        let analysis = analyze_transactions(&slot);
+
+        let summary = possible_speculative_chain_time(&[1, 2, 3], &analysis);
+
+        assert_eq!(summary.actual_chain_exec_wall_ns, Some(45));
+        assert_eq!(summary.possible_chain_time_ns, Some(35));
+        assert_eq!(summary.saved_vs_actual_ns, Some(10));
+        assert_eq!(summary.speculative_edges, 2);
+        assert_eq!(summary.speculative_restarts, 1);
+        assert_eq!(summary.missing_worker_service_txs, 0);
+        assert_eq!(summary.missing_execution_status_txs, 0);
+    }
+
+    #[test]
+    fn possible_speculative_chain_time_chains_consecutive_failures() {
+        let slot = slot_with_transactions([
+            execution_transaction_with_status(
+                1,
+                0,
+                execution_timing(10, 10, 20, 20),
+                vec![],
+                1,
+            ),
+            execution_transaction_with_status(
+                2,
+                1,
+                execution_timing(20, 20, 50, 50),
+                vec![],
+                1,
+            ),
+            execution_transaction_with_status(
+                3,
+                2,
+                execution_timing(50, 50, 55, 55),
+                vec![],
+                0,
+            ),
+            execution_transaction_with_status(
+                4,
+                3,
+                execution_timing(55, 55, 62, 62),
+                vec![],
+                0,
+            ),
+        ]);
+        let analysis = analyze_transactions(&slot);
+
+        let summary = possible_speculative_chain_time(&[1, 2, 3, 4], &analysis);
+
+        assert_eq!(summary.actual_chain_exec_wall_ns, Some(52));
+        assert_eq!(summary.possible_chain_time_ns, Some(37));
+        assert_eq!(summary.saved_vs_actual_ns, Some(15));
+        assert_eq!(summary.speculative_edges, 3);
+        assert_eq!(summary.speculative_restarts, 0);
+        assert_eq!(summary.missing_worker_service_txs, 0);
+        assert_eq!(summary.missing_execution_status_txs, 0);
+    }
+
+    #[test]
+    fn possible_speculative_chain_time_never_reports_slower_than_actual_chain_wall() {
+        let slot = slot_with_transactions([
+            execution_transaction_with_status(
+                1,
+                0,
+                execution_timing(0, 0, 50, 50),
+                vec![],
+                0,
+            ),
+            execution_transaction_with_status(
+                2,
+                1,
+                execution_timing(0, 0, 10, 10),
+                vec![],
+                0,
+            ),
+        ]);
+        let analysis = analyze_transactions(&slot);
+
+        let summary = possible_speculative_chain_time(&[1, 2], &analysis);
+
+        assert_eq!(summary.actual_chain_exec_wall_ns, Some(50));
+        assert_eq!(summary.possible_chain_time_ns, Some(50));
+        assert_eq!(summary.saved_vs_actual_ns, Some(0));
+        assert_eq!(summary.speculative_edges, 1);
+        assert_eq!(summary.speculative_restarts, 1);
+    }
+
+    #[test]
+    fn possible_speculative_chain_time_reports_missing_worker_service_timing() {
+        let slot = slot_with_transactions([
+            transaction(
+                1,
+                [
+                    ReplayEvent::transaction_ingested(10, 42, 1, [1; 64]),
+                    ReplayEvent::transaction_execution_result(
+                        20,
+                        replay_event_tags::TRANSACTION_FINISHED_EXEC,
+                        42,
+                        1,
+                        0,
+                        0,
+                        1,
+                    ),
+                ],
+            ),
+            execution_transaction_with_status(
+                2,
+                0,
+                execution_timing(20, 20, 50, 50),
+                vec![],
+                0,
+            ),
+        ]);
+        let analysis = analyze_transactions(&slot);
+
+        let summary = possible_speculative_chain_time(&[1, 2], &analysis);
+
+        assert_eq!(summary.actual_chain_exec_wall_ns, None);
+        assert_eq!(summary.possible_chain_time_ns, None);
+        assert_eq!(summary.saved_vs_actual_ns, None);
+        assert_eq!(summary.speculative_edges, 1);
+        assert_eq!(summary.speculative_restarts, 0);
+        assert_eq!(summary.missing_worker_service_txs, 1);
+        assert_eq!(summary.missing_execution_status_txs, 0);
+    }
+
+    #[test]
     fn chain_parallelism_separates_prequeued_edges_and_worker_queue_wait() {
         let slot = slot_with_transactions([
             execution_transaction(0, 1, 25, 25, 38, 38, vec![]),
@@ -1907,6 +2249,28 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    struct ExecutionTransactionTiming {
+        scheduled_timestamp_ns: u64,
+        picked_up_timestamp_ns: u64,
+        worker_completed_timestamp_ns: u64,
+        scheduler_finished_timestamp_ns: u64,
+    }
+
+    fn execution_timing(
+        scheduled_timestamp_ns: u64,
+        picked_up_timestamp_ns: u64,
+        worker_completed_timestamp_ns: u64,
+        scheduler_finished_timestamp_ns: u64,
+    ) -> ExecutionTransactionTiming {
+        ExecutionTransactionTiming {
+            scheduled_timestamp_ns,
+            picked_up_timestamp_ns,
+            worker_completed_timestamp_ns,
+            scheduler_finished_timestamp_ns,
+        }
+    }
+
     fn execution_transaction(
         index: u64,
         worker_id: u64,
@@ -1914,7 +2278,28 @@ mod tests {
         picked_up_timestamp_ns: u64,
         worker_completed_timestamp_ns: u64,
         scheduler_finished_timestamp_ns: u64,
+        extra_events: Vec<ReplayEvent>,
+    ) -> TransactionRecord {
+        execution_transaction_with_status(
+            index,
+            worker_id,
+            execution_timing(
+                scheduled_timestamp_ns,
+                picked_up_timestamp_ns,
+                worker_completed_timestamp_ns,
+                scheduler_finished_timestamp_ns,
+            ),
+            extra_events,
+            0,
+        )
+    }
+
+    fn execution_transaction_with_status(
+        index: u64,
+        worker_id: u64,
+        timing: ExecutionTransactionTiming,
         mut extra_events: Vec<ReplayEvent>,
+        execution_status: u64,
     ) -> TransactionRecord {
         let mut events = vec![ReplayEvent::transaction_ingested(
             index,
@@ -1925,7 +2310,7 @@ mod tests {
         events.append(&mut extra_events);
         events.extend([
             ReplayEvent::transaction_worker_dispatch_event(
-                scheduled_timestamp_ns,
+                timing.scheduled_timestamp_ns,
                 replay_event_tags::TRANSACTION_SCHEDULED_FOR_EXEC,
                 42,
                 index,
@@ -1934,27 +2319,27 @@ mod tests {
                 0,
             ),
             ReplayEvent::transaction_worker_event(
-                picked_up_timestamp_ns,
+                timing.picked_up_timestamp_ns,
                 replay_event_tags::TRANSACTION_WORKER_PICKED_UP,
                 42,
                 index,
                 worker_id,
             ),
             ReplayEvent::transaction_worker_event(
-                worker_completed_timestamp_ns,
+                timing.worker_completed_timestamp_ns,
                 replay_event_tags::TRANSACTION_WORKER_EXECUTION_COMPLETED,
                 42,
                 index,
                 worker_id,
             ),
             ReplayEvent::transaction_execution_result(
-                scheduler_finished_timestamp_ns,
+                timing.scheduler_finished_timestamp_ns,
                 replay_event_tags::TRANSACTION_FINISHED_EXEC,
                 42,
                 index,
                 worker_id,
                 0,
-                0,
+                execution_status,
             ),
         ]);
 
