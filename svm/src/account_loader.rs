@@ -570,7 +570,7 @@ fn load_transaction_accounts<CB: TransactionProcessingCallback>(
     // Attempt to load and collect remaining non-fee payer accounts.
     for (account_index, account_key) in account_keys.iter().enumerate().skip(1) {
         let loaded_account =
-            load_transaction_account(account_loader, message, account_key, account_index, rent);
+            load_transaction_account(account_loader, message, account_key, account_index, rent)?;
         collect_loaded_account(account_loader, account_key, loaded_account)?;
     }
 
@@ -596,33 +596,33 @@ fn load_transaction_account<CB: TransactionProcessingCallback>(
     account_key: &Pubkey,
     account_index: usize,
     rent: &Rent,
-) -> LoadedTransactionAccount {
+) -> Result<LoadedTransactionAccount> {
     let is_writable = message.is_writable(account_index);
     if solana_sdk_ids::sysvar::instructions::check_id(account_key) {
         // Since the instructions sysvar is constructed by the SVM and modified
         // for each transaction instruction, it cannot be loaded.
-        LoadedTransactionAccount {
+        Ok(LoadedTransactionAccount {
             loaded_size: 0,
-            account: construct_instructions_account(message),
-        }
+            account: construct_instructions_account(message)?,
+        })
     } else if let Some(mut loaded_account) =
         account_loader.load_transaction_account(account_key, is_writable)
     {
         if is_writable {
             update_rent_exempt_status_for_account(rent, &mut loaded_account.account);
         }
-        loaded_account
+        Ok(loaded_account)
     } else {
         let mut default_account = AccountSharedData::default();
         default_account.set_rent_epoch(RENT_EXEMPT_RENT_EPOCH);
-        LoadedTransactionAccount {
+        Ok(LoadedTransactionAccount {
             loaded_size: default_account.data().len(),
             account: default_account,
-        }
+        })
     }
 }
 
-fn construct_instructions_account(message: &impl SVMMessage) -> AccountSharedData {
+fn construct_instructions_account(message: &impl SVMMessage) -> Result<AccountSharedData> {
     let account_keys = message.account_keys();
     let mut decompiled_instructions = Vec::with_capacity(message.num_instructions());
     for (program_id, instruction) in message.program_instructions_iter() {
@@ -646,11 +646,31 @@ fn construct_instructions_account(message: &impl SVMMessage) -> AccountSharedDat
         });
     }
 
-    AccountSharedData::from(Account {
-        data: construct_instructions_data(&decompiled_instructions),
+    // Mirror of the layout in solana_instructions_sysvar::serialize_instructions:
+    // header = num_instructions (u16) + one u16 offset per instruction;
+    // each instruction = num_accounts (u16) + 33 bytes per account meta
+    // + program_id (32) + data_len (u16) + data.
+    let mut offset = 2 + 2 * decompiled_instructions.len();
+    for instruction in &decompiled_instructions {
+        if offset > usize::from(u16::MAX) {
+            // The instruction's start offset cannot be represented in the
+            // sysvar's u16 offset table, so the sysvar cannot be constructed.
+            // TODO: replace with a dedicated TransactionError variant once
+            // one is added to solana-transaction-error.
+            return Err(TransactionError::SanitizeFailure);
+        }
+        offset += 2 + 33 * instruction.accounts.len() + 32 + 2 + instruction.data.len();
+    }
+
+    let data = construct_instructions_data(&decompiled_instructions);
+    // `construct_instructions_data` appends a 2-byte current-index trailer.
+    debug_assert_eq!(offset + 2, data.len());
+
+    Ok(AccountSharedData::from(Account {
+        data,
         owner: sysvar::id(),
         ..Account::default()
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -1397,13 +1417,77 @@ mod tests {
             is_writable_account_cache: vec![false],
         };
         let message = SanitizedMessage::V0(loaded_message);
-        let shared_data = construct_instructions_account(&message);
+        let shared_data = construct_instructions_account(&message).unwrap();
         let expected = AccountSharedData::from(Account {
             data: construct_instructions_data(&message.decompile_instructions()),
             owner: sysvar::id(),
             ..Account::default()
         });
         assert_eq!(shared_data, expected);
+    }
+
+    // Build a message whose instructions sysvar serialization is large enough
+    // to overflow the sysvar's u16 offset table when `num_instructions` is
+    // large enough. Each instruction references 255 accounts and serializes to
+    // 2 + 33 * 255 + 32 + 2 = 8451 bytes, so the last instruction's start
+    // offset, 2 + 2 * num_instructions + (num_instructions - 1) * 8451, first
+    // exceeds u16::MAX at 9 instructions.
+    fn make_instructions_sysvar_message(num_instructions: usize) -> Message {
+        Message {
+            account_keys: vec![
+                Pubkey::new_unique(),
+                sysvar::instructions::id(),
+                Pubkey::new_unique(),
+            ],
+            header: MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 2,
+            },
+            instructions: vec![CompiledInstruction::new(2, &(), vec![1u8; 255]); num_instructions],
+            recent_blockhash: Hash::default(),
+        }
+    }
+
+    #[test]
+    fn test_construct_instructions_account_overflow() {
+        let message = new_unchecked_sanitized_message(make_instructions_sysvar_message(8));
+        assert!(construct_instructions_account(&message).is_ok());
+
+        let message = new_unchecked_sanitized_message(make_instructions_sysvar_message(9));
+        assert_eq!(
+            construct_instructions_account(&message),
+            Err(TransactionError::SanitizeFailure)
+        );
+    }
+
+    #[test]
+    fn test_load_accounts_instructions_sysvar_overflow() {
+        let mut error_metrics = TransactionErrorMetrics::default();
+
+        let keypair = Keypair::new();
+        let mut message = make_instructions_sysvar_message(9);
+        message.account_keys[0] = keypair.pubkey();
+        let tx = Transaction::new(&[&keypair], message, Hash::default());
+
+        let payer_account = AccountSharedData::new(1, 0, &Pubkey::default());
+        let accounts = vec![(keypair.pubkey(), payer_account)];
+
+        let load_results = load_accounts_with_features_and_rent(
+            tx,
+            &accounts,
+            &Rent::default(),
+            &mut error_metrics,
+            SVMFeatureSet::all_enabled(),
+        );
+
+        assert!(matches!(
+            load_results,
+            TransactionLoadResult::FeesOnly(FeesOnlyTransaction {
+                load_error: TransactionError::SanitizeFailure,
+                ..
+            }),
+        ));
     }
 
     #[test]

@@ -2701,6 +2701,73 @@ fn drop_on_failure_batch(statuses: &[bool]) -> Vec<SvmTestEntry> {
     vec![test_entry]
 }
 
+fn instructions_sysvar_overflow(drop_on_failure: bool) -> Vec<SvmTestEntry> {
+    let mut test_entry = SvmTestEntry {
+        drop_on_failure,
+        ..Default::default()
+    };
+
+    let program_name = "hello-solana";
+    let program_id = program_address(program_name);
+    test_entry.add_initial_program(program_name);
+
+    // Each instruction references 63 accounts (the default program entrypoint
+    // supports at most 64) and serializes to 2115 bytes in the instructions
+    // sysvar, so the last instruction's start offset first overflows the
+    // sysvar's u16 offset table at 32 instructions.
+    let make_transaction = |fee_payer_keypair: &Keypair, num_instructions: usize| {
+        let instruction = Instruction::new_with_bytes(
+            program_id,
+            &[],
+            vec![AccountMeta::new_readonly(solana_sdk_ids::sysvar::instructions::id(), false); 63],
+        );
+        Transaction::new_signed_with_payer(
+            &vec![instruction; num_instructions],
+            Some(&fee_payer_keypair.pubkey()),
+            &[fee_payer_keypair],
+            Hash::default(),
+        )
+    };
+
+    let add_fee_payer = |test_entry: &mut SvmTestEntry| {
+        let fee_payer_keypair = Keypair::new();
+        let mut fee_payer_data = AccountSharedData::default();
+        fee_payer_data.set_lamports(LAMPORTS_PER_SOL);
+        fee_payer_data.set_rent_epoch(u64::MAX);
+        test_entry.add_initial_account(fee_payer_keypair.pubkey(), &fee_payer_data);
+        fee_payer_keypair
+    };
+
+    // 0: 32 instructions overflow the sysvar offset table, fees are charged
+    {
+        let fee_payer_keypair = add_fee_payer(&mut test_entry);
+
+        test_entry.push_transaction_with_status(
+            make_transaction(&fee_payer_keypair, 32),
+            if drop_on_failure {
+                ExecutionStatus::Discarded
+            } else {
+                ExecutionStatus::ProcessedFailed
+            },
+        );
+
+        if !drop_on_failure {
+            test_entry
+                .decrease_expected_lamports(&fee_payer_keypair.pubkey(), LAMPORTS_PER_SIGNATURE);
+        }
+    }
+
+    // 1: 31 instructions fit, the transaction executes successfully
+    {
+        let fee_payer_keypair = add_fee_payer(&mut test_entry);
+
+        test_entry.push_transaction(make_transaction(&fee_payer_keypair, 31));
+        test_entry.decrease_expected_lamports(&fee_payer_keypair.pubkey(), LAMPORTS_PER_SIGNATURE);
+    }
+
+    vec![test_entry]
+}
+
 #[test_case(program_medley(false))]
 #[test_case(program_medley(true))]
 #[test_case(simple_transfer(false))]
@@ -2725,6 +2792,8 @@ fn drop_on_failure_batch(statuses: &[bool]) -> Vec<SvmTestEntry> {
 #[test_case(drop_on_failure_batch(&[true, true, false]))]
 #[test_case(drop_on_failure_batch(&[false, true, false]))]
 #[test_case(drop_on_failure_batch(&[true, false, true]))]
+#[test_case(instructions_sysvar_overflow(false))]
+#[test_case(instructions_sysvar_overflow(true))]
 fn svm_integration(test_entries: Vec<SvmTestEntry>) {
     for test_entry in test_entries {
         let env = SvmTestEnvironment::create(test_entry);
