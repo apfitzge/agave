@@ -150,6 +150,17 @@ pub struct UpdateParentSignal {
 // has DATA_COMPLETE_SHRED flag.
 type CompletedRanges = Vec<Range<u32>>;
 
+/// Returns `true` if `payload` is a serialized, empty `Vec<Entry>`. The wincode
+/// encoding of a `Vec` begins with its length as a little-endian `u64`, so an
+/// empty vector is encoded as a leading zero length.
+fn serialized_entries_is_empty(payload: &[u8]) -> bool {
+    payload
+        .get(..std::mem::size_of::<u64>())
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(|bytes| u64::from_le_bytes(bytes) == 0)
+        .unwrap_or(true)
+}
+
 #[derive(Default)]
 pub struct SignatureInfosForAddress {
     pub infos: Vec<ConfirmedTransactionStatusWithSignature>,
@@ -4787,6 +4798,30 @@ impl Blockstore {
         Ok((entries, num_shreds, slot_meta.is_full()))
     }
 
+    /// Returns the serialized entry vectors for the slot starting with `shred_start_index`, the
+    /// number of shreds that comprise the entry vectors, and whether the slot is full (consumed
+    /// all shreds).
+    ///
+    /// This is the byte-oriented analogue of [`Blockstore::get_slot_entries_with_shred_info`]: it
+    /// returns the deshredded payloads (each a serialized `Vec<Entry>`) without deserializing into
+    /// `Entry` types. One [`bytes::Bytes`] blob is returned per completed data range.
+    pub fn get_slot_entry_bytes_with_shred_info(
+        &self,
+        slot: Slot,
+        start_index: u64,
+        allow_dead_slots: bool,
+    ) -> Result<(Vec<bytes::Bytes>, u64, bool)> {
+        let Some((completed_ranges, slot_meta, num_shreds)) =
+            self.get_slot_data_with_shred_info_common(slot, start_index, allow_dead_slots)?
+        else {
+            return Ok((vec![], 0, false));
+        };
+
+        let entry_bytes =
+            self.get_slot_entry_bytes_in_block(slot, &completed_ranges, Some(&slot_meta))?;
+        Ok((entry_bytes, num_shreds, slot_meta.is_full()))
+    }
+
     /// Returns the components vector for the slot starting with `shred_start_index`, the number of
     /// shreds that comprise the components vector, and whether the slot is full (consumed all
     /// shreds).
@@ -5038,6 +5073,38 @@ impl Blockstore {
         slot_meta: Option<&SlotMeta>,
     ) -> Result<Vec<Entry>> {
         self.get_slot_entries_in_block(slot, &vec![range], slot_meta)
+    }
+
+    /// Fetch the serialized entry vectors corresponding to all of the shred indices in
+    /// `completed_ranges`, without deserializing into `Entry` types. One blob is returned per
+    /// completed data range. Empty entry batches are rejected to match the semantics of
+    /// [`Blockstore::get_slot_entries_in_block`].
+    fn get_slot_entry_bytes_in_block(
+        &self,
+        slot: Slot,
+        completed_ranges: &CompletedRanges,
+        slot_meta: Option<&SlotMeta>,
+    ) -> Result<Vec<bytes::Bytes>> {
+        self.get_slot_data_in_block(slot, completed_ranges, slot_meta, |payload| {
+            if serialized_entries_is_empty(&payload) {
+                Err(BlockstoreError::EmptyEntryBatch(slot))
+            } else {
+                Ok(vec![bytes::Bytes::from(payload)])
+            }
+        })
+    }
+
+    pub fn get_entry_bytes_in_data_block(
+        &self,
+        slot: Slot,
+        range: Range<u32>,
+        slot_meta: Option<&SlotMeta>,
+    ) -> Result<bytes::Bytes> {
+        let mut payloads = self.get_slot_entry_bytes_in_block(slot, &vec![range], slot_meta)?;
+        debug_assert_eq!(payloads.len(), 1);
+        payloads.pop().ok_or_else(|| {
+            BlockstoreError::InvalidShredData("could not reconstruct entry bytes".to_string())
+        })
     }
 
     /// Returns a mapping from each elements of `slots` to a list of the

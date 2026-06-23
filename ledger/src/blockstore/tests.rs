@@ -249,6 +249,110 @@ fn test_insert_get_bytes() {
     assert_eq!(last_shred, deserialized_shred);
 }
 
+fn deserialize_entry_bytes(bytes: &[u8]) -> Vec<Entry> {
+    <WincodeVec<Entry, MaxDataShredsLen>>::deserialize(bytes).unwrap()
+}
+
+fn entries_to_test_shreds_with_next_index(
+    entries: &[Entry],
+    slot: Slot,
+    parent_slot: Slot,
+    is_full_slot: bool,
+    next_shred_index: u32,
+) -> Vec<Shred> {
+    Shredder::new(slot, parent_slot, 0, 0)
+        .unwrap()
+        .make_merkle_shreds_from_entries(
+            &Keypair::new(),
+            entries,
+            is_full_slot,
+            Hash::new_unique(),
+            next_shred_index,
+            0,
+            &ReedSolomonCache::default(),
+            &mut ProcessShredsStats::default(),
+        )
+        .filter(Shred::is_data)
+        .collect()
+}
+
+#[test]
+fn test_get_slot_entry_bytes_with_shred_info() {
+    let slot = 1;
+    let parent_slot = 0;
+    let num_entries = max_ticks_per_n_shreds(1, None) + 1;
+    let entries = create_ticks(num_entries, 0, Hash::default());
+    let shreds = entries_to_test_shreds(&entries, slot, parent_slot, true, 0);
+    let num_shreds = shreds.len() as u64;
+
+    let ledger_path = get_tmp_ledger_path_auto_delete!();
+    let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+    blockstore.insert_shreds(shreds, None, false).unwrap();
+
+    let (entry_bytes, returned_num_shreds, is_full) = blockstore
+        .get_slot_entry_bytes_with_shred_info(slot, 0, false)
+        .unwrap();
+    assert_eq!(returned_num_shreds, num_shreds);
+    assert!(is_full);
+    assert_eq!(entry_bytes.len(), 1);
+    assert_eq!(deserialize_entry_bytes(&entry_bytes[0]), entries);
+    // The byte path must agree with the deserialized path.
+    assert_eq!(blockstore.get_slot_entries(slot, 0).unwrap(), entries);
+
+    let slot_meta = blockstore.meta(slot).unwrap();
+    let data_block_bytes = blockstore
+        .get_entry_bytes_in_data_block(slot, 0..num_shreds as u32, slot_meta.as_ref())
+        .unwrap();
+    assert_eq!(deserialize_entry_bytes(&data_block_bytes), entries);
+    assert_eq!(
+        blockstore
+            .get_entries_in_data_block(slot, 0..num_shreds as u32, slot_meta.as_ref())
+            .unwrap(),
+        entries,
+    );
+}
+
+#[test]
+fn test_get_slot_entry_bytes_preserves_completed_range_boundaries() {
+    let slot = 1;
+    let parent_slot = 0;
+    let first_entries = create_ticks(1, 0, Hash::new_unique());
+    let second_entries = create_ticks(1, 0, Hash::new_unique());
+    let first_shreds =
+        entries_to_test_shreds_with_next_index(&first_entries, slot, parent_slot, false, 0);
+    let second_shreds = entries_to_test_shreds_with_next_index(
+        &second_entries,
+        slot,
+        parent_slot,
+        true,
+        first_shreds.len() as u32,
+    );
+    let num_shreds = (first_shreds.len() + second_shreds.len()) as u64;
+    let mut shreds = first_shreds;
+    shreds.extend(second_shreds);
+
+    let ledger_path = get_tmp_ledger_path_auto_delete!();
+    let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+    blockstore.insert_shreds(shreds, None, false).unwrap();
+
+    let (entry_bytes, returned_num_shreds, is_full) = blockstore
+        .get_slot_entry_bytes_with_shred_info(slot, 0, false)
+        .unwrap();
+    assert_eq!(returned_num_shreds, num_shreds);
+    assert!(is_full);
+    // One blob per completed data range; boundaries must be preserved.
+    assert_eq!(entry_bytes.len(), 2);
+    assert_eq!(deserialize_entry_bytes(&entry_bytes[0]), first_entries);
+    assert_eq!(deserialize_entry_bytes(&entry_bytes[1]), second_entries);
+
+    let mut expected_entries = first_entries;
+    expected_entries.extend(second_entries);
+    assert_eq!(
+        blockstore.get_slot_entries(slot, 0).unwrap(),
+        expected_entries
+    );
+}
+
 #[test]
 fn test_write_entries() {
     agave_logger::setup();
