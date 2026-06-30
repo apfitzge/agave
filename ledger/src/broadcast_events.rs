@@ -3,6 +3,7 @@ pub use generated::agave::ledger::broadcast_events::{
 };
 use {
     generated::agave::ledger::broadcast_events as generated_events,
+    libc::{CLOCK_MONOTONIC, clock_gettime, timespec},
     shaq::broadcast::{BroadcastConfig, Producer},
     solana_runtime::bank::Bank,
     std::{
@@ -84,23 +85,39 @@ pub fn event_schema_path(events_dir: &Path, queue_name: &str) -> PathBuf {
 }
 
 pub fn new_bank_event(bank: &Bank) -> BankEvent {
+    let monotonic_clock_timestamp_ns = monotonic_clock_timestamp_ns();
     let parent_hash = generated_events::Hash::new(&bank.parent_hash().to_bytes());
     let new_bank = NewBankEvent::new(bank.slot(), bank.parent_slot(), &parent_hash);
     BankEvent::new(
         BankEventKind::NewBank,
+        monotonic_clock_timestamp_ns,
         &new_bank,
         &FrozenBankEvent::default(),
     )
 }
 
 pub fn frozen_bank_event(bank: &Bank) -> BankEvent {
+    let monotonic_clock_timestamp_ns = monotonic_clock_timestamp_ns();
     let bank_hash = generated_events::Hash::new(&bank.hash().to_bytes());
     let frozen_bank = FrozenBankEvent::new(bank.slot(), &bank_hash);
     BankEvent::new(
         BankEventKind::FrozenBank,
+        monotonic_clock_timestamp_ns,
         &NewBankEvent::default(),
         &frozen_bank,
     )
+}
+
+fn monotonic_clock_timestamp_ns() -> u64 {
+    let mut timestamp = timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let result = unsafe { clock_gettime(CLOCK_MONOTONIC, &mut timestamp) };
+    assert_eq!(result, 0, "CLOCK_MONOTONIC clock_gettime failed");
+    (timestamp.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(timestamp.tv_nsec as u64)
 }
 
 fn create_temp_file(
@@ -162,14 +179,22 @@ mod tests {
         let genesis_config = create_genesis_config(1).genesis_config;
         let bank = Bank::new_for_tests(&genesis_config);
 
+        let before_new_bank = monotonic_clock_timestamp_ns();
         let new_bank = new_bank_event(&bank);
+        let after_new_bank = monotonic_clock_timestamp_ns();
         assert_eq!(new_bank.kind(), BankEventKind::NewBank);
+        assert!(new_bank.monotonic_clock_timestamp_ns() >= before_new_bank);
+        assert!(new_bank.monotonic_clock_timestamp_ns() <= after_new_bank);
         assert_eq!(new_bank.new_bank().slot(), bank.slot());
         assert_eq!(new_bank.new_bank().parent_slot(), bank.parent_slot());
 
         bank.freeze();
+        let before_frozen_bank = monotonic_clock_timestamp_ns();
         let frozen_bank = frozen_bank_event(&bank);
+        let after_frozen_bank = monotonic_clock_timestamp_ns();
         assert_eq!(frozen_bank.kind(), BankEventKind::FrozenBank);
+        assert!(frozen_bank.monotonic_clock_timestamp_ns() >= before_frozen_bank);
+        assert!(frozen_bank.monotonic_clock_timestamp_ns() <= after_frozen_bank);
         assert_eq!(frozen_bank.frozen_bank().slot(), bank.slot());
     }
 

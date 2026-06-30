@@ -23,6 +23,7 @@ struct FrozenBankEvent {
 
 struct BankEvent {
   kind: BankEventKind;
+  monotonic_clock_timestamp_ns: ulong;
   new_bank: NewBankEvent;
   frozen_bank: FrozenBankEvent;
 }

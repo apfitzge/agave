@@ -437,16 +437,17 @@ impl<'a> FrozenBankEvent {
 // struct BankEvent, aligned to 8
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq)]
-pub struct BankEvent(pub [u8; 96]);
+pub struct BankEvent(pub [u8; 104]);
 impl Default for BankEvent { 
   fn default() -> Self { 
-    Self([0; 96])
+    Self([0; 104])
   }
 }
 impl ::core::fmt::Debug for BankEvent {
   fn fmt(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
     f.debug_struct("BankEvent")
       .field("kind", &self.kind())
+      .field("monotonic_clock_timestamp_ns", &self.monotonic_clock_timestamp_ns())
       .field("new_bank", &self.new_bank())
       .field("frozen_bank", &self.frozen_bank())
       .finish()
@@ -494,11 +495,13 @@ impl<'a> BankEvent {
   #[allow(clippy::too_many_arguments)]
   pub fn new(
     kind: BankEventKind,
+    monotonic_clock_timestamp_ns: u64,
     new_bank: &NewBankEvent,
     frozen_bank: &FrozenBankEvent,
   ) -> Self {
-    let mut s = Self([0; 96]);
+    let mut s = Self([0; 104]);
     s.set_kind(kind);
+    s.set_monotonic_clock_timestamp_ns(monotonic_clock_timestamp_ns);
     s.set_new_bank(new_bank);
     s.set_frozen_bank(frozen_bank);
     s
@@ -533,28 +536,57 @@ impl<'a> BankEvent {
     }
   }
 
+  pub fn monotonic_clock_timestamp_ns(&self) -> u64 {
+    let mut mem = ::core::mem::MaybeUninit::<<u64 as ::flatbuffers::EndianScalar>::Scalar>::uninit();
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    ::flatbuffers::EndianScalar::from_little_endian(unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        self.0[8..].as_ptr(),
+        mem.as_mut_ptr() as *mut u8,
+        ::core::mem::size_of::<<u64 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+      mem.assume_init()
+    })
+  }
+
+  pub fn set_monotonic_clock_timestamp_ns(&mut self, x: u64) {
+    let x_le = ::flatbuffers::EndianScalar::to_little_endian(x);
+    // Safety:
+    // Created from a valid Table for this object
+    // Which contains a valid value in this slot
+    unsafe {
+      ::core::ptr::copy_nonoverlapping(
+        &x_le as *const _ as *const u8,
+        self.0[8..].as_mut_ptr(),
+        ::core::mem::size_of::<<u64 as ::flatbuffers::EndianScalar>::Scalar>(),
+      );
+    }
+  }
+
   pub fn new_bank(&self) -> &NewBankEvent {
     // Safety:
     // Created from a valid Table for this object
     // Which contains a valid struct in this slot
-    unsafe { &*(self.0[8..].as_ptr() as *const NewBankEvent) }
+    unsafe { &*(self.0[16..].as_ptr() as *const NewBankEvent) }
   }
 
   #[allow(clippy::identity_op)]
   pub fn set_new_bank(&mut self, x: &NewBankEvent) {
-    self.0[8..8 + 48].copy_from_slice(&x.0)
+    self.0[16..16 + 48].copy_from_slice(&x.0)
   }
 
   pub fn frozen_bank(&self) -> &FrozenBankEvent {
     // Safety:
     // Created from a valid Table for this object
     // Which contains a valid struct in this slot
-    unsafe { &*(self.0[56..].as_ptr() as *const FrozenBankEvent) }
+    unsafe { &*(self.0[64..].as_ptr() as *const FrozenBankEvent) }
   }
 
   #[allow(clippy::identity_op)]
   pub fn set_frozen_bank(&mut self, x: &FrozenBankEvent) {
-    self.0[56..56 + 40].copy_from_slice(&x.0)
+    self.0[64..64 + 40].copy_from_slice(&x.0)
   }
 
 }
