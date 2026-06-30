@@ -13,6 +13,96 @@ pub mod ledger {
 pub mod broadcast_events {
 
 
+#[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
+pub const ENUM_MIN_BANK_EVENT_PAYLOAD: u8 = 0;
+#[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
+pub const ENUM_MAX_BANK_EVENT_PAYLOAD: u8 = 2;
+#[deprecated(since = "2.0.0", note = "Use associated constants instead. This will no longer be generated in 2021.")]
+#[allow(non_camel_case_types)]
+pub const ENUM_VALUES_BANK_EVENT_PAYLOAD: [BankEventPayload; 3] = [
+  BankEventPayload::NONE,
+  BankEventPayload::NewBankEvent,
+  BankEventPayload::FrozenBankEvent,
+];
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[repr(transparent)]
+pub struct BankEventPayload(pub u8);
+#[allow(non_upper_case_globals)]
+impl BankEventPayload {
+  pub const NONE: Self = Self(0);
+  pub const NewBankEvent: Self = Self(1);
+  pub const FrozenBankEvent: Self = Self(2);
+
+  pub const ENUM_MIN: u8 = 0;
+  pub const ENUM_MAX: u8 = 2;
+  pub const ENUM_VALUES: &'static [Self] = &[
+    Self::NONE,
+    Self::NewBankEvent,
+    Self::FrozenBankEvent,
+  ];
+  /// Returns the variant's name or "" if unknown.
+  pub fn variant_name(self) -> Option<&'static str> {
+    match self {
+      Self::NONE => Some("NONE"),
+      Self::NewBankEvent => Some("NewBankEvent"),
+      Self::FrozenBankEvent => Some("FrozenBankEvent"),
+      _ => None,
+    }
+  }
+}
+impl ::core::fmt::Debug for BankEventPayload {
+  fn fmt(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+    if let Some(name) = self.variant_name() {
+      f.write_str(name)
+    } else {
+      f.write_fmt(format_args!("<UNKNOWN {:?}>", self.0))
+    }
+  }
+}
+impl<'a> ::flatbuffers::Follow<'a> for BankEventPayload {
+  type Inner = Self;
+  #[inline]
+  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    let b = unsafe { ::flatbuffers::read_scalar_at::<u8>(buf, loc) };
+    Self(b)
+  }
+}
+
+impl ::flatbuffers::Push for BankEventPayload {
+    type Output = BankEventPayload;
+    #[inline]
+    unsafe fn push(&self, dst: &mut [u8], _written_len: usize) {
+        unsafe { ::flatbuffers::emplace_scalar::<u8>(dst, self.0) };
+    }
+}
+
+impl ::flatbuffers::EndianScalar for BankEventPayload {
+  type Scalar = u8;
+  #[inline]
+  fn to_little_endian(self) -> u8 {
+    self.0.to_le()
+  }
+  #[inline]
+  #[allow(clippy::wrong_self_convention)]
+  fn from_little_endian(v: u8) -> Self {
+    let b = u8::from_le(v);
+    Self(b)
+  }
+}
+
+impl<'a> ::flatbuffers::Verifiable for BankEventPayload {
+  #[inline]
+  fn run_verifier(
+    v: &mut ::flatbuffers::Verifier, pos: usize
+  ) -> Result<(), ::flatbuffers::InvalidFlatbuffer> {
+    u8::run_verifier(v, pos)
+  }
+}
+
+impl ::flatbuffers::SimpleToVerifyInSlice for BankEventPayload {}
+pub struct BankEventPayloadUnionTableOffset {}
+
 // struct Hash, aligned to 1
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq)]
@@ -94,258 +184,249 @@ impl<'a> Hash {
 
 }
 
-// struct NewBankEvent, aligned to 8
-#[repr(transparent)]
-#[derive(Clone, Copy, PartialEq)]
-pub struct NewBankEvent(pub [u8; 48]);
-impl Default for NewBankEvent { 
-  fn default() -> Self { 
-    Self([0; 48])
-  }
-}
-impl ::core::fmt::Debug for NewBankEvent {
-  fn fmt(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
-    f.debug_struct("NewBankEvent")
-      .field("slot", &self.slot())
-      .field("parent_slot", &self.parent_slot())
-      .field("parent_hash", &self.parent_hash())
-      .finish()
-  }
+pub enum NewBankEventOffset {}
+#[derive(Copy, Clone, PartialEq)]
+
+pub struct NewBankEvent<'a> {
+  pub _tab: ::flatbuffers::Table<'a>,
 }
 
-impl ::flatbuffers::SimpleToVerifyInSlice for NewBankEvent {}
-impl<'a> ::flatbuffers::Follow<'a> for NewBankEvent {
-  type Inner = &'a NewBankEvent;
+impl<'a> ::flatbuffers::Follow<'a> for NewBankEvent<'a> {
+  type Inner = NewBankEvent<'a>;
   #[inline]
   unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
-    unsafe { <&'a NewBankEvent>::follow(buf, loc) }
+    Self { _tab: unsafe { ::flatbuffers::Table::new(buf, loc) } }
   }
 }
-impl<'a> ::flatbuffers::Follow<'a> for &'a NewBankEvent {
-  type Inner = &'a NewBankEvent;
+
+impl<'a> NewBankEvent<'a> {
+  pub const VT_SLOT: ::flatbuffers::VOffsetT = 4;
+  pub const VT_PARENT_SLOT: ::flatbuffers::VOffsetT = 6;
+  pub const VT_PARENT_HASH: ::flatbuffers::VOffsetT = 8;
+
   #[inline]
-  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
-    unsafe { ::flatbuffers::follow_cast_ref::<NewBankEvent>(buf, loc) }
+  pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
+    NewBankEvent { _tab: table }
   }
-}
-impl<'b> ::flatbuffers::Push for NewBankEvent {
-    type Output = NewBankEvent;
-    #[inline]
-    unsafe fn push(&self, dst: &mut [u8], _written_len: usize) {
-        let src = unsafe { ::core::slice::from_raw_parts(self as *const NewBankEvent as *const u8, <Self as ::flatbuffers::Push>::size()) };
-        dst.copy_from_slice(src);
-    }
-    #[inline]
-    fn alignment() -> ::flatbuffers::PushAlignment {
-        ::flatbuffers::PushAlignment::new(8)
-    }
-}
+  #[allow(unused_mut)]
+  pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr, A: ::flatbuffers::Allocator + 'bldr>(
+    _fbb: &'mut_bldr mut ::flatbuffers::FlatBufferBuilder<'bldr, A>,
+    args: &'args NewBankEventArgs<'args>
+  ) -> ::flatbuffers::WIPOffset<NewBankEvent<'bldr>> {
+    let mut builder = NewBankEventBuilder::new(_fbb);
+    builder.add_parent_slot(args.parent_slot);
+    builder.add_slot(args.slot);
+    if let Some(x) = args.parent_hash { builder.add_parent_hash(x); }
+    builder.finish()
+  }
 
-impl<'a> ::flatbuffers::Verifiable for NewBankEvent {
+
   #[inline]
-  fn run_verifier(
-    v: &mut ::flatbuffers::Verifier, pos: usize
-  ) -> Result<(), ::flatbuffers::InvalidFlatbuffer> {
-    v.in_buffer::<Self>(pos)
-  }
-}
-
-impl<'a> NewBankEvent {
-  #[allow(clippy::too_many_arguments)]
-  pub fn new(
-    slot: u64,
-    parent_slot: u64,
-    parent_hash: &Hash,
-  ) -> Self {
-    let mut s = Self([0; 48]);
-    s.set_slot(slot);
-    s.set_parent_slot(parent_slot);
-    s.set_parent_hash(parent_hash);
-    s
-  }
-
   pub fn slot(&self) -> u64 {
-    let mut mem = ::core::mem::MaybeUninit::<<u64 as ::flatbuffers::EndianScalar>::Scalar>::uninit();
     // Safety:
-    // Created from a valid Table for this object
-    // Which contains a valid value in this slot
-    ::flatbuffers::EndianScalar::from_little_endian(unsafe {
-      ::core::ptr::copy_nonoverlapping(
-        self.0[0..].as_ptr(),
-        mem.as_mut_ptr() as *mut u8,
-        ::core::mem::size_of::<<u64 as ::flatbuffers::EndianScalar>::Scalar>(),
-      );
-      mem.assume_init()
-    })
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u64>(NewBankEvent::VT_SLOT, Some(0)).unwrap()}
   }
-
-  pub fn set_slot(&mut self, x: u64) {
-    let x_le = ::flatbuffers::EndianScalar::to_little_endian(x);
-    // Safety:
-    // Created from a valid Table for this object
-    // Which contains a valid value in this slot
-    unsafe {
-      ::core::ptr::copy_nonoverlapping(
-        &x_le as *const _ as *const u8,
-        self.0[0..].as_mut_ptr(),
-        ::core::mem::size_of::<<u64 as ::flatbuffers::EndianScalar>::Scalar>(),
-      );
-    }
-  }
-
+  #[inline]
   pub fn parent_slot(&self) -> u64 {
-    let mut mem = ::core::mem::MaybeUninit::<<u64 as ::flatbuffers::EndianScalar>::Scalar>::uninit();
     // Safety:
-    // Created from a valid Table for this object
-    // Which contains a valid value in this slot
-    ::flatbuffers::EndianScalar::from_little_endian(unsafe {
-      ::core::ptr::copy_nonoverlapping(
-        self.0[8..].as_ptr(),
-        mem.as_mut_ptr() as *mut u8,
-        ::core::mem::size_of::<<u64 as ::flatbuffers::EndianScalar>::Scalar>(),
-      );
-      mem.assume_init()
-    })
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u64>(NewBankEvent::VT_PARENT_SLOT, Some(0)).unwrap()}
   }
-
-  pub fn set_parent_slot(&mut self, x: u64) {
-    let x_le = ::flatbuffers::EndianScalar::to_little_endian(x);
-    // Safety:
-    // Created from a valid Table for this object
-    // Which contains a valid value in this slot
-    unsafe {
-      ::core::ptr::copy_nonoverlapping(
-        &x_le as *const _ as *const u8,
-        self.0[8..].as_mut_ptr(),
-        ::core::mem::size_of::<<u64 as ::flatbuffers::EndianScalar>::Scalar>(),
-      );
-    }
-  }
-
-  pub fn parent_hash(&self) -> &Hash {
-    // Safety:
-    // Created from a valid Table for this object
-    // Which contains a valid struct in this slot
-    unsafe { &*(self.0[16..].as_ptr() as *const Hash) }
-  }
-
-  #[allow(clippy::identity_op)]
-  pub fn set_parent_hash(&mut self, x: &Hash) {
-    self.0[16..16 + 32].copy_from_slice(&x.0)
-  }
-
-}
-
-// struct FrozenBankEvent, aligned to 8
-#[repr(transparent)]
-#[derive(Clone, Copy, PartialEq)]
-pub struct FrozenBankEvent(pub [u8; 40]);
-impl Default for FrozenBankEvent { 
-  fn default() -> Self { 
-    Self([0; 40])
-  }
-}
-impl ::core::fmt::Debug for FrozenBankEvent {
-  fn fmt(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
-    f.debug_struct("FrozenBankEvent")
-      .field("slot", &self.slot())
-      .field("bank_hash", &self.bank_hash())
-      .finish()
-  }
-}
-
-impl ::flatbuffers::SimpleToVerifyInSlice for FrozenBankEvent {}
-impl<'a> ::flatbuffers::Follow<'a> for FrozenBankEvent {
-  type Inner = &'a FrozenBankEvent;
   #[inline]
-  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
-    unsafe { <&'a FrozenBankEvent>::follow(buf, loc) }
+  pub fn parent_hash(&self) -> Option<&'a Hash> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<Hash>(NewBankEvent::VT_PARENT_HASH, None)}
   }
-}
-impl<'a> ::flatbuffers::Follow<'a> for &'a FrozenBankEvent {
-  type Inner = &'a FrozenBankEvent;
-  #[inline]
-  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
-    unsafe { ::flatbuffers::follow_cast_ref::<FrozenBankEvent>(buf, loc) }
-  }
-}
-impl<'b> ::flatbuffers::Push for FrozenBankEvent {
-    type Output = FrozenBankEvent;
-    #[inline]
-    unsafe fn push(&self, dst: &mut [u8], _written_len: usize) {
-        let src = unsafe { ::core::slice::from_raw_parts(self as *const FrozenBankEvent as *const u8, <Self as ::flatbuffers::Push>::size()) };
-        dst.copy_from_slice(src);
-    }
-    #[inline]
-    fn alignment() -> ::flatbuffers::PushAlignment {
-        ::flatbuffers::PushAlignment::new(8)
-    }
 }
 
-impl<'a> ::flatbuffers::Verifiable for FrozenBankEvent {
+impl ::flatbuffers::Verifiable for NewBankEvent<'_> {
   #[inline]
   fn run_verifier(
     v: &mut ::flatbuffers::Verifier, pos: usize
   ) -> Result<(), ::flatbuffers::InvalidFlatbuffer> {
-    v.in_buffer::<Self>(pos)
+    v.visit_table(pos)?
+     .visit_field::<u64>("slot", Self::VT_SLOT, false)?
+     .visit_field::<u64>("parent_slot", Self::VT_PARENT_SLOT, false)?
+     .visit_field::<Hash>("parent_hash", Self::VT_PARENT_HASH, false)?
+     .finish();
+    Ok(())
   }
 }
-
-impl<'a> FrozenBankEvent {
-  #[allow(clippy::too_many_arguments)]
-  pub fn new(
-    slot: u64,
-    bank_hash: &Hash,
-  ) -> Self {
-    let mut s = Self([0; 40]);
-    s.set_slot(slot);
-    s.set_bank_hash(bank_hash);
-    s
-  }
-
-  pub fn slot(&self) -> u64 {
-    let mut mem = ::core::mem::MaybeUninit::<<u64 as ::flatbuffers::EndianScalar>::Scalar>::uninit();
-    // Safety:
-    // Created from a valid Table for this object
-    // Which contains a valid value in this slot
-    ::flatbuffers::EndianScalar::from_little_endian(unsafe {
-      ::core::ptr::copy_nonoverlapping(
-        self.0[0..].as_ptr(),
-        mem.as_mut_ptr() as *mut u8,
-        ::core::mem::size_of::<<u64 as ::flatbuffers::EndianScalar>::Scalar>(),
-      );
-      mem.assume_init()
-    })
-  }
-
-  pub fn set_slot(&mut self, x: u64) {
-    let x_le = ::flatbuffers::EndianScalar::to_little_endian(x);
-    // Safety:
-    // Created from a valid Table for this object
-    // Which contains a valid value in this slot
-    unsafe {
-      ::core::ptr::copy_nonoverlapping(
-        &x_le as *const _ as *const u8,
-        self.0[0..].as_mut_ptr(),
-        ::core::mem::size_of::<<u64 as ::flatbuffers::EndianScalar>::Scalar>(),
-      );
+pub struct NewBankEventArgs<'a> {
+    pub slot: u64,
+    pub parent_slot: u64,
+    pub parent_hash: Option<&'a Hash>,
+}
+impl<'a> Default for NewBankEventArgs<'a> {
+  #[inline]
+  fn default() -> Self {
+    NewBankEventArgs {
+      slot: 0,
+      parent_slot: 0,
+      parent_hash: None,
     }
   }
-
-  pub fn bank_hash(&self) -> &Hash {
-    // Safety:
-    // Created from a valid Table for this object
-    // Which contains a valid struct in this slot
-    unsafe { &*(self.0[8..].as_ptr() as *const Hash) }
-  }
-
-  #[allow(clippy::identity_op)]
-  pub fn set_bank_hash(&mut self, x: &Hash) {
-    self.0[8..8 + 32].copy_from_slice(&x.0)
-  }
-
 }
 
+pub struct NewBankEventBuilder<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> {
+  fbb_: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>,
+  start_: ::flatbuffers::WIPOffset<::flatbuffers::TableUnfinishedWIPOffset>,
+}
+impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> NewBankEventBuilder<'a, 'b, A> {
+  #[inline]
+  pub fn add_slot(&mut self, slot: u64) {
+    self.fbb_.push_slot::<u64>(NewBankEvent::VT_SLOT, slot, 0);
+  }
+  #[inline]
+  pub fn add_parent_slot(&mut self, parent_slot: u64) {
+    self.fbb_.push_slot::<u64>(NewBankEvent::VT_PARENT_SLOT, parent_slot, 0);
+  }
+  #[inline]
+  pub fn add_parent_hash(&mut self, parent_hash: &Hash) {
+    self.fbb_.push_slot_always::<&Hash>(NewBankEvent::VT_PARENT_HASH, parent_hash);
+  }
+  #[inline]
+  pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> NewBankEventBuilder<'a, 'b, A> {
+    let start = _fbb.start_table();
+    NewBankEventBuilder {
+      fbb_: _fbb,
+      start_: start,
+    }
+  }
+  #[inline]
+  pub fn finish(self) -> ::flatbuffers::WIPOffset<NewBankEvent<'a>> {
+    let o = self.fbb_.end_table(self.start_);
+    ::flatbuffers::WIPOffset::new(o.value())
+  }
+}
+
+impl ::core::fmt::Debug for NewBankEvent<'_> {
+  fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+    let mut ds = f.debug_struct("NewBankEvent");
+      ds.field("slot", &self.slot());
+      ds.field("parent_slot", &self.parent_slot());
+      ds.field("parent_hash", &self.parent_hash());
+      ds.finish()
+  }
+}
+pub enum FrozenBankEventOffset {}
+#[derive(Copy, Clone, PartialEq)]
+
+pub struct FrozenBankEvent<'a> {
+  pub _tab: ::flatbuffers::Table<'a>,
+}
+
+impl<'a> ::flatbuffers::Follow<'a> for FrozenBankEvent<'a> {
+  type Inner = FrozenBankEvent<'a>;
+  #[inline]
+  unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+    Self { _tab: unsafe { ::flatbuffers::Table::new(buf, loc) } }
+  }
+}
+
+impl<'a> FrozenBankEvent<'a> {
+  pub const VT_SLOT: ::flatbuffers::VOffsetT = 4;
+  pub const VT_BANK_HASH: ::flatbuffers::VOffsetT = 6;
+
+  #[inline]
+  pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
+    FrozenBankEvent { _tab: table }
+  }
+  #[allow(unused_mut)]
+  pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr, A: ::flatbuffers::Allocator + 'bldr>(
+    _fbb: &'mut_bldr mut ::flatbuffers::FlatBufferBuilder<'bldr, A>,
+    args: &'args FrozenBankEventArgs<'args>
+  ) -> ::flatbuffers::WIPOffset<FrozenBankEvent<'bldr>> {
+    let mut builder = FrozenBankEventBuilder::new(_fbb);
+    builder.add_slot(args.slot);
+    if let Some(x) = args.bank_hash { builder.add_bank_hash(x); }
+    builder.finish()
+  }
+
+
+  #[inline]
+  pub fn slot(&self) -> u64 {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<u64>(FrozenBankEvent::VT_SLOT, Some(0)).unwrap()}
+  }
+  #[inline]
+  pub fn bank_hash(&self) -> Option<&'a Hash> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<Hash>(FrozenBankEvent::VT_BANK_HASH, None)}
+  }
+}
+
+impl ::flatbuffers::Verifiable for FrozenBankEvent<'_> {
+  #[inline]
+  fn run_verifier(
+    v: &mut ::flatbuffers::Verifier, pos: usize
+  ) -> Result<(), ::flatbuffers::InvalidFlatbuffer> {
+    v.visit_table(pos)?
+     .visit_field::<u64>("slot", Self::VT_SLOT, false)?
+     .visit_field::<Hash>("bank_hash", Self::VT_BANK_HASH, false)?
+     .finish();
+    Ok(())
+  }
+}
+pub struct FrozenBankEventArgs<'a> {
+    pub slot: u64,
+    pub bank_hash: Option<&'a Hash>,
+}
+impl<'a> Default for FrozenBankEventArgs<'a> {
+  #[inline]
+  fn default() -> Self {
+    FrozenBankEventArgs {
+      slot: 0,
+      bank_hash: None,
+    }
+  }
+}
+
+pub struct FrozenBankEventBuilder<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> {
+  fbb_: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>,
+  start_: ::flatbuffers::WIPOffset<::flatbuffers::TableUnfinishedWIPOffset>,
+}
+impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> FrozenBankEventBuilder<'a, 'b, A> {
+  #[inline]
+  pub fn add_slot(&mut self, slot: u64) {
+    self.fbb_.push_slot::<u64>(FrozenBankEvent::VT_SLOT, slot, 0);
+  }
+  #[inline]
+  pub fn add_bank_hash(&mut self, bank_hash: &Hash) {
+    self.fbb_.push_slot_always::<&Hash>(FrozenBankEvent::VT_BANK_HASH, bank_hash);
+  }
+  #[inline]
+  pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> FrozenBankEventBuilder<'a, 'b, A> {
+    let start = _fbb.start_table();
+    FrozenBankEventBuilder {
+      fbb_: _fbb,
+      start_: start,
+    }
+  }
+  #[inline]
+  pub fn finish(self) -> ::flatbuffers::WIPOffset<FrozenBankEvent<'a>> {
+    let o = self.fbb_.end_table(self.start_);
+    ::flatbuffers::WIPOffset::new(o.value())
+  }
+}
+
+impl ::core::fmt::Debug for FrozenBankEvent<'_> {
+  fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+    let mut ds = f.debug_struct("FrozenBankEvent");
+      ds.field("slot", &self.slot());
+      ds.field("bank_hash", &self.bank_hash());
+      ds.finish()
+  }
+}
 pub enum BankEventOffset {}
 #[derive(Copy, Clone, PartialEq)]
 
@@ -363,8 +444,8 @@ impl<'a> ::flatbuffers::Follow<'a> for BankEvent<'a> {
 
 impl<'a> BankEvent<'a> {
   pub const VT_TIMESTAMP: ::flatbuffers::VOffsetT = 4;
-  pub const VT_NEW_BANK: ::flatbuffers::VOffsetT = 6;
-  pub const VT_FROZEN_BANK: ::flatbuffers::VOffsetT = 8;
+  pub const VT_PAYLOAD_TYPE: ::flatbuffers::VOffsetT = 6;
+  pub const VT_PAYLOAD: ::flatbuffers::VOffsetT = 8;
 
   #[inline]
   pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -373,12 +454,12 @@ impl<'a> BankEvent<'a> {
   #[allow(unused_mut)]
   pub fn create<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr, A: ::flatbuffers::Allocator + 'bldr>(
     _fbb: &'mut_bldr mut ::flatbuffers::FlatBufferBuilder<'bldr, A>,
-    args: &'args BankEventArgs<'args>
+    args: &'args BankEventArgs
   ) -> ::flatbuffers::WIPOffset<BankEvent<'bldr>> {
     let mut builder = BankEventBuilder::new(_fbb);
     builder.add_timestamp(args.timestamp);
-    if let Some(x) = args.frozen_bank { builder.add_frozen_bank(x); }
-    if let Some(x) = args.new_bank { builder.add_new_bank(x); }
+    if let Some(x) = args.payload { builder.add_payload(x); }
+    builder.add_payload_type(args.payload_type);
     builder.finish()
   }
 
@@ -391,19 +472,49 @@ impl<'a> BankEvent<'a> {
     unsafe { self._tab.get::<u64>(BankEvent::VT_TIMESTAMP, Some(0)).unwrap()}
   }
   #[inline]
-  pub fn new_bank(&self) -> Option<&'a NewBankEvent> {
+  pub fn payload_type(&self) -> BankEventPayload {
     // Safety:
     // Created from valid Table for this object
     // which contains a valid value in this slot
-    unsafe { self._tab.get::<NewBankEvent>(BankEvent::VT_NEW_BANK, None)}
+    unsafe { self._tab.get::<BankEventPayload>(BankEvent::VT_PAYLOAD_TYPE, Some(BankEventPayload::NONE)).unwrap()}
   }
   #[inline]
-  pub fn frozen_bank(&self) -> Option<&'a FrozenBankEvent> {
+  pub fn payload(&self) -> Option<::flatbuffers::Table<'a>> {
     // Safety:
     // Created from valid Table for this object
     // which contains a valid value in this slot
-    unsafe { self._tab.get::<FrozenBankEvent>(BankEvent::VT_FROZEN_BANK, None)}
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Table<'a>>>(BankEvent::VT_PAYLOAD, None)}
   }
+  #[inline]
+  #[allow(non_snake_case)]
+  pub fn payload_as_new_bank_event(&self) -> Option<NewBankEvent<'a>> {
+    if self.payload_type() == BankEventPayload::NewBankEvent {
+      self.payload().map(|t| {
+       // Safety:
+       // Created from a valid Table for this object
+       // Which contains a valid union in this slot
+       unsafe { NewBankEvent::init_from_table(t) }
+     })
+    } else {
+      None
+    }
+  }
+
+  #[inline]
+  #[allow(non_snake_case)]
+  pub fn payload_as_frozen_bank_event(&self) -> Option<FrozenBankEvent<'a>> {
+    if self.payload_type() == BankEventPayload::FrozenBankEvent {
+      self.payload().map(|t| {
+       // Safety:
+       // Created from a valid Table for this object
+       // Which contains a valid union in this slot
+       unsafe { FrozenBankEvent::init_from_table(t) }
+     })
+    } else {
+      None
+    }
+  }
+
 }
 
 impl ::flatbuffers::Verifiable for BankEvent<'_> {
@@ -413,24 +524,29 @@ impl ::flatbuffers::Verifiable for BankEvent<'_> {
   ) -> Result<(), ::flatbuffers::InvalidFlatbuffer> {
     v.visit_table(pos)?
      .visit_field::<u64>("timestamp", Self::VT_TIMESTAMP, false)?
-     .visit_field::<NewBankEvent>("new_bank", Self::VT_NEW_BANK, false)?
-     .visit_field::<FrozenBankEvent>("frozen_bank", Self::VT_FROZEN_BANK, false)?
+     .visit_union::<BankEventPayload, _>("payload_type", Self::VT_PAYLOAD_TYPE, "payload", Self::VT_PAYLOAD, false, |key, v, pos| {
+        match key {
+          BankEventPayload::NewBankEvent => v.verify_union_variant::<::flatbuffers::ForwardsUOffset<NewBankEvent>>("BankEventPayload::NewBankEvent", pos),
+          BankEventPayload::FrozenBankEvent => v.verify_union_variant::<::flatbuffers::ForwardsUOffset<FrozenBankEvent>>("BankEventPayload::FrozenBankEvent", pos),
+          _ => Ok(()),
+        }
+     })?
      .finish();
     Ok(())
   }
 }
-pub struct BankEventArgs<'a> {
+pub struct BankEventArgs {
     pub timestamp: u64,
-    pub new_bank: Option<&'a NewBankEvent>,
-    pub frozen_bank: Option<&'a FrozenBankEvent>,
+    pub payload_type: BankEventPayload,
+    pub payload: Option<::flatbuffers::WIPOffset<::flatbuffers::UnionWIPOffset>>,
 }
-impl<'a> Default for BankEventArgs<'a> {
+impl<'a> Default for BankEventArgs {
   #[inline]
   fn default() -> Self {
     BankEventArgs {
       timestamp: 0,
-      new_bank: None,
-      frozen_bank: None,
+      payload_type: BankEventPayload::NONE,
+      payload: None,
     }
   }
 }
@@ -445,12 +561,12 @@ impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> BankEventBuilder<'a, 'b, A> {
     self.fbb_.push_slot::<u64>(BankEvent::VT_TIMESTAMP, timestamp, 0);
   }
   #[inline]
-  pub fn add_new_bank(&mut self, new_bank: &NewBankEvent) {
-    self.fbb_.push_slot_always::<&NewBankEvent>(BankEvent::VT_NEW_BANK, new_bank);
+  pub fn add_payload_type(&mut self, payload_type: BankEventPayload) {
+    self.fbb_.push_slot::<BankEventPayload>(BankEvent::VT_PAYLOAD_TYPE, payload_type, BankEventPayload::NONE);
   }
   #[inline]
-  pub fn add_frozen_bank(&mut self, frozen_bank: &FrozenBankEvent) {
-    self.fbb_.push_slot_always::<&FrozenBankEvent>(BankEvent::VT_FROZEN_BANK, frozen_bank);
+  pub fn add_payload(&mut self, payload: ::flatbuffers::WIPOffset<::flatbuffers::UnionWIPOffset>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(BankEvent::VT_PAYLOAD, payload);
   }
   #[inline]
   pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> BankEventBuilder<'a, 'b, A> {
@@ -471,8 +587,27 @@ impl ::core::fmt::Debug for BankEvent<'_> {
   fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
     let mut ds = f.debug_struct("BankEvent");
       ds.field("timestamp", &self.timestamp());
-      ds.field("new_bank", &self.new_bank());
-      ds.field("frozen_bank", &self.frozen_bank());
+      ds.field("payload_type", &self.payload_type());
+      match self.payload_type() {
+        BankEventPayload::NewBankEvent => {
+          if let Some(x) = self.payload_as_new_bank_event() {
+            ds.field("payload", &x)
+          } else {
+            ds.field("payload", &"InvalidFlatbuffer: Union discriminant does not match value.")
+          }
+        },
+        BankEventPayload::FrozenBankEvent => {
+          if let Some(x) = self.payload_as_frozen_bank_event() {
+            ds.field("payload", &x)
+          } else {
+            ds.field("payload", &"InvalidFlatbuffer: Union discriminant does not match value.")
+          }
+        },
+        _ => {
+          let x: Option<()> = None;
+          ds.field("payload", &x)
+        },
+      };
       ds.finish()
   }
 }

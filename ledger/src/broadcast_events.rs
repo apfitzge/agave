@@ -1,6 +1,8 @@
-pub use generated::agave::ledger::broadcast_events::{FrozenBankEvent, NewBankEvent};
+pub use generated::agave::ledger::broadcast_events::{
+    BankEventPayload, FrozenBankEvent, NewBankEvent,
+};
 use {
-    flatbuffers::FlatBufferBuilder,
+    flatbuffers::{FlatBufferBuilder, UnionWIPOffset, WIPOffset},
     generated::agave::ledger::broadcast_events as generated_events,
     libc::{CLOCK_MONOTONIC, clock_gettime, timespec},
     shaq::broadcast::{BroadcastConfig, Producer},
@@ -139,38 +141,66 @@ pub fn event_schema_path(events_dir: &Path, queue_name: &str) -> PathBuf {
 }
 
 pub fn new_bank_event(bank: &Bank) -> BankEvent {
-    let timestamp = monotonic_clock_timestamp_ns();
-    let parent_hash = generated_events::Hash::new(&bank.parent_hash().to_bytes());
-    let new_bank = NewBankEvent::new(bank.slot(), bank.parent_slot(), &parent_hash);
-    build_bank_event(timestamp, Some(&new_bank), None)
-}
-
-pub fn frozen_bank_event(bank: &Bank) -> BankEvent {
-    let timestamp = monotonic_clock_timestamp_ns();
-    let bank_hash = generated_events::Hash::new(&bank.hash().to_bytes());
-    let frozen_bank = FrozenBankEvent::new(bank.slot(), &bank_hash);
-    build_bank_event(timestamp, None, Some(&frozen_bank))
-}
-
-fn build_bank_event(
-    timestamp: u64,
-    new_bank: Option<&NewBankEvent>,
-    frozen_bank: Option<&FrozenBankEvent>,
-) -> BankEvent {
     BANK_EVENT_BUILDER.with(|builder| {
         let mut builder = builder.borrow_mut();
         builder.reset();
-        let root = generated_events::BankEvent::create(
+        let timestamp = monotonic_clock_timestamp_ns();
+        let parent_hash = generated_events::Hash::new(&bank.parent_hash().to_bytes());
+        let payload = NewBankEvent::create(
             &mut builder,
-            &generated_events::BankEventArgs {
-                timestamp,
-                new_bank,
-                frozen_bank,
+            &generated_events::NewBankEventArgs {
+                slot: bank.slot(),
+                parent_slot: bank.parent_slot(),
+                parent_hash: Some(&parent_hash),
             },
         );
-        generated_events::finish_size_prefixed_bank_event_buffer(&mut builder, root);
-        BankEvent::from_flatbuffer(builder.finished_data())
+        build_bank_event(
+            &mut builder,
+            timestamp,
+            BankEventPayload::NewBankEvent,
+            payload.as_union_value(),
+        )
     })
+}
+
+pub fn frozen_bank_event(bank: &Bank) -> BankEvent {
+    BANK_EVENT_BUILDER.with(|builder| {
+        let mut builder = builder.borrow_mut();
+        builder.reset();
+        let timestamp = monotonic_clock_timestamp_ns();
+        let bank_hash = generated_events::Hash::new(&bank.hash().to_bytes());
+        let payload = FrozenBankEvent::create(
+            &mut builder,
+            &generated_events::FrozenBankEventArgs {
+                slot: bank.slot(),
+                bank_hash: Some(&bank_hash),
+            },
+        );
+        build_bank_event(
+            &mut builder,
+            timestamp,
+            BankEventPayload::FrozenBankEvent,
+            payload.as_union_value(),
+        )
+    })
+}
+
+fn build_bank_event(
+    builder: &mut FlatBufferBuilder<'static>,
+    timestamp: u64,
+    payload_type: BankEventPayload,
+    payload: WIPOffset<UnionWIPOffset>,
+) -> BankEvent {
+    let root = generated_events::BankEvent::create(
+        builder,
+        &generated_events::BankEventArgs {
+            timestamp,
+            payload_type,
+            payload: Some(payload),
+        },
+    );
+    generated_events::finish_size_prefixed_bank_event_buffer(builder, root);
+    BankEvent::from_flatbuffer(builder.finished_data())
 }
 
 fn monotonic_clock_timestamp_ns() -> u64 {
@@ -252,12 +282,15 @@ mod tests {
             generated_events::size_prefixed_root_as_bank_event(new_bank.flatbuffer()).unwrap();
         assert!(new_bank.timestamp() >= before_new_bank);
         assert!(new_bank.timestamp() <= after_new_bank);
-        assert_eq!(new_bank.new_bank().unwrap().slot(), bank.slot());
+        assert_eq!(new_bank.payload_type(), BankEventPayload::NewBankEvent);
+        let new_bank_payload = new_bank.payload_as_new_bank_event().unwrap();
+        assert_eq!(new_bank_payload.slot(), bank.slot());
+        assert_eq!(new_bank_payload.parent_slot(), bank.parent_slot());
         assert_eq!(
-            new_bank.new_bank().unwrap().parent_slot(),
-            bank.parent_slot()
+            <[u8; 32]>::from(new_bank_payload.parent_hash().unwrap().bytes()),
+            bank.parent_hash().to_bytes()
         );
-        assert!(new_bank.frozen_bank().is_none());
+        assert!(new_bank.payload_as_frozen_bank_event().is_none());
 
         bank.freeze();
         let before_frozen_bank = monotonic_clock_timestamp_ns();
@@ -268,8 +301,17 @@ mod tests {
             generated_events::size_prefixed_root_as_bank_event(frozen_bank.flatbuffer()).unwrap();
         assert!(frozen_bank.timestamp() >= before_frozen_bank);
         assert!(frozen_bank.timestamp() <= after_frozen_bank);
-        assert!(frozen_bank.new_bank().is_none());
-        assert_eq!(frozen_bank.frozen_bank().unwrap().slot(), bank.slot());
+        assert_eq!(
+            frozen_bank.payload_type(),
+            BankEventPayload::FrozenBankEvent
+        );
+        assert!(frozen_bank.payload_as_new_bank_event().is_none());
+        let frozen_bank_payload = frozen_bank.payload_as_frozen_bank_event().unwrap();
+        assert_eq!(frozen_bank_payload.slot(), bank.slot());
+        assert_eq!(
+            <[u8; 32]>::from(frozen_bank_payload.bank_hash().unwrap().bytes()),
+            bank.hash().to_bytes()
+        );
     }
 
     #[test]

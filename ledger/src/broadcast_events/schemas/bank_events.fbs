@@ -4,21 +4,25 @@ struct Hash {
   bytes: [ubyte:32];
 }
 
-struct NewBankEvent {
+table NewBankEvent {
   slot: ulong;
   parent_slot: ulong;
   parent_hash: Hash;
 }
 
-struct FrozenBankEvent {
+table FrozenBankEvent {
   slot: ulong;
   bank_hash: Hash;
 }
 
+union BankEventPayload {
+  NewBankEvent,
+  FrozenBankEvent,
+}
+
 table BankEvent {
   timestamp: ulong;
-  new_bank: NewBankEvent;
-  frozen_bank: FrozenBankEvent;
+  payload: BankEventPayload;
 }
 
 root_type BankEvent;

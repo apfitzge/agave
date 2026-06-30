@@ -2,7 +2,10 @@ use {
     flatbuffers::{Follow, ForwardsUOffset, Table},
     flatbuffers_reflection::{
         get_any_root,
-        reflection::{BaseType, Object, Schema, Type, root_as_schema as root_as_reflection_schema},
+        reflection::{
+            BaseType, Enum as ReflectionEnum, EnumVal, Field, Object, Schema, Type,
+            root_as_schema as root_as_reflection_schema,
+        },
     },
     serde_json::{Map, Number, Value},
     shaq::{broadcast::SliceConsumer, error::WaitError},
@@ -191,7 +194,11 @@ fn select_root_object<'schema>(
     ))
 }
 
-fn decode_table(schema: &Schema<'_>, object: Object<'_>, table: Table<'_>) -> AppResult<Value> {
+fn decode_table<'schema>(
+    schema: &Schema<'schema>,
+    object: Object<'schema>,
+    table: Table<'_>,
+) -> AppResult<Value> {
     if object.is_struct() {
         return Err(AppError::InvalidSchema(format!(
             "{} is a struct; root table decoding expected a table",
@@ -218,7 +225,7 @@ fn decode_table(schema: &Schema<'_>, object: Object<'_>, table: Table<'_>) -> Ap
             .ok_or_else(|| AppError::InvalidPayload("field offset overflow".to_string()))?;
         map.insert(
             field.name().to_string(),
-            decode_table_field(schema, field.type_(), table.buf(), field_loc)?,
+            decode_table_field(schema, object, field, table, field_loc)?,
         );
     }
 
@@ -227,10 +234,13 @@ fn decode_table(schema: &Schema<'_>, object: Object<'_>, table: Table<'_>) -> Ap
 
 fn decode_table_field(
     schema: &Schema<'_>,
-    type_: Type<'_>,
-    payload: &[u8],
+    object: Object<'_>,
+    field: Field<'_>,
+    table: Table<'_>,
     loc: usize,
 ) -> AppResult<Value> {
+    let type_ = field.type_();
+    let payload = table.buf();
     match type_.base_type() {
         BaseType::Obj => {
             let object = object_for_type(schema, type_)?;
@@ -245,16 +255,73 @@ fn decode_table_field(
             let value = unsafe { ForwardsUOffset::<&str>::follow(payload, loc) };
             Ok(Value::String(value.to_string()))
         }
-        BaseType::Vector | BaseType::Vector64 | BaseType::Union => {
-            Err(AppError::InvalidSchema(format!(
-                "unsupported table field type {}",
-                base_type_name(type_.base_type())
-            )))
-        }
+        BaseType::Union => decode_union(schema, object, field, table, loc),
+        BaseType::Vector | BaseType::Vector64 => Err(AppError::InvalidSchema(format!(
+            "unsupported table field type {}",
+            base_type_name(type_.base_type())
+        ))),
         BaseType::Array => Err(AppError::InvalidSchema(
             "arrays are only supported inside structs".to_string(),
         )),
         base_type => decode_scalar(schema, base_type, type_.index(), payload, loc),
+    }
+}
+
+fn decode_union(
+    schema: &Schema<'_>,
+    object: Object<'_>,
+    field: Field<'_>,
+    table: Table<'_>,
+    loc: usize,
+) -> AppResult<Value> {
+    let union_enum = enum_for_index(schema, field.type_().index())?;
+    if !union_enum.is_union() {
+        return Err(AppError::InvalidSchema(format!(
+            "{} is not a union enum",
+            union_enum.name()
+        )));
+    }
+
+    let union_type_field = find_field(object, &format!("{}_type", field.name()))?;
+    let union_type_value = read_table_u8_field(table, union_type_field)?;
+    if union_type_value == 0 {
+        return Ok(Value::Null);
+    }
+
+    let union_enum_value =
+        find_enum_value(union_enum, i64::from(union_type_value)).ok_or_else(|| {
+            AppError::InvalidPayload(format!(
+                "union {} has unknown variant value {}",
+                union_enum.name(),
+                union_type_value
+            ))
+        })?;
+    let union_type = union_enum_value.union_type().ok_or_else(|| {
+        AppError::InvalidSchema(format!(
+            "union variant {} has no reflected payload type",
+            union_enum_value.name()
+        ))
+    })?;
+
+    match union_type.base_type() {
+        BaseType::Obj => {
+            let union_object = object_for_type(schema, union_type)?;
+            let value_loc = forwards_uoffset_target(table.buf(), loc)?;
+            if union_object.is_struct() {
+                decode_struct(schema, union_object, table.buf(), value_loc)
+            } else {
+                let union_table = unsafe { Table::new(table.buf(), value_loc) };
+                decode_table(schema, union_object, union_table)
+            }
+        }
+        BaseType::String => {
+            let value = unsafe { ForwardsUOffset::<&str>::follow(table.buf(), loc) };
+            Ok(Value::String(value.to_string()))
+        }
+        unsupported => Err(AppError::InvalidSchema(format!(
+            "unsupported union payload type {}",
+            base_type_name(unsupported)
+        ))),
     }
 }
 
@@ -428,6 +495,89 @@ fn enum_name(schema: &Schema<'_>, enum_index: i32, value: i64) -> Option<String>
     }
 
     None
+}
+
+fn enum_for_index<'schema>(
+    schema: &Schema<'schema>,
+    enum_index: i32,
+) -> AppResult<ReflectionEnum<'schema>> {
+    if enum_index < 0 {
+        return Err(AppError::InvalidSchema(format!(
+            "invalid enum index {enum_index}"
+        )));
+    }
+
+    let enums = schema.enums();
+    let enum_index = usize::try_from(enum_index)
+        .map_err(|_| AppError::InvalidSchema(format!("invalid enum index {enum_index}")))?;
+    if enum_index >= enums.len() {
+        return Err(AppError::InvalidSchema(format!(
+            "invalid enum index {enum_index}"
+        )));
+    }
+
+    Ok(enums.get(enum_index))
+}
+
+fn find_enum_value<'schema>(
+    enum_def: ReflectionEnum<'schema>,
+    value: i64,
+) -> Option<EnumVal<'schema>> {
+    let values = enum_def.values();
+    for index in 0..values.len() {
+        let enum_value = values.get(index);
+        if enum_value.value() == value {
+            return Some(enum_value);
+        }
+    }
+
+    None
+}
+
+fn find_field<'schema>(object: Object<'schema>, name: &str) -> AppResult<Field<'schema>> {
+    let fields = object.fields();
+    for index in 0..fields.len() {
+        let field = fields.get(index);
+        if field.name() == name {
+            return Ok(field);
+        }
+    }
+
+    Err(AppError::InvalidSchema(format!(
+        "{} is missing field {name}",
+        object.name()
+    )))
+}
+
+fn read_table_u8_field(table: Table<'_>, field: Field<'_>) -> AppResult<u8> {
+    let field_offset = table.vtable().get(field.offset()) as usize;
+    if field_offset == 0 {
+        return u8::try_from(field.default_integer()).map_err(|_| {
+            AppError::InvalidSchema(format!(
+                "{} default value {} does not fit in ubyte",
+                field.name(),
+                field.default_integer()
+            ))
+        });
+    }
+
+    let field_loc = table
+        .loc()
+        .checked_add(field_offset)
+        .ok_or_else(|| AppError::InvalidPayload("field offset overflow".to_string()))?;
+    read_u8(table.buf(), field_loc)
+}
+
+fn forwards_uoffset_target(payload: &[u8], loc: usize) -> AppResult<usize> {
+    let offset = read_u32(payload, loc)? as usize;
+    if offset == 0 {
+        return Err(AppError::InvalidPayload(
+            "union payload offset is zero".to_string(),
+        ));
+    }
+
+    loc.checked_add(offset)
+        .ok_or_else(|| AppError::InvalidPayload("uoffset overflow".to_string()))
 }
 
 fn find_object<'schema>(schema: &Schema<'schema>, name: &str) -> AppResult<Object<'schema>> {
@@ -655,6 +805,18 @@ fn main() {
 mod tests {
     use super::*;
 
+    mod generated {
+        #![allow(clippy::all)]
+        #![allow(dead_code)]
+        #![allow(missing_docs)]
+        #![allow(non_camel_case_types)]
+        #![allow(non_snake_case)]
+        #![allow(non_upper_case_globals)]
+        #![allow(unsafe_op_in_unsafe_fn)]
+
+        include!("../../ledger/src/broadcast_events/generated/bank_events_generated.rs");
+    }
+
     const BANK_EVENTS_SCHEMA: &[u8] =
         include_bytes!("../../ledger/src/broadcast_events/schemas/bank_events.bfbs");
 
@@ -669,8 +831,28 @@ mod tests {
         let table = unsafe { get_any_root(flatbuffer) };
         let value = decode_table(&schema, object, table).unwrap();
         assert_eq!(value["timestamp"], Value::from(42_u64));
-        assert!(value.get("new_bank").is_none());
-        assert!(value.get("frozen_bank").is_none());
+        assert!(value.get("payload_type").is_none());
+        assert!(value.get("payload").is_none());
+    }
+
+    #[test]
+    fn decodes_reflected_union_payload_to_json() {
+        let schema = root_as_reflection_schema(BANK_EVENTS_SCHEMA).unwrap();
+        let object = select_root_object(&schema, None).unwrap();
+
+        let payload = new_bank_payload();
+        let flatbuffer = payload_flatbuffer(&payload).unwrap();
+        let table = unsafe { get_any_root(flatbuffer) };
+        let value = decode_table(&schema, object, table).unwrap();
+
+        assert_eq!(value["timestamp"], Value::from(42_u64));
+        assert_eq!(value["payload_type"], Value::from("NewBankEvent"));
+        assert_eq!(value["payload"]["slot"], Value::from(2_u64));
+        assert_eq!(value["payload"]["parent_slot"], Value::from(1_u64));
+        assert_eq!(
+            value["payload"]["parent_hash"]["bytes"],
+            Value::Array((0_u64..32).map(Value::from).collect())
+        );
     }
 
     fn timestamp_only_payload(timestamp: u64) -> Vec<u8> {
@@ -684,5 +866,35 @@ mod tests {
         let mut payload = vec![0; 128];
         payload[..flatbuffer.len()].copy_from_slice(flatbuffer);
         payload
+    }
+
+    fn new_bank_payload() -> Vec<u8> {
+        use generated::agave::ledger::broadcast_events as bank_events;
+
+        let mut builder = flatbuffers::FlatBufferBuilder::new();
+        let parent_hash_bytes = std::array::from_fn(|index| index as u8);
+        let parent_hash = bank_events::Hash::new(&parent_hash_bytes);
+        let payload = bank_events::NewBankEvent::create(
+            &mut builder,
+            &bank_events::NewBankEventArgs {
+                slot: 2,
+                parent_slot: 1,
+                parent_hash: Some(&parent_hash),
+            },
+        );
+        let root = bank_events::BankEvent::create(
+            &mut builder,
+            &bank_events::BankEventArgs {
+                timestamp: 42,
+                payload_type: bank_events::BankEventPayload::NewBankEvent,
+                payload: Some(payload.as_union_value()),
+            },
+        );
+        bank_events::finish_size_prefixed_bank_event_buffer(&mut builder, root);
+
+        let flatbuffer = builder.finished_data();
+        let mut queue_payload = vec![0; 128];
+        queue_payload[..flatbuffer.len()].copy_from_slice(flatbuffer);
+        queue_payload
     }
 }

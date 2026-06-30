@@ -159,5 +159,9 @@ name = "blockstore"
 name = "make_shreds_from_entries"
 harness = false
 
+[[bench]]
+name = "broadcast_events"
+harness = false
+
 [lints]
 workspace = true
