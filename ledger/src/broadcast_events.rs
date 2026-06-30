@@ -1,12 +1,12 @@
-pub use generated::agave::ledger::broadcast_events::{
-    BankEvent, BankEventKind, FrozenBankEvent, NewBankEvent,
-};
+pub use generated::agave::ledger::broadcast_events::{FrozenBankEvent, NewBankEvent};
 use {
+    flatbuffers::FlatBufferBuilder,
     generated::agave::ledger::broadcast_events as generated_events,
     libc::{CLOCK_MONOTONIC, clock_gettime, timespec},
     shaq::broadcast::{BroadcastConfig, Producer},
     solana_runtime::bank::Bank,
     std::{
+        cell::RefCell,
         ffi::OsStr,
         fs::{self, File, OpenOptions},
         io::Write,
@@ -16,7 +16,14 @@ use {
 };
 
 pub const BANK_EVENTS_SCHEMA: &[u8] = include_bytes!("broadcast_events/schemas/bank_events.bfbs");
+pub const BANK_EVENT_QUEUE_PAYLOAD_SIZE: usize = 128;
+const FLATBUFFER_SIZE_PREFIX_SIZE: usize = 4;
 pub type BankEventProducer = Producer<BankEvent>;
+
+thread_local! {
+    static BANK_EVENT_BUILDER: RefCell<FlatBufferBuilder<'static>> =
+        RefCell::new(FlatBufferBuilder::with_capacity(BANK_EVENT_QUEUE_PAYLOAD_SIZE));
+}
 
 mod generated {
     #![allow(clippy::all)]
@@ -28,6 +35,53 @@ mod generated {
     #![allow(unsafe_op_in_unsafe_fn)]
 
     include!("broadcast_events/generated/bank_events_generated.rs");
+}
+
+#[repr(C, align(8))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BankEvent {
+    flatbuffer: [u8; BANK_EVENT_QUEUE_PAYLOAD_SIZE],
+}
+
+impl Default for BankEvent {
+    fn default() -> Self {
+        Self {
+            flatbuffer: [0; BANK_EVENT_QUEUE_PAYLOAD_SIZE],
+        }
+    }
+}
+
+impl BankEvent {
+    pub fn flatbuffer(&self) -> &[u8] {
+        let len = u32::from_le_bytes(
+            self.flatbuffer[..FLATBUFFER_SIZE_PREFIX_SIZE]
+                .try_into()
+                .expect("slice length checked"),
+        ) as usize;
+        let end = FLATBUFFER_SIZE_PREFIX_SIZE
+            .checked_add(len)
+            .expect("bank event length overflow");
+        assert!(
+            end <= BANK_EVENT_QUEUE_PAYLOAD_SIZE,
+            "invalid bank event length {len}"
+        );
+        &self.flatbuffer[..end]
+    }
+
+    fn from_flatbuffer(flatbuffer: &[u8]) -> Self {
+        assert!(
+            flatbuffer.len() <= BANK_EVENT_QUEUE_PAYLOAD_SIZE,
+            "bank event flatbuffer size {} exceeds max {}",
+            flatbuffer.len(),
+            BANK_EVENT_QUEUE_PAYLOAD_SIZE
+        );
+
+        let mut event = Self {
+            flatbuffer: [0; BANK_EVENT_QUEUE_PAYLOAD_SIZE],
+        };
+        event.flatbuffer[..flatbuffer.len()].copy_from_slice(flatbuffer);
+        event
+    }
 }
 
 pub fn create_event_queue<T>(
@@ -85,27 +139,38 @@ pub fn event_schema_path(events_dir: &Path, queue_name: &str) -> PathBuf {
 }
 
 pub fn new_bank_event(bank: &Bank) -> BankEvent {
-    let monotonic_clock_timestamp_ns = monotonic_clock_timestamp_ns();
+    let timestamp = monotonic_clock_timestamp_ns();
     let parent_hash = generated_events::Hash::new(&bank.parent_hash().to_bytes());
     let new_bank = NewBankEvent::new(bank.slot(), bank.parent_slot(), &parent_hash);
-    BankEvent::new(
-        BankEventKind::NewBank,
-        monotonic_clock_timestamp_ns,
-        &new_bank,
-        &FrozenBankEvent::default(),
-    )
+    build_bank_event(timestamp, Some(&new_bank), None)
 }
 
 pub fn frozen_bank_event(bank: &Bank) -> BankEvent {
-    let monotonic_clock_timestamp_ns = monotonic_clock_timestamp_ns();
+    let timestamp = monotonic_clock_timestamp_ns();
     let bank_hash = generated_events::Hash::new(&bank.hash().to_bytes());
     let frozen_bank = FrozenBankEvent::new(bank.slot(), &bank_hash);
-    BankEvent::new(
-        BankEventKind::FrozenBank,
-        monotonic_clock_timestamp_ns,
-        &NewBankEvent::default(),
-        &frozen_bank,
-    )
+    build_bank_event(timestamp, None, Some(&frozen_bank))
+}
+
+fn build_bank_event(
+    timestamp: u64,
+    new_bank: Option<&NewBankEvent>,
+    frozen_bank: Option<&FrozenBankEvent>,
+) -> BankEvent {
+    BANK_EVENT_BUILDER.with(|builder| {
+        let mut builder = builder.borrow_mut();
+        builder.reset();
+        let root = generated_events::BankEvent::create(
+            &mut builder,
+            &generated_events::BankEventArgs {
+                timestamp,
+                new_bank,
+                frozen_bank,
+            },
+        );
+        generated_events::finish_size_prefixed_bank_event_buffer(&mut builder, root);
+        BankEvent::from_flatbuffer(builder.finished_data())
+    })
 }
 
 fn monotonic_clock_timestamp_ns() -> u64 {
@@ -182,20 +247,29 @@ mod tests {
         let before_new_bank = monotonic_clock_timestamp_ns();
         let new_bank = new_bank_event(&bank);
         let after_new_bank = monotonic_clock_timestamp_ns();
-        assert_eq!(new_bank.kind(), BankEventKind::NewBank);
-        assert!(new_bank.monotonic_clock_timestamp_ns() >= before_new_bank);
-        assert!(new_bank.monotonic_clock_timestamp_ns() <= after_new_bank);
-        assert_eq!(new_bank.new_bank().slot(), bank.slot());
-        assert_eq!(new_bank.new_bank().parent_slot(), bank.parent_slot());
+        assert!(new_bank.flatbuffer().len() <= BANK_EVENT_QUEUE_PAYLOAD_SIZE);
+        let new_bank =
+            generated_events::size_prefixed_root_as_bank_event(new_bank.flatbuffer()).unwrap();
+        assert!(new_bank.timestamp() >= before_new_bank);
+        assert!(new_bank.timestamp() <= after_new_bank);
+        assert_eq!(new_bank.new_bank().unwrap().slot(), bank.slot());
+        assert_eq!(
+            new_bank.new_bank().unwrap().parent_slot(),
+            bank.parent_slot()
+        );
+        assert!(new_bank.frozen_bank().is_none());
 
         bank.freeze();
         let before_frozen_bank = monotonic_clock_timestamp_ns();
         let frozen_bank = frozen_bank_event(&bank);
         let after_frozen_bank = monotonic_clock_timestamp_ns();
-        assert_eq!(frozen_bank.kind(), BankEventKind::FrozenBank);
-        assert!(frozen_bank.monotonic_clock_timestamp_ns() >= before_frozen_bank);
-        assert!(frozen_bank.monotonic_clock_timestamp_ns() <= after_frozen_bank);
-        assert_eq!(frozen_bank.frozen_bank().slot(), bank.slot());
+        assert!(frozen_bank.flatbuffer().len() <= BANK_EVENT_QUEUE_PAYLOAD_SIZE);
+        let frozen_bank =
+            generated_events::size_prefixed_root_as_bank_event(frozen_bank.flatbuffer()).unwrap();
+        assert!(frozen_bank.timestamp() >= before_frozen_bank);
+        assert!(frozen_bank.timestamp() <= after_frozen_bank);
+        assert!(frozen_bank.new_bank().is_none());
+        assert_eq!(frozen_bank.frozen_bank().unwrap().slot(), bank.slot());
     }
 
     #[test]

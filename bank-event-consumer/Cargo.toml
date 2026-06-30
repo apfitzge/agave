@@ -1,0 +1,14 @@
+[workspace]
+
+[package]
+name = "bank-event-consumer"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+flatbuffers = "25.12.19"
+flatbuffers-reflection = "0.1.0"
+serde_json = "1"
+shaq = { git = "https://github.com/anza-xyz/shaq", rev = "c7144f800409089cf2029367fd1fc32dcbebdc71" }
+signal-hook = "0.4"

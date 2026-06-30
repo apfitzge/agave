@@ -4,12 +4,6 @@ struct Hash {
   bytes: [ubyte:32];
 }
 
-enum BankEventKind : ubyte {
-  None = 0,
-  NewBank = 1,
-  FrozenBank = 2,
-}
-
 struct NewBankEvent {
   slot: ulong;
   parent_slot: ulong;
@@ -21,9 +15,10 @@ struct FrozenBankEvent {
   bank_hash: Hash;
 }
 
-struct BankEvent {
-  kind: BankEventKind;
-  monotonic_clock_timestamp_ns: ulong;
+table BankEvent {
+  timestamp: ulong;
   new_bank: NewBankEvent;
   frozen_bank: FrozenBankEvent;
 }
+
+root_type BankEvent;
