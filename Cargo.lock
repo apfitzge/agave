@@ -3002,6 +3002,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
 
 [[package]]
+name = "flatbuffers"
+version = "25.12.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "35f6839d7b3b98adde531effaf34f0c2badc6f4735d26fe74709d8e513a96ef3"
+dependencies = [
+ "bitflags 2.13.0",
+ "rustc_version 0.4.1",
+]
+
+[[package]]
 name = "flate2"
 version = "1.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6778,8 +6788,7 @@ dependencies = [
 [[package]]
 name = "shaq"
 version = "3.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f70af47ac33fc236ff3d3185a60d0821622475415a6f3aa8378d50eed158913b"
+source = "git+https://github.com/anza-xyz/shaq?rev=c7144f800409089cf2029367fd1fc32dcbebdc71#c7144f800409089cf2029367fd1fc32dcbebdc71"
 dependencies = [
  "libc",
  "windows-sys 0.59.0",
@@ -9036,6 +9045,7 @@ dependencies = [
  "crossbeam-channel",
  "dashmap",
  "eager",
+ "flatbuffers",
  "fs_extra",
  "futures 0.3.32",
  "itertools 0.14.0",
@@ -9055,6 +9065,7 @@ dependencies = [
  "rocksdb",
  "scopeguard",
  "serde",
+ "shaq",
  "solana-account 4.3.1",
  "solana-account-decoder",
  "solana-accounts-db",

@@ -1,0 +1,28 @@
+namespace agave.ledger.broadcast_events;
+
+struct Hash {
+  bytes: [ubyte:32];
+}
+
+enum BankEventKind : ubyte {
+  None = 0,
+  NewBank = 1,
+  FrozenBank = 2,
+}
+
+struct NewBankEvent {
+  slot: ulong;
+  parent_slot: ulong;
+  parent_hash: Hash;
+}
+
+struct FrozenBankEvent {
+  slot: ulong;
+  bank_hash: Hash;
+}
+
+struct BankEvent {
+  kind: BankEventKind;
+  new_bank: NewBankEvent;
+  frozen_bank: FrozenBankEvent;
+}
