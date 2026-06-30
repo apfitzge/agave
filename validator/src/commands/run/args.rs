@@ -6,7 +6,7 @@ use {
     },
     agave_snapshots::{SUPPORTED_ARCHIVE_COMPRESSION, SnapshotVersion},
     bytesize::ByteSize,
-    clap::{App, Arg, ArgMatches, values_t},
+    clap::{App, Arg, ArgMatches, value_t, values_t},
     solana_accounts_db::utils::create_and_canonicalize_directory,
     solana_clap_utils::{
         hidden_unless_forced,
@@ -49,6 +49,8 @@ pub mod send_transaction_config;
 pub struct RunArgs {
     pub identity_keypair: Keypair,
     pub ledger_path: PathBuf,
+    pub events_dir: Option<PathBuf>,
+    pub event_consumer_slots: usize,
     pub logfile: Option<PathBuf>,
     pub entrypoints: Vec<SocketAddr>,
     pub known_validators: Option<HashSet<Pubkey>>,
@@ -93,6 +95,8 @@ impl FromClapArgMatches for RunArgs {
         } else {
             Some(PathBuf::from(logfile))
         };
+        let events_dir = matches.value_of("events_dir").map(PathBuf::from);
+        let event_consumer_slots = value_t!(matches, "event_consumer_slots", usize)?;
 
         let mut entrypoints = values_t!(matches, "entrypoint", String).unwrap_or_default();
         // sort() + dedup() to yield a vector of unique elements
@@ -121,6 +125,8 @@ impl FromClapArgMatches for RunArgs {
         Ok(RunArgs {
             identity_keypair,
             ledger_path,
+            events_dir,
+            event_consumer_slots,
             logfile,
             entrypoints,
             known_validators,
@@ -203,6 +209,22 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .required(true)
             .default_value(&default_args.ledger_path)
             .help("Use DIR as ledger location"),
+    )
+    .arg(
+        Arg::with_name("events_dir")
+            .long("events-dir")
+            .value_name("DIR")
+            .takes_value(true)
+            .help("Use DIR as event queue and schema location [default: <LEDGER>/events]"),
+    )
+    .arg(
+        Arg::with_name("event_consumer_slots")
+            .long("event-consumer-slots")
+            .value_name("COUNT")
+            .takes_value(true)
+            .default_value("4")
+            .validator(is_parsable::<usize>)
+            .help("Number of consumers supported by each event queue"),
     )
     .arg(
         Arg::with_name("entrypoint")
@@ -1310,6 +1332,8 @@ mod tests {
             RunArgs {
                 identity_keypair,
                 ledger_path,
+                events_dir: None,
+                event_consumer_slots: 4,
                 logfile: Some(logfile),
                 entrypoints,
                 known_validators,
@@ -1341,6 +1365,8 @@ mod tests {
                 known_validators: self.known_validators.clone(),
                 socket_addr_space: self.socket_addr_space,
                 ledger_path: self.ledger_path.clone(),
+                events_dir: self.events_dir.clone(),
+                event_consumer_slots: self.event_consumer_slots,
                 rpc_bootstrap_config: self.rpc_bootstrap_config.clone(),
                 blockstore_options: self.blockstore_options.clone(),
                 json_rpc_config: self.json_rpc_config.clone(),
@@ -1528,6 +1554,29 @@ mod tests {
             );
             assert!(fs::exists(&ledger_path).unwrap());
         }
+    }
+
+    #[test]
+    fn verify_args_struct_by_command_run_with_events_dir() {
+        let default_run_args = RunArgs::default();
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let events_dir = tmp_dir.path().join("events");
+
+        let expected_args = RunArgs {
+            events_dir: Some(events_dir.clone()),
+            event_consumer_slots: 7,
+            ..default_run_args.clone()
+        };
+        verify_args_struct_by_command_run_with_identity_setup(
+            default_run_args,
+            vec![
+                "--events-dir",
+                events_dir.to_str().unwrap(),
+                "--event-consumer-slots",
+                "7",
+            ],
+            expected_args,
+        );
     }
 
     #[test]

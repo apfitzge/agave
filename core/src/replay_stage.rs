@@ -64,6 +64,10 @@ use {
             ConfirmationProgress, ExecuteBatchesInternalMetrics, ReplaySlotStats,
             TransactionStatusSender, check_chained_block_id,
         },
+        broadcast_events::{
+            self, BANK_EVENTS_SCHEMA, BankEvent, BankEventProducer, frozen_bank_event,
+            new_bank_event,
+        },
         entry_notifier_service::EntryNotifierSender,
         leader_schedule_cache::LeaderScheduleCache,
     },
@@ -100,6 +104,7 @@ use {
     std::{
         collections::{BTreeSet, HashMap, HashSet},
         num::{NonZeroUsize, Saturating},
+        path::PathBuf,
         result,
         sync::{
             Arc, RwLock,
@@ -313,6 +318,8 @@ struct NewBankForksContext<'a> {
     migration_status: &'a MigrationStatus,
     /// This validator's identity, used to leave live own-leader banks to BCL.
     my_pubkey: &'a Pubkey,
+    /// Replay-owned event producer for bank lifecycle events.
+    bank_event_producer: Option<&'a mut BankEventProducer>,
 }
 
 struct LastVoteRefreshTime {
@@ -427,6 +434,8 @@ pub struct ReplayStageConfig {
     pub banking_tracer: Arc<BankingTracer>,
     pub snapshot_controller: Option<Arc<SnapshotController>>,
     pub replay_highest_frozen: Arc<ReplayHighestFrozen>,
+    pub events_dir: Option<PathBuf>,
+    pub event_consumer_slots: usize,
 }
 
 pub struct ReplaySenders {
@@ -748,6 +757,8 @@ impl ReplayStage {
             banking_tracer,
             snapshot_controller,
             replay_highest_frozen,
+            events_dir,
+            event_consumer_slots,
         } = config;
 
         let ReplaySenders {
@@ -798,6 +809,30 @@ impl ReplayStage {
             .highest_frozen_bank()
             .map_or(0, |hfs| hfs.slot());
         *replay_highest_frozen.highest_frozen_slot.lock().unwrap() = highest_frozen_slot;
+
+        let mut bank_event_producer = if let Some(events_dir) = events_dir {
+            let producer = broadcast_events::create_event_queue::<BankEvent>(
+                &events_dir,
+                "bank_events",
+                BANK_EVENTS_SCHEMA,
+                1024,
+                1,
+                event_consumer_slots,
+            )
+            .map_err(|err| {
+                format!(
+                    "failed to create bank event queue in {}: {err}",
+                    events_dir.display()
+                )
+            })?;
+            info!(
+                "bank event queue initialized at {}",
+                broadcast_events::event_queue_path(&events_dir, "bank_events").display()
+            );
+            Some(producer)
+        } else {
+            None
+        };
 
         let run_replay = move || {
             let _exit = Finalizer::new(exit.clone());
@@ -977,6 +1012,7 @@ impl ReplayStage {
                         slot_status_notifier: &slot_status_notifier,
                         migration_status: migration_status.as_ref(),
                         my_pubkey: &my_pubkey,
+                        bank_event_producer: bank_event_producer.as_mut(),
                     },
                     &mut progress,
                     &mut replay_timing,
@@ -1006,6 +1042,7 @@ impl ReplayStage {
                     &vote_account,
                     &mut replay_timing,
                     &own_message_sender,
+                    bank_event_producer.as_mut(),
                 );
                 let did_complete_bank = !new_frozen_slots.is_empty();
                 replay_active_banks_time.stop();
@@ -1508,6 +1545,7 @@ impl ReplayStage {
                             &banking_tracer,
                             has_new_vote_been_rooted,
                             migration_status.as_ref(),
+                            bank_event_producer.as_mut(),
                         )
                     {
                         Self::log_leader_change(
@@ -2855,6 +2893,7 @@ impl ReplayStage {
         banking_tracer: &Arc<BankingTracer>,
         has_new_vote_been_rooted: bool,
         migration_status: &MigrationStatus,
+        bank_event_producer: Option<&mut BankEventProducer>,
     ) -> Option<Slot> {
         assert!(!migration_status.is_alpenglow_enabled());
         // all the individual calls to poh_recorder.read() are designed to
@@ -2963,6 +3002,15 @@ impl ReplayStage {
                 slot_status_notifier,
                 NewBankOptions { vote_only_bank },
             );
+            if let Some(producer) = bank_event_producer
+                && producer.try_write(new_bank_event(&tpu_bank)).is_err()
+            {
+                datapoint_warn!(
+                    "bank_event_publish_failed",
+                    ("event", "new_bank", String),
+                    ("slot", poh_slot, i64),
+                );
+            }
             // make sure parent is frozen for finalized hashes via the above
             // new()-ing of its child bank
             banking_tracer.hash_event(parent.slot(), &parent.last_blockhash(), &parent.hash());
@@ -3814,6 +3862,7 @@ impl ReplayStage {
         mut tbft_structs: Option<&mut TowerBFTStructures>,
         replay_result_vec: &[ReplaySlotFromBlockstore],
         my_pubkey: &Pubkey,
+        mut bank_event_producer: Option<&mut BankEventProducer>,
     ) -> Vec<Slot> {
         let bank_forks = &process_active_banks_context.bank_forks;
 
@@ -4009,6 +4058,15 @@ impl ReplayStage {
                     );
 
                     continue;
+                }
+                if let Some(producer) = bank_event_producer.as_deref_mut()
+                    && producer.try_write(frozen_bank_event(bank)).is_err()
+                {
+                    datapoint_warn!(
+                        "bank_event_publish_failed",
+                        ("event", "frozen_bank", String),
+                        ("slot", bank_slot, i64),
+                    );
                 }
 
                 let r_replay_stats = replay_stats.read().unwrap();
@@ -4228,6 +4286,7 @@ impl ReplayStage {
         vote_account: &Pubkey,
         replay_timing: &mut ReplayLoopTiming,
         finalization_cert_sender: &Sender<ConsensusMessage>,
+        bank_event_producer: Option<&mut BankEventProducer>,
     ) -> Vec<Slot> /* completed slots */ {
         let bank_replay_result_trackers = Self::prepare_active_banks_for_replay(
             process_active_banks_context,
@@ -4261,6 +4320,7 @@ impl ReplayStage {
             tbft_structs,
             &replay_result_vec,
             my_pubkey,
+            bank_event_producer,
         )
     }
 
@@ -5200,6 +5260,7 @@ impl ReplayStage {
             slot_status_notifier,
             migration_status,
             my_pubkey,
+            mut bank_event_producer,
         } = ctx;
 
         // Find the next slot that chains to the old slot
@@ -5295,6 +5356,15 @@ impl ReplayStage {
                     slot_status_notifier,
                     options,
                 );
+                if let Some(producer) = bank_event_producer.as_deref_mut()
+                    && producer.try_write(new_bank_event(&child_bank)).is_err()
+                {
+                    datapoint_warn!(
+                        "bank_event_publish_failed",
+                        ("event", "new_bank", String),
+                        ("slot", child_slot, i64),
+                    );
+                }
                 blockstore_processor::set_alpenglow_ticks(&child_bank, migration_status);
 
                 let empty: Vec<Pubkey> = vec![];

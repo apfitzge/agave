@@ -821,6 +821,8 @@ pub fn execute(
         process_ledger_before_services: matches.is_present("process_ledger_before_services"),
         account_paths: account_run_paths,
         account_snapshot_paths,
+        events_dir: run_args.events_dir,
+        event_consumer_slots: run_args.event_consumer_slots,
         accounts_db_config,
         accounts_db_skip_shrink: true,
         accounts_db_force_initial_clean: matches.is_present("no_skip_initial_accounts_db_clean"),

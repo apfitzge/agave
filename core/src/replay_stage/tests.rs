@@ -431,6 +431,7 @@ fn test_child_slots_of_same_parent() {
             slot_status_notifier: &None,
             migration_status: &MigrationStatus::default(),
             my_pubkey: &Pubkey::default(),
+            bank_event_producer: None,
         },
         &mut progress,
         &mut replay_timing,
@@ -463,6 +464,7 @@ fn test_child_slots_of_same_parent() {
             slot_status_notifier: &None,
             migration_status: &MigrationStatus::default(),
             my_pubkey: &Pubkey::default(),
+            bank_event_producer: None,
         },
         &mut progress,
         &mut replay_timing,
@@ -1061,6 +1063,7 @@ fn do_test_dead_slot_on_complete_bank(failure: CompleteBankFailure) {
         None,
         &[replay_result],
         &my_pubkey,
+        None,
     );
 
     assert!(progress.get(&slot).unwrap().dead_reason.is_some());
@@ -1121,6 +1124,7 @@ fn test_cmr_mismatch_hard_dead() {
         None,
         &[replay_result],
         &Pubkey::new_unique(),
+        None,
     );
 
     assert!(blockstore.is_dead(slot));
@@ -1187,6 +1191,7 @@ fn test_abandon_invalidates() {
         None,
         &[replay_result],
         &Pubkey::new_unique(),
+        None,
     );
 
     assert!(progress.get(&slot).is_none());
@@ -2722,6 +2727,7 @@ fn test_purge_unconfirmed_duplicate_slots_and_reattach() {
             slot_status_notifier: &None,
             migration_status: &MigrationStatus::default(),
             my_pubkey: &Pubkey::default(),
+            bank_event_producer: None,
         },
         &mut progress,
         &mut replay_timing,
@@ -2755,6 +2761,7 @@ fn test_purge_unconfirmed_duplicate_slots_and_reattach() {
             slot_status_notifier: &None,
             migration_status: &MigrationStatus::default(),
             my_pubkey: &Pubkey::default(),
+            bank_event_producer: None,
         },
         &mut progress,
         &mut replay_timing,
@@ -2789,6 +2796,7 @@ fn test_purge_unconfirmed_duplicate_slots_and_reattach() {
             slot_status_notifier: &None,
             migration_status: &MigrationStatus::default(),
             my_pubkey: &Pubkey::default(),
+            bank_event_producer: None,
         },
         &mut progress,
         &mut replay_timing,
@@ -2822,6 +2830,7 @@ fn test_purge_unconfirmed_duplicate_slots_and_reattach() {
             slot_status_notifier: &None,
             migration_status: &MigrationStatus::default(),
             my_pubkey: &Pubkey::default(),
+            bank_event_producer: None,
         },
         &mut progress,
         &mut replay_timing,
@@ -2955,6 +2964,7 @@ fn test_headerless_update_parent() {
             slot_status_notifier: &None,
             migration_status: &migration_status,
             my_pubkey: &my_pubkey,
+            bank_event_producer: None,
         },
         &mut progress,
         &mut replay_timing,
@@ -3520,6 +3530,7 @@ fn test_skip_own_update_full() {
             slot_status_notifier: &None,
             migration_status: &migration_status,
             my_pubkey: &my_pubkey,
+            bank_event_producer: None,
         },
         &mut progress,
         &mut replay_timing,
@@ -5654,6 +5665,7 @@ fn test_dumped_slot_not_causing_panic() {
             &banking_tracer,
             has_new_vote_been_rooted,
             &MigrationStatus::default(),
+            None,
         )
         .is_none()
     );
@@ -6338,6 +6350,7 @@ fn test_skip_leader_slot_for_existing_slot() {
             &banking_tracer,
             has_new_vote_been_rooted,
             &MigrationStatus::default(),
+            None,
         )
         .is_none()
     );
@@ -6369,6 +6382,7 @@ fn test_skip_leader_slot_for_existing_slot() {
             &banking_tracer,
             has_new_vote_been_rooted,
             &MigrationStatus::default(),
+            None,
         )
         .is_some()
     );

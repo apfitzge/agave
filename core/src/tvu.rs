@@ -88,6 +88,7 @@ use {
         collections::HashSet,
         net::UdpSocket,
         num::NonZeroUsize,
+        path::PathBuf,
         sync::{Arc, RwLock, atomic::AtomicBool},
         thread::{self, JoinHandle},
     },
@@ -151,6 +152,8 @@ pub struct TvuConfig {
     pub bls_sigverify_threads: NonZeroUsize,
     pub turbine_xdp_sender: Option<TurbineXdpSender>,
     pub repair_xdp_sender: Option<PinnedXdpSender>,
+    pub events_dir: Option<PathBuf>,
+    pub event_consumer_slots: usize,
 }
 
 impl Default for TvuConfig {
@@ -167,6 +170,8 @@ impl Default for TvuConfig {
             bls_sigverify_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
             turbine_xdp_sender: None,
             repair_xdp_sender: None,
+            events_dir: None,
+            event_consumer_slots: 4,
         }
     }
 }
@@ -587,6 +592,8 @@ impl Tvu {
             banking_tracer,
             snapshot_controller,
             replay_highest_frozen,
+            events_dir: tvu_config.events_dir,
+            event_consumer_slots: tvu_config.event_consumer_slots,
         };
 
         let voting_service = VotingService::new(

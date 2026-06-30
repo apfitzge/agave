@@ -325,6 +325,8 @@ pub struct ValidatorConfig {
     pub voting_disabled: bool,
     pub account_paths: Vec<PathBuf>,
     pub account_snapshot_paths: Vec<PathBuf>,
+    pub events_dir: Option<PathBuf>,
+    pub event_consumer_slots: usize,
     pub rpc_config: JsonRpcConfig,
     /// Specifies which plugins to start up with
     pub on_start_geyser_plugin_config_files: Option<Vec<PathBuf>>,
@@ -412,6 +414,8 @@ impl ValidatorConfig {
             blockstore_options: BlockstoreOptions::default_for_tests(),
             account_paths: Vec::new(),
             account_snapshot_paths: Vec::new(),
+            events_dir: None,
+            event_consumer_slots: 4,
             rpc_config: JsonRpcConfig::default_for_test(),
             on_start_geyser_plugin_config_files: None,
             geyser_plugin_always_enabled: false,
@@ -829,6 +833,10 @@ impl Validator {
                 "ledger directory does not exist or is not accessible: {ledger_path:?}"
             ));
         }
+        let events_dir = config
+            .events_dir
+            .clone()
+            .unwrap_or_else(|| ledger_path.join("events"));
         let genesis_config = load_genesis(config, ledger_path)?;
         metrics_config_sanity_check(genesis_config.cluster_type)?;
 
@@ -1666,6 +1674,8 @@ impl Validator {
                 bls_sigverify_threads: config.tvu_bls_sigverify_threads,
                 turbine_xdp_sender: turbine_xdp_sender.clone(),
                 repair_xdp_sender,
+                events_dir: Some(events_dir),
+                event_consumer_slots: config.event_consumer_slots,
             },
             &max_slots,
             block_metadata_notifier,
