@@ -47,7 +47,8 @@ use {
         vote_sender_types::{ReplayVoteMessage, ReplayVoteSendType, ReplayVoteSender},
     },
     solana_runtime_transaction::{
-        runtime_transaction::RuntimeTransaction, transaction_with_meta::TransactionWithMeta,
+        runtime_transaction::{ReplayTransaction, RuntimeTransaction},
+        transaction_with_meta::TransactionWithMeta,
     },
     solana_shred_version::compute_shred_version,
     solana_signature::Signature,
@@ -96,7 +97,7 @@ pub struct LockedTransactionsWithIndexes<Tx: SVMMessage> {
 }
 
 struct ReplayEntry {
-    entry: EntryType<RuntimeTransaction<SanitizedTransaction>>,
+    entry: EntryType<ReplayTransaction>,
     starting_index: usize,
 }
 
@@ -405,7 +406,7 @@ impl ExecuteBatchesInternalMetrics {
 fn execute_batches_internal(
     bank: &Arc<Bank>,
     replay_tx_thread_pool: &ThreadPool,
-    batches: &[TransactionBatchWithIndexes<RuntimeTransaction<SanitizedTransaction>>],
+    batches: &[TransactionBatchWithIndexes<ReplayTransaction>],
     transaction_status_sender: Option<&TransactionStatusSender>,
     replay_vote_sender: Option<&ReplayVoteSender>,
     log_messages_bytes_limit: Option<usize>,
@@ -639,7 +640,7 @@ pub fn process_entries_for_tests(
         let bank = bank.clone_with_scheduler();
         move |versioned_tx: VersionedTransaction,
               serialized_message: &[u8]|
-              -> Result<RuntimeTransaction<SanitizedTransaction>> {
+              -> Result<ReplayTransaction> {
             bank.verify_transaction_with_serialized_message(
                 versioned_tx,
                 serialized_message,
@@ -765,7 +766,7 @@ fn process_entries(
 fn queue_batches_with_lock_retry(
     bank: &Bank,
     starting_index: usize,
-    transactions: Vec<RuntimeTransaction<SanitizedTransaction>>,
+    transactions: Vec<ReplayTransaction>,
     batches: &mut Vec<LockedTransactionsWithIndexes<SanitizedTransaction>>,
     mut process_batches: impl FnMut(
         Drain<LockedTransactionsWithIndexes<SanitizedTransaction>>,
@@ -5588,7 +5589,7 @@ pub mod tests {
     fn create_test_transactions(
         mint_keypair: &Keypair,
         genesis_hash: &Hash,
-    ) -> Vec<RuntimeTransaction<SanitizedTransaction>> {
+    ) -> Vec<ReplayTransaction> {
         let pubkey = solana_pubkey::new_rand();
         let keypair2 = Keypair::new();
         let pubkey2 = solana_pubkey::new_rand();
@@ -5596,19 +5597,19 @@ pub mod tests {
         let pubkey3 = solana_pubkey::new_rand();
 
         vec![
-            RuntimeTransaction::from_transaction_for_tests(system_transaction::transfer(
+            ReplayTransaction::from_transaction_for_tests(system_transaction::transfer(
                 mint_keypair,
                 &pubkey,
                 1,
                 *genesis_hash,
             )),
-            RuntimeTransaction::from_transaction_for_tests(system_transaction::transfer(
+            ReplayTransaction::from_transaction_for_tests(system_transaction::transfer(
                 &keypair2,
                 &pubkey2,
                 1,
                 *genesis_hash,
             )),
-            RuntimeTransaction::from_transaction_for_tests(system_transaction::transfer(
+            ReplayTransaction::from_transaction_for_tests(system_transaction::transfer(
                 &keypair3,
                 &pubkey3,
                 1,
@@ -5922,7 +5923,7 @@ pub mod tests {
         let pubkey = solana_pubkey::new_rand();
         let (tx, expected_tx_result) = match tx_result {
             TxResult::ExecutedWithSuccess => (
-                RuntimeTransaction::from_transaction_for_tests(system_transaction::transfer(
+                ReplayTransaction::from_transaction_for_tests(system_transaction::transfer(
                     &mint_keypair,
                     &pubkey,
                     1,
@@ -5931,7 +5932,7 @@ pub mod tests {
                 Ok(()),
             ),
             TxResult::ExecutedWithFailure => (
-                RuntimeTransaction::from_transaction_for_tests(system_transaction::transfer(
+                ReplayTransaction::from_transaction_for_tests(system_transaction::transfer(
                     &mint_keypair,
                     &pubkey,
                     100000000,
@@ -5940,7 +5941,7 @@ pub mod tests {
                 Ok(()),
             ),
             TxResult::NotExecuted => (
-                RuntimeTransaction::from_transaction_for_tests(system_transaction::transfer(
+                ReplayTransaction::from_transaction_for_tests(system_transaction::transfer(
                     &mint_keypair,
                     &pubkey,
                     1,
@@ -6329,7 +6330,7 @@ pub mod tests {
         } = create_genesis_config_with_leader(500, &dummy_leader_pubkey, 100);
         let bank = Bank::new_for_tests(&genesis_config);
 
-        let tx = RuntimeTransaction::from_transaction_for_tests(system_transaction::transfer(
+        let tx = ReplayTransaction::from_transaction_for_tests(system_transaction::transfer(
             &mint_keypair,
             &Pubkey::new_unique(),
             1,
