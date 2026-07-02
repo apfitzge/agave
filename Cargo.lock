@@ -3002,16 +3002,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
 
 [[package]]
-name = "flatbuffers"
-version = "25.12.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35f6839d7b3b98adde531effaf34f0c2badc6f4735d26fe74709d8e513a96ef3"
-dependencies = [
- "bitflags 2.13.0",
- "rustc_version 0.4.1",
-]
-
-[[package]]
 name = "flate2"
 version = "1.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3019,6 +3009,28 @@ checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
+]
+
+[[package]]
+name = "flatrecord"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a85fb64e06ab69c2c63565f829619fc26a519cf3967fb2f82b6cdf89fc574c6"
+dependencies = [
+ "flatrecord-derive",
+ "thiserror 2.0.18",
+ "wincode",
+]
+
+[[package]]
+name = "flatrecord-derive"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11288e31bdf0ae361eba0599dd4f9ddae3bb22db3913ab5f4081d5149b7ac2c1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -9045,7 +9057,7 @@ dependencies = [
  "crossbeam-channel",
  "dashmap",
  "eager",
- "flatbuffers",
+ "flatrecord",
  "fs_extra",
  "futures 0.3.32",
  "itertools 0.14.0",

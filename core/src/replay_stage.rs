@@ -65,7 +65,7 @@ use {
             TransactionStatusSender, check_chained_block_id,
         },
         broadcast_events::{
-            self, BANK_EVENTS_SCHEMA, BankEvent, BankEventProducer, frozen_bank_event,
+            self, BankEvent, BankEventProducer, bank_events_schema, frozen_bank_event,
             new_bank_event,
         },
         entry_notifier_service::EntryNotifierSender,
@@ -811,10 +811,11 @@ impl ReplayStage {
         *replay_highest_frozen.highest_frozen_slot.lock().unwrap() = highest_frozen_slot;
 
         let mut bank_event_producer = if let Some(events_dir) = events_dir {
+            let schema = bank_events_schema();
             let producer = broadcast_events::create_event_queue::<BankEvent>(
                 &events_dir,
                 "bank_events",
-                BANK_EVENTS_SCHEMA,
+                &schema,
                 1024,
                 1,
                 event_consumer_slots,

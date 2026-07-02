@@ -42,7 +42,7 @@ chrono-humanize = { workspace = true }
 crossbeam-channel = { workspace = true }
 dashmap = { workspace = true, features = ["rayon", "raw-api"] }
 eager = { workspace = true }
-flatbuffers = { workspace = true }
+flatrecord = { workspace = true }
 fs_extra = { workspace = true }
 futures = { workspace = true }
 itertools = { workspace = true }
