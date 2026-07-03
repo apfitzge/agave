@@ -58,6 +58,8 @@ use {
 
 pub mod transaction_scheduler;
 
+#[cfg(unix)]
+mod check_worker;
 mod committer;
 mod consume_worker;
 mod consumer;
