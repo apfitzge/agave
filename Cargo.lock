@@ -6779,8 +6779,7 @@ dependencies = [
 [[package]]
 name = "shaq"
 version = "3.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f70af47ac33fc236ff3d3185a60d0821622475415a6f3aa8378d50eed158913b"
+source = "git+https://github.com/anza-xyz/shaq.git?rev=2348a757ebf8e9c2b91ff7bf38ce1aa0fd4fea9b#2348a757ebf8e9c2b91ff7bf38ce1aa0fd4fea9b"
 dependencies = [
  "libc",
  "windows-sys 0.59.0",
