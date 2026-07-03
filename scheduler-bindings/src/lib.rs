@@ -242,6 +242,37 @@ pub struct PackToWorkerMessage {
     pub batch: SharableTransactionBatchRegion,
 }
 
+/// Message: [Pack -> Check Worker]
+/// External pack process passes transactions to check worker threads within agave.
+///
+/// These messages do not transfer ownership of the transactions.
+/// The external pack process is still responsible for freeing the memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct PackToCheckWorkerMessage {
+    /// Flags on how to handle this message.
+    /// See [`check_message_flags`] for details.
+    pub flags: u16,
+    /// Offset and number of transactions in the batch.
+    /// See [`SharableTransactionBatchRegion`] for details.
+    /// Agave will return this batch in the response message, it is
+    /// the responsibility of the external pack process to free the memory
+    /// ONLY after receiving the response message.
+    pub batch: SharableTransactionBatchRegion,
+}
+
+pub mod check_message_flags {
+    /// Transactions should check status: if transaction has already been processed
+    /// or the nonce is invalid.
+    pub const STATUS_CHECKS: u16 = 1 << 0;
+
+    /// Fee-payer balance should be fetched for transactions.
+    pub const LOAD_FEE_PAYER_BALANCE: u16 = 1 << 1;
+
+    /// Transactions should have ATL pubkeys resolved and returned.
+    pub const LOAD_ADDRESS_LOOKUP_TABLES: u16 = 1 << 2;
+}
+
 pub mod pack_message_flags {
     //! Flags for [`crate::PackToWorkerMessage::flags`].
     //! Use [`CHECK`] or [`EXECUTE`] to specify how a batch should be processed.
@@ -299,6 +330,26 @@ pub mod processed_codes {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct WorkerToPackMessage {
+    /// Offset and number of transactions in the batch.
+    /// See [`SharableTransactionBatchRegion`] for details.
+    /// Once the external pack process receives this message,
+    /// it is responsible for freeing the memory for this batch,
+    /// and is safe to do so - agave will hold no references to this memory
+    /// after sending this message.
+    pub batch: SharableTransactionBatchRegion,
+    /// See [`processed_codes`] for accepted values.
+    pub processed_code: u8,
+    /// Response per transaction in the batch.
+    /// If message was not processed, this field is undefined.
+    /// See [`TransactionResponseRegion`] for details.
+    pub responses: TransactionResponseRegion,
+}
+
+/// Message: [Check Worker -> Pack]
+/// Message from check worker threads in response to a [`PackToCheckWorkerMessage`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct CheckWorkerToPackMessage {
     /// Offset and number of transactions in the batch.
     /// See [`SharableTransactionBatchRegion`] for details.
     /// Once the external pack process receives this message,
