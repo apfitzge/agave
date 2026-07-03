@@ -656,8 +656,12 @@ impl BankingStage {
 mod external {
     use {
         super::*,
-        crate::banking_stage::consume_worker::external::ExternalWorker,
-        agave_scheduling_utils::handshake::{AgaveSession, AgaveWorkerSession},
+        crate::banking_stage::{
+            check_worker::ExternalCheckWorker, consume_worker::external::ExternalWorker,
+        },
+        agave_scheduling_utils::handshake::{
+            AgaveCheckWorkerSession, AgaveSession, AgaveWorkerSession,
+        },
         tpu_to_pack::BankingPacketReceivers,
     };
 
@@ -668,6 +672,7 @@ mod external {
                 flags: _,
                 tpu_to_pack,
                 progress_tracker,
+                check_workers,
                 workers,
             }: AgaveSession,
         ) -> Result<Vec<JoinHandle<()>>, ()> {
@@ -680,7 +685,7 @@ mod external {
             assert!(workers.len() <= BankingStage::max_num_workers().get());
 
             // Spawn the external consumer workers.
-            let mut threads = Vec::with_capacity(workers.len() + 2);
+            let mut threads = Vec::with_capacity(workers.len() + check_workers.len() + 2);
             let mut worker_metrics = Vec::with_capacity(workers.len());
             for (
                 index,
@@ -713,6 +718,37 @@ mod external {
                         .spawn(move || {
                             if let Err(err) = consume_worker.run(pack_to_worker) {
                                 error!("External consume worker error; err={err}");
+                            }
+                        })
+                        .unwrap(),
+                );
+            }
+
+            for (
+                index,
+                AgaveCheckWorkerSession {
+                    allocator,
+                    pack_to_check_worker,
+                    check_worker_to_pack,
+                },
+            ) in check_workers.into_iter().enumerate()
+            {
+                let id = index as u32;
+                let check_worker = ExternalCheckWorker::new(
+                    self.worker_exit_signal.clone(),
+                    pack_to_check_worker,
+                    check_worker_to_pack,
+                    allocator,
+                    self.poh_recorder.read().unwrap().shared_leader_state(),
+                    self.bank_forks.read().unwrap().sharable_banks(),
+                );
+
+                threads.push(
+                    Builder::new()
+                        .name(format!("solEChWorker{id:02}"))
+                        .spawn(move || {
+                            if let Err(err) = check_worker.run() {
+                                error!("External check worker error; err={err}");
                             }
                         })
                         .unwrap(),

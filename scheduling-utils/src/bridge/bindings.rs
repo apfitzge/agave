@@ -6,9 +6,10 @@ use {
     },
     agave_feature_set::FeatureSet,
     agave_scheduler_bindings::{
-        MAX_TRANSACTIONS_PER_MESSAGE, PackToWorkerMessage, ProgressMessage,
-        SharableTransactionBatchRegion, SharableTransactionRegion, TpuToPackMessage,
-        WorkerToPackMessage, processed_codes, tpu_message_flags,
+        CheckWorkerToPackMessage, MAX_TRANSACTIONS_PER_MESSAGE, PackToCheckWorkerMessage,
+        PackToWorkerMessage, ProgressMessage, SharableTransactionBatchRegion,
+        SharableTransactionRegion, TpuToPackMessage, WorkerToPackMessage, processed_codes,
+        tpu_message_flags,
         worker_message_types::{self, CheckResponse, ExecutionResponse},
     },
     agave_transaction_view::{
@@ -27,6 +28,8 @@ pub struct SchedulerBindingsBridge<M> {
     allocator: Allocator,
     tpu_to_pack: shaq::spsc::Consumer<TpuToPackMessage>,
     progress_tracker: shaq::spsc::Consumer<ProgressMessage>,
+    pack_to_check_worker: shaq::mpmc::Producer<PackToCheckWorkerMessage>,
+    check_worker_to_pack: shaq::mpmc::Consumer<CheckWorkerToPackMessage>,
     workers: Vec<SchedulerWorker>,
 
     progress: ProgressMessage,
@@ -63,6 +66,8 @@ where
             mut allocators,
             tpu_to_pack,
             progress_tracker,
+            pack_to_check_worker,
+            check_worker_to_pack,
             workers,
         }: ClientSession,
     ) -> Self {
@@ -72,6 +77,8 @@ where
             allocator: allocators.remove(0),
             tpu_to_pack,
             progress_tracker,
+            pack_to_check_worker,
+            check_worker_to_pack,
             workers: workers.into_iter().map(SchedulerWorker).collect(),
 
             progress: ProgressMessage {
@@ -311,6 +318,19 @@ where
         self.workers[worker].0.worker_to_pack.finalize();
     }
 
+    pub fn drain_check_worker(
+        &mut self,
+        mut callback: impl FnMut(&mut Self, WorkerResponse<'_, M>) -> TxDecision,
+        max_count: usize,
+    ) {
+        for _ in 0..max_count {
+            let Some(rep) = self.check_worker_to_pack.try_read() else {
+                break;
+            };
+            self.handle_check_worker_response(rep, &mut callback);
+        }
+    }
+
     /// Builds & schedules the provided batch.
     ///
     /// # Panics
@@ -351,6 +371,24 @@ where
         Ok(())
     }
 
+    pub fn schedule_check(
+        &mut self,
+        CheckScheduleBatch {
+            transactions: batch,
+            flags,
+        }: CheckScheduleBatch<&[KeyedTransactionMeta<M>]>,
+    ) -> Result<(), ScheduleError> {
+        let batch = Self::collect_batch(&self.allocator, &mut self.state, batch)?;
+
+        let message = PackToCheckWorkerMessage { flags, batch };
+        if let Err(message) = self.pack_to_check_worker.try_write(message) {
+            Self::release_batch(&self.allocator, &mut self.state, message.batch);
+            return Err(ScheduleError::Queue);
+        }
+
+        Ok(())
+    }
+
     fn collect_batch(
         allocator: &Allocator,
         state: &mut SlotMap<TransactionKey, TransactionState>,
@@ -362,9 +400,11 @@ where
         let transactions = allocator
             .allocate(Self::TRANSACTION_BATCH_SIZE as u32)
             .ok_or(ScheduleError::Allocation)?;
+        // SAFETY: `transactions` was just allocated from this allocator.
         let transactions_offset = unsafe { allocator.offset(transactions) };
 
         // Get our two pointers to the TX region & meta region.
+        // SAFETY: `transactions_offset` came from this allocator immediately above.
         let tx_ptr = unsafe {
             allocator
                 .ptr_from_offset(transactions_offset)
@@ -406,6 +446,39 @@ where
             num_transactions: batch.len().try_into().unwrap(),
             transactions_offset,
         })
+    }
+
+    fn release_batch(
+        allocator: &Allocator,
+        state: &mut SlotMap<TransactionKey, TransactionState>,
+        batch: SharableTransactionBatchRegion,
+    ) {
+        // SAFETY: `batch` was produced by `collect_batch` using this allocator.
+        let transactions = unsafe {
+            allocator
+                .ptr_from_offset(batch.transactions_offset)
+                .cast::<SharableTransactionRegion>()
+        };
+        // SAFETY: `collect_batch` allocates enough space for the transaction regions and
+        // `KeyedTransactionMeta` values at `TRANSACTION_META_START`.
+        let metas = unsafe {
+            transactions
+                .byte_add(Batch::<M>::TRANSACTION_META_START)
+                .cast::<KeyedTransactionMeta<M>>()
+        };
+
+        for index in 0..usize::from(batch.num_transactions) {
+            // SAFETY: `index` is bounded by `batch.num_transactions`, which was set from the
+            // original batch length in `collect_batch`.
+            let KeyedTransactionMeta::<M> { key, .. } = unsafe { metas.add(index).read() };
+            state[key].borrows = state[key].borrows.checked_sub(1).unwrap();
+        }
+
+        // SAFETY: `batch.transactions_offset` owns the batch container allocation created by
+        // `collect_batch`, and this path is releasing it before Agave observes it.
+        unsafe {
+            allocator.free_offset(batch.transactions_offset);
+        }
     }
 
     fn handle_worker_response(
@@ -574,6 +647,65 @@ where
             }
         }
     }
+
+    fn handle_check_worker_response(
+        &mut self,
+        rep: CheckWorkerToPackMessage,
+        callback: &mut impl FnMut(&mut Self, WorkerResponse<'_, M>) -> TxDecision,
+    ) {
+        // SAFETY: check-worker responses return the same batch region allocated by
+        // `schedule_check` with this bridge allocator.
+        let transactions = unsafe {
+            self.allocator
+                .ptr_from_offset(rep.batch.transactions_offset)
+                .cast::<SharableTransactionRegion>()
+        };
+        // SAFETY: batches scheduled through `schedule_check` are allocated by `collect_batch`,
+        // which stores `KeyedTransactionMeta` values at `TRANSACTION_META_START`.
+        let metas = unsafe {
+            transactions
+                .byte_add(Batch::<M>::TRANSACTION_META_START)
+                .cast()
+        };
+
+        let responses = match (rep.processed_code, rep.responses.tag) {
+            (processed_codes::PROCESSED, worker_message_types::CHECK_RESPONSE) => {
+                assert_eq!(
+                    rep.batch.num_transactions,
+                    rep.responses.num_transaction_responses
+                );
+                // SAFETY: a processed check-worker response with `CHECK_RESPONSE` points to an
+                // array of `CheckResponse` values allocated by Agave in the shared allocator.
+                WorkerResponseBatch::Check(unsafe {
+                    self.allocator
+                        .ptr_from_offset(rep.responses.transaction_responses_offset)
+                        .cast()
+                })
+            }
+            _ => panic!("Unexpected check response; rep={rep:?}"),
+        };
+
+        for index in 0..usize::from(rep.batch.num_transactions) {
+            // SAFETY: `index` is bounded by the returned batch length, and `metas` points to the
+            // metadata array originally created by `collect_batch`.
+            let KeyedTransactionMeta::<M> { key, meta } = unsafe { metas.add(index).read() };
+            let decision = self.handle_transaction_response(key, meta, index, &responses, callback);
+
+            if decision == TxDecision::Drop {
+                self.drop_transaction(key);
+            }
+        }
+
+        // SAFETY: the bridge owns the returned batch container and check response allocation after
+        // receiving this response. Individual transaction allocations are managed via state borrows.
+        unsafe {
+            self.allocator.free_offset(rep.batch.transactions_offset);
+            let WorkerResponseBatch::Check(ptr) = responses else {
+                unreachable!();
+            };
+            self.allocator.free(ptr.cast());
+        }
+    }
 }
 
 pub struct SchedulerWorker(ClientWorkerSession);
@@ -616,6 +748,12 @@ pub struct ScheduleBatch<T> {
     pub worker: usize,
     pub transactions: T,
     pub max_working_slot: u64,
+    pub flags: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckScheduleBatch<T> {
+    pub transactions: T,
     pub flags: u16,
 }
 

@@ -3,6 +3,7 @@ use {
         ClientHandshakeError, ClientLogon, ClientSession, ClientWorkerSession,
         shared::{LOGON_FAILURE, MAX_WORKERS, VERSION},
     },
+    agave_scheduler_bindings::{CheckWorkerToPackMessage, PackToCheckWorkerMessage},
     libc::CMSG_LEN,
     nix::sys::socket::{self, ControlMessageOwned, MsgFlags, UnixAddr},
     rts_alloc::Allocator,
@@ -19,7 +20,7 @@ use {
 };
 
 /// Number of global shared memory objects (in addition to per worker objects).
-const GLOBAL_SHMEM: usize = 3;
+const GLOBAL_SHMEM: usize = 5;
 
 /// The maximum size in bytes of the control message containing the queues assuming [`MAX_WORKERS`]
 /// is respected.
@@ -138,7 +139,14 @@ pub fn setup_session(
         return Err(ClientHandshakeError::ProtocolViolation);
     }
     let (global_files, worker_files) = files.split_at(GLOBAL_SHMEM);
-    let [allocator_file, tpu_to_pack_file, progress_tracker_file] = global_files else {
+    let [
+        allocator_file,
+        tpu_to_pack_file,
+        progress_tracker_file,
+        pack_to_check_worker_file,
+        check_worker_to_pack_file,
+    ] = global_files
+    else {
         unreachable!();
     };
 
@@ -159,8 +167,22 @@ pub fn setup_session(
     // underlying object alive until process exit or munmap.
     let session = ClientSession {
         allocators,
+        // SAFETY: the server initialized this FD as a `TpuToPackMessage` SPSC producer and sent
+        // it in this fixed global position.
         tpu_to_pack: unsafe { shaq::spsc::Consumer::join(tpu_to_pack_file)? },
+        // SAFETY: the server initialized this FD as a `ProgressMessage` SPSC producer and sent it
+        // in this fixed global position.
         progress_tracker: unsafe { shaq::spsc::Consumer::join(progress_tracker_file)? },
+        // SAFETY: the server initialized this FD as a `PackToCheckWorkerMessage` MPMC consumer
+        // and sent it in this fixed global position.
+        pack_to_check_worker: unsafe {
+            shaq::mpmc::Producer::<PackToCheckWorkerMessage>::join(pack_to_check_worker_file)?
+        },
+        // SAFETY: the server initialized this FD as a `CheckWorkerToPackMessage` MPMC producer
+        // and sent it in this fixed global position.
+        check_worker_to_pack: unsafe {
+            shaq::mpmc::Consumer::<CheckWorkerToPackMessage>::join(check_worker_to_pack_file)?
+        },
         workers: worker_files
             .chunks(2)
             .map(|window| {
@@ -169,7 +191,11 @@ pub fn setup_session(
                 };
 
                 Ok(ClientWorkerSession {
+                    // SAFETY: each worker file pair is sent as pack_to_worker then
+                    // worker_to_pack, and this FD was initialized as a matching SPSC consumer.
                     pack_to_worker: unsafe { shaq::spsc::Producer::join(pack_to_worker)? },
+                    // SAFETY: each worker file pair is sent as pack_to_worker then
+                    // worker_to_pack, and this FD was initialized as a matching SPSC producer.
                     worker_to_pack: unsafe { shaq::spsc::Consumer::join(worker_to_pack)? },
                 })
             })

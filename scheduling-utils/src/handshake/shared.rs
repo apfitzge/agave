@@ -1,6 +1,7 @@
 use {
     agave_scheduler_bindings::{
-        PackToWorkerMessage, ProgressMessage, TpuToPackMessage, WorkerToPackMessage,
+        CheckWorkerToPackMessage, PackToCheckWorkerMessage, PackToWorkerMessage, ProgressMessage,
+        TpuToPackMessage, WorkerToPackMessage,
     },
     rts_alloc::Allocator,
     thiserror::Error,
@@ -24,6 +25,8 @@ pub(crate) const GLOBAL_ALLOCATORS: usize = 1;
 pub struct ClientLogon {
     /// The number of Agave worker threads that will be spawned to handle packing requests.
     pub worker_count: usize,
+    /// The number of Agave check worker threads that will be spawned to handle check requests.
+    pub check_worker_count: usize,
     /// The minimum allocator file size in bytes, this is shared by all allocator handles.
     pub allocator_size: usize,
     /// The number of [`rts_alloc::Allocator`] handles the external process is requesting.
@@ -66,6 +69,8 @@ pub struct ClientSession {
     pub allocators: Vec<Allocator>,
     pub tpu_to_pack: shaq::spsc::Consumer<TpuToPackMessage>,
     pub progress_tracker: shaq::spsc::Consumer<ProgressMessage>,
+    pub pack_to_check_worker: shaq::mpmc::Producer<PackToCheckWorkerMessage>,
+    pub check_worker_to_pack: shaq::mpmc::Consumer<CheckWorkerToPackMessage>,
     pub workers: Vec<ClientWorkerSession>,
 }
 
@@ -97,6 +102,7 @@ pub struct AgaveSession {
     pub flags: u16,
     pub tpu_to_pack: AgaveTpuToPackSession,
     pub progress_tracker: shaq::spsc::Producer<ProgressMessage>,
+    pub check_workers: Vec<AgaveCheckWorkerSession>,
     pub workers: Vec<AgaveWorkerSession>,
 }
 
@@ -111,6 +117,13 @@ pub struct AgaveWorkerSession {
     pub allocator: Allocator,
     pub pack_to_worker: shaq::spsc::Consumer<PackToWorkerMessage>,
     pub worker_to_pack: shaq::spsc::Producer<WorkerToPackMessage>,
+}
+
+/// Shared memory objects for a single check worker.
+pub struct AgaveCheckWorkerSession {
+    pub allocator: Allocator,
+    pub pack_to_check_worker: shaq::mpmc::Consumer<PackToCheckWorkerMessage>,
+    pub check_worker_to_pack: shaq::mpmc::Producer<CheckWorkerToPackMessage>,
 }
 
 /// Potential errors that can occur during the Agave side of the handshake.
@@ -130,6 +143,8 @@ pub enum AgaveHandshakeError {
     Version { server: u64, client: u64 },
     #[error("Worker count; count={0}")]
     WorkerCount(usize),
+    #[error("Check worker count; count={0}")]
+    CheckWorkerCount(usize),
     #[error("Allocator handles; count={0}")]
     AllocatorHandles(usize),
     #[error("Rts alloc; err={0:?}")]

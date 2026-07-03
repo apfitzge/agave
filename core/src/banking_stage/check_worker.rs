@@ -762,6 +762,7 @@ mod tests {
 
         let logon = ClientLogon {
             worker_count: 1,
+            check_worker_count: 1,
             allocator_size: 64 * 1024 * 1024,
             allocator_handles: 1,
             tpu_to_pack_capacity: 16,
