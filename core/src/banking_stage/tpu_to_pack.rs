@@ -88,7 +88,7 @@ fn handle_packet_batches(
 ) {
     // Clean all remote frees in allocator so we have as much
     // room as possible.
-    allocator.clean_remote_free_lists();
+    allocator.clean_remote_frees();
 
     // Sync producer queue with reader so we have as much room as possible.
     producer.sync();

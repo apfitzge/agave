@@ -310,7 +310,7 @@ pub(crate) mod external {
             receiver: &mut shaq::spsc::Consumer<PackToWorkerMessage>,
             should_drain_executes: &mut bool,
         ) -> Result<IterationResult, ExternalConsumeWorkerError> {
-            self.allocator.clean_remote_free_lists();
+            self.allocator.clean_remote_frees();
             if receiver.is_empty() {
                 receiver.sync();
                 *should_drain_executes = false;
