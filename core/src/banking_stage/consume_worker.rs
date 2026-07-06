@@ -232,6 +232,8 @@ pub(crate) mod external {
     }
 
     impl ExternalWorker {
+        const RECEIVE_TIMEOUT: Duration = Duration::from_millis(10);
+
         pub fn new(
             id: u32,
             exit: Arc<AtomicBool>,
@@ -259,26 +261,13 @@ pub(crate) mod external {
             mut receiver: shaq::spsc::Consumer<PackToExecutionWorkerMessage>,
         ) -> Result<(), ExternalConsumeWorkerError> {
             let mut should_drain_executes = false;
-            let mut did_work = false;
-            let mut last_empty_time = Instant::now();
-            let mut sleep_duration = STARTING_SLEEP_DURATION;
 
             while !self.exit.load(Ordering::Relaxed) {
-                match self.iterate(&mut receiver, &mut should_drain_executes)? {
-                    IterationResult::ProcessedMessage => {
-                        did_work = true;
-                    }
-                    IterationResult::Idle => {
-                        let now = Instant::now();
-
-                        if did_work {
-                            last_empty_time = now;
-                        }
-                        did_work = false;
-                        let idle_duration = now.duration_since(last_empty_time);
-                        sleep_duration = backoff(idle_duration, &sleep_duration);
-                    }
-                }
+                self.iterate(
+                    &mut receiver,
+                    &mut should_drain_executes,
+                    Self::RECEIVE_TIMEOUT,
+                )?;
             }
 
             Ok(())
@@ -288,19 +277,20 @@ pub(crate) mod external {
             &mut self,
             receiver: &mut shaq::spsc::Consumer<PackToExecutionWorkerMessage>,
             should_drain_executes: &mut bool,
+            timeout: Duration,
         ) -> Result<IterationResult, ExternalConsumeWorkerError> {
             self.allocator.clean_remote_frees();
+
             if receiver.is_empty() {
-                receiver.sync();
                 *should_drain_executes = false;
             }
 
-            match receiver.try_read() {
-                Some(message) => {
+            match receiver.read_timeout(timeout) {
+                Ok(message) => {
                     self.sender.sync();
 
                     // Process message, if bank is unavailable enable draining for the
-                    // remainder of the current batch (i.e. what our `receiver.sync()`
+                    // remainder of the current batch (i.e. what `read_timeout()`
                     // fetched).
                     *should_drain_executes |=
                         self.process_message(message, *should_drain_executes)?;
@@ -311,7 +301,7 @@ pub(crate) mod external {
 
                     Ok(IterationResult::ProcessedMessage)
                 }
-                None => Ok(IterationResult::Idle),
+                Err(shaq::error::WaitError::Timeout) => Ok(IterationResult::Idle),
             }
         }
 
@@ -754,10 +744,22 @@ pub(crate) mod external {
             }
 
             fn iterate(&mut self) -> Result<(), ExternalConsumeWorkerError> {
-                let result = self
-                    .worker
-                    .iterate(&mut self.receiver, &mut self.should_drain_executes)?;
+                let result = self.worker.iterate(
+                    &mut self.receiver,
+                    &mut self.should_drain_executes,
+                    Duration::ZERO,
+                )?;
                 assert!(matches!(result, IterationResult::ProcessedMessage));
+                Ok(())
+            }
+
+            fn iterate_idle(&mut self) -> Result<(), ExternalConsumeWorkerError> {
+                let result = self.worker.iterate(
+                    &mut self.receiver,
+                    &mut self.should_drain_executes,
+                    Duration::ZERO,
+                )?;
+                assert!(matches!(result, IterationResult::Idle));
                 Ok(())
             }
 
@@ -963,6 +965,16 @@ pub(crate) mod external {
                 execution_message_flags::DROP_ON_FAILURE | execution_message_flags::ALL_OR_NOTHING
             ));
             assert!(!ExternalWorker::validate_message_flags(1 << 15));
+        }
+
+        #[test]
+        fn test_iterate_idle_timeout_clears_drain_state() {
+            let mut test_frame = setup_external_test_frame();
+            test_frame.should_drain_executes = true;
+
+            test_frame.iterate_idle().unwrap();
+
+            assert!(!test_frame.should_drain_executes);
         }
 
         #[test]
