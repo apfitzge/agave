@@ -1,7 +1,7 @@
 use {
     agave_scheduler_bindings::{
-        CheckWorkerToPackMessage, PackToCheckWorkerMessage, PackToWorkerMessage, ProgressMessage,
-        TpuToPackMessage, WorkerToPackMessage,
+        CheckWorkerToPackMessage, ExecutionWorkerToPackMessage, PackToCheckWorkerMessage,
+        PackToExecutionWorkerMessage, ProgressMessage, TpuToPackMessage,
     },
     rts_alloc::Allocator,
     thiserror::Error,
@@ -13,7 +13,7 @@ pub(crate) type ShaqError = shaq::error::Error;
 pub const MAX_WORKERS: usize = 64;
 
 /// Protocol version.
-pub(crate) const VERSION: u64 = 4;
+pub(crate) const VERSION: u64 = 5;
 pub(crate) const LOGON_SUCCESS: u8 = 0x01;
 pub(crate) const LOGON_FAILURE: u8 = 0x02;
 pub(crate) const MAX_ALLOCATOR_HANDLES: usize = 128;
@@ -76,8 +76,8 @@ pub struct ClientSession {
 
 /// A per worker scheduling session.
 pub struct ClientWorkerSession {
-    pub pack_to_worker: shaq::spsc::Producer<PackToWorkerMessage>,
-    pub worker_to_pack: shaq::spsc::Consumer<WorkerToPackMessage>,
+    pub pack_to_worker: shaq::spsc::Producer<PackToExecutionWorkerMessage>,
+    pub worker_to_pack: shaq::spsc::Consumer<ExecutionWorkerToPackMessage>,
 }
 
 /// Potential errors that can occur during the client's side of the handshake.
@@ -115,8 +115,8 @@ pub struct AgaveTpuToPackSession {
 /// Shared memory objects for a single banking worker.
 pub struct AgaveWorkerSession {
     pub allocator: Allocator,
-    pub pack_to_worker: shaq::spsc::Consumer<PackToWorkerMessage>,
-    pub worker_to_pack: shaq::spsc::Producer<WorkerToPackMessage>,
+    pub pack_to_worker: shaq::spsc::Consumer<PackToExecutionWorkerMessage>,
+    pub worker_to_pack: shaq::spsc::Producer<ExecutionWorkerToPackMessage>,
 }
 
 /// Shared memory objects for a single check worker.

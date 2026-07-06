@@ -2,7 +2,7 @@
 #![no_std]
 
 //! Messages passed between agave and an external pack process.
-//! Messages are passed via `shaq::spsc::Consumer/Producer`.
+//! Messages are passed via `shaq` SPSC and MPMC queues.
 //!
 //! Memory freeing is responsibility of the external pack process,
 //! and is done via `rts-alloc` crate. It is also possible the external
@@ -38,14 +38,18 @@
 //! - [`ProgressMessage`] are sent from `progress_tracker` queue to the
 //!   external scheduler process. This passes information about leader status
 //!   and slot progress to the external scheduler process.
-//! - [`PackToWorkerMessage`] are sent from the external scheduler process
-//!   to worker threads within agave. This passes a batch of transactions
-//!   to be processed by the worker threads. This processing can also involve
-//!   resolving the transactions' addresses, or similar operations beyond
-//!   execution.
-//! - [`WorkerToPackMessage`] are sent from worker threads within agave
-//!   back to the external scheduler process. This passes back the results
-//!   of processing the transactions.
+//! - [`PackToExecutionWorkerMessage`] are sent from the external scheduler process
+//!   to execution worker threads within agave. This passes a batch of
+//!   transactions to be executed by the worker threads.
+//! - [`ExecutionWorkerToPackMessage`] are sent from execution worker threads
+//!   within agave back to the external scheduler process. This passes back the
+//!   results of executing the transactions.
+//! - [`PackToCheckWorkerMessage`] are sent from the external scheduler process to
+//!   check worker threads within agave. This passes a batch of transactions to be
+//!   checked by the worker threads.
+//! - [`CheckWorkerToPackMessage`] are sent from check worker threads within agave
+//!   back to the external scheduler process. This passes back the results of
+//!   checking the transactions.
 //!
 //! Ownership and pointer lifetime rule:
 //! - Sending a message that contains offsets or pointers to memory transfers
@@ -84,8 +88,8 @@ pub struct SharablePubkeys {
 /// General flow:
 /// 1. External pack process allocates memory for
 ///    `num_transactions` [`SharableTransactionRegion`].
-/// 2. External pack sends a [`PackToWorkerMessage`] with `batch`.
-/// 3. agave processes the transactions and sends back a [`WorkerToPackMessage`]
+/// 2. External pack sends a [`PackToExecutionWorkerMessage`] with `batch`.
+/// 3. agave processes the transactions and sends back an [`ExecutionWorkerToPackMessage`]
 ///    with the same `batch`.
 /// 4. External pack process frees all transaction memory pointed to by the
 ///    [`SharableTransactionRegion`] in the batch, then frees the memory for
@@ -103,7 +107,7 @@ pub struct SharableTransactionBatchRegion {
 /// Reference to an array of response messages.
 /// General flow:
 /// 1. agave allocates memory for `num_transaction_responses` inner messages.
-/// 2. agave sends a [`WorkerToPackMessage`] with `responses`.
+/// 2. agave sends a worker response message with `responses`.
 /// 3. External pack process processes the inner messages. Potentially freeing
 ///    any memory within each inner message (see [`worker_message_types`] for details).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,7 +212,7 @@ pub struct ProgressMessage {
     pub latest_blockhash: [u8; 32],
 }
 
-/// Maximum number of transactions allowed in a [`PackToWorkerMessage`].
+/// Maximum number of transactions allowed in a [`PackToExecutionWorkerMessage`].
 /// If the number of transactions exceeds this value, agave will
 /// not process the message.
 //
@@ -218,21 +222,21 @@ pub struct ProgressMessage {
 // transactions sent. This is a conservative bound.
 pub const MAX_TRANSACTIONS_PER_MESSAGE: usize = 64;
 
-/// Message: [Pack -> Worker]
-/// External pack processe passes transactions to worker threads within agave.
+/// Message: [Pack -> Execution Worker]
+/// External pack process passes transactions to execution worker threads within agave.
 ///
 /// These messages do not transfer ownership of the transactions.
 /// The external pack process is still responsible for freeing the memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
-pub struct PackToWorkerMessage {
+pub struct PackToExecutionWorkerMessage {
     /// Flags on how to handle this message.
-    /// See [`pack_message_flags`] for details.
+    /// See [`execution_message_flags`] for details.
     pub flags: u16,
     /// Maximum working bank slot that this message will be processed
     /// for. For execution, this will check the leader bank if it exists.
-    /// If the working bank is ahead of the slot, the return message will
-    /// be set with [`NOT_PROCESSED`].
+    /// If the working bank is ahead of the slot, the response will use
+    /// [`processed_codes::MAX_WORKING_SLOT_EXCEEDED`].
     pub max_working_slot: u64,
     /// Offset and number of transactions in the batch.
     /// See [`SharableTransactionBatchRegion`] for details.
@@ -273,46 +277,21 @@ pub mod check_message_flags {
     pub const LOAD_ADDRESS_LOOKUP_TABLES: u16 = 1 << 2;
 }
 
-pub mod pack_message_flags {
-    //! Flags for [`crate::PackToWorkerMessage::flags`].
-    //! Use [`CHECK`] or [`EXECUTE`] to specify how a batch should be processed.
-    //! See [`check_flags`] and [`execution_flags`] for details.
+pub mod execution_message_flags {
+    //! Flags for [`crate::PackToExecutionWorkerMessage::flags`].
 
-    /// Combine with [`check_flags`] for performing checks on transactions.
-    /// Worker will respond with [`super::worker_message_types::CheckResponse`] if
-    /// the message is processed.
-    pub const CHECK: u16 = 0;
-    /// Combine with additional [`execution_flags`] for executing a batch of transactions.
-    /// Worker will responsd with [`super::worker_message_types::ExecutionResponse`] if
-    /// the message is processed.
-    pub const EXECUTE: u16 = 1;
-
-    pub mod execution_flags {
-        /// Should failing transactions within the batch be dropped (no fee charged & not
-        /// committed).
-        pub const DROP_ON_FAILURE: u16 = 1 << 1;
-        /// If any transaction in the batch is not committed then the entire batch should not be
-        /// committed.
-        ///
-        /// # Note
-        ///
-        /// Without `drop_on_failure` this flag will still allow processed but failing transactions
-        /// to be committed. If both flags are set then any failing transaction will cause all
-        /// transactions to be aborted.
-        pub const ALL_OR_NOTHING: u16 = 1 << 2;
-    }
-
-    pub mod check_flags {
-        /// Transactions should check status: if transaction has already been processed
-        /// or the nonce is invalid.
-        pub const STATUS_CHECKS: u16 = 1 << 1;
-
-        /// Fee-payer balance should be fetched for transactions.
-        pub const LOAD_FEE_PAYER_BALANCE: u16 = 1 << 2;
-
-        /// Transactions should have ATL pubkeys resolved and returned.
-        pub const LOAD_ADDRESS_LOOKUP_TABLES: u16 = 1 << 3;
-    }
+    /// Should failing transactions within the batch be dropped (no fee charged & not
+    /// committed).
+    pub const DROP_ON_FAILURE: u16 = 1 << 0;
+    /// If any transaction in the batch is not committed then the entire batch should not be
+    /// committed.
+    ///
+    /// # Note
+    ///
+    /// Without `drop_on_failure` this flag will still allow processed but failing transactions
+    /// to be committed. If both flags are set then any failing transaction will cause all
+    /// transactions to be aborted.
+    pub const ALL_OR_NOTHING: u16 = 1 << 1;
 }
 
 pub mod processed_codes {
@@ -325,11 +304,11 @@ pub mod processed_codes {
     pub const MAX_WORKING_SLOT_EXCEEDED: u8 = 2;
 }
 
-/// Message: [Worker -> Pack]
-/// Message from worker threads in response to a [`PackToWorkerMessage`].
+/// Message: [Execution Worker -> Pack]
+/// Message from worker threads in response to a [`PackToExecutionWorkerMessage`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
-pub struct WorkerToPackMessage {
+pub struct ExecutionWorkerToPackMessage {
     /// Offset and number of transactions in the batch.
     /// See [`SharableTransactionBatchRegion`] for details.
     /// Once the external pack process receives this message,
@@ -372,8 +351,6 @@ pub mod worker_message_types {
     pub const EXECUTION_RESPONSE: u8 = 0;
 
     /// Response to pack for a transaction that attempted execution.
-    /// This response will only be sent if the original message flags
-    /// requested execution i.e. not [`super::pack_message_flags::RESOLVE`].
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     #[repr(C)]
     pub struct ExecutionResponse {

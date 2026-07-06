@@ -4,9 +4,9 @@ use {
         shared::MAX_WORKERS,
     },
     agave_scheduler_bindings::{
-        CheckWorkerToPackMessage, PackToCheckWorkerMessage, PackToWorkerMessage, ProgressMessage,
-        SharableTransactionBatchRegion, SharableTransactionRegion, TpuToPackMessage,
-        TransactionResponseRegion, WorkerToPackMessage,
+        CheckWorkerToPackMessage, ExecutionWorkerToPackMessage, PackToCheckWorkerMessage,
+        PackToExecutionWorkerMessage, ProgressMessage, SharableTransactionBatchRegion,
+        SharableTransactionRegion, TpuToPackMessage, TransactionResponseRegion,
     },
     std::time::Duration,
     tempfile::NamedTempFile,
@@ -37,7 +37,7 @@ fn message_passing_on_all_queues() {
         remaining_cost_units: 12_000_000,
         latest_blockhash: [42; 32],
     };
-    let pack_to_worker = PackToWorkerMessage {
+    let pack_to_worker = PackToExecutionWorkerMessage {
         flags: 123,
         max_working_slot: 100,
         batch: SharableTransactionBatchRegion {
@@ -45,7 +45,7 @@ fn message_passing_on_all_queues() {
             transactions_offset: 100,
         },
     };
-    let worker_to_pack = WorkerToPackMessage {
+    let worker_to_pack = ExecutionWorkerToPackMessage {
         batch: SharableTransactionBatchRegion {
             num_transactions: 5,
             transactions_offset: 100,
@@ -139,7 +139,7 @@ fn message_passing_on_all_queues() {
                 }
             };
             assert_eq!(
-                PackToWorkerMessage {
+                PackToExecutionWorkerMessage {
                     max_working_slot: pack_to_worker.max_working_slot + i as u64,
                     ..pack_to_worker
                 },
@@ -151,7 +151,7 @@ fn message_passing_on_all_queues() {
         for (i, worker) in session.workers.iter_mut().enumerate() {
             worker
                 .worker_to_pack
-                .try_write(WorkerToPackMessage {
+                .try_write(ExecutionWorkerToPackMessage {
                     batch: SharableTransactionBatchRegion {
                         num_transactions: worker_to_pack.batch.num_transactions + i as u8,
                         ..worker_to_pack.batch
@@ -237,7 +237,7 @@ fn message_passing_on_all_queues() {
         for (i, worker) in session.workers.iter_mut().enumerate() {
             worker
                 .pack_to_worker
-                .try_write(PackToWorkerMessage {
+                .try_write(PackToExecutionWorkerMessage {
                     max_working_slot: pack_to_worker.max_working_slot + i as u64,
                     ..pack_to_worker
                 })
@@ -254,7 +254,7 @@ fn message_passing_on_all_queues() {
                 }
             };
             assert_eq!(
-                WorkerToPackMessage {
+                ExecutionWorkerToPackMessage {
                     batch: SharableTransactionBatchRegion {
                         num_transactions: worker_to_pack.batch.num_transactions + i as u8,
                         ..worker_to_pack.batch

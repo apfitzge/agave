@@ -6,10 +6,10 @@ use {
     },
     agave_feature_set::FeatureSet,
     agave_scheduler_bindings::{
-        CheckWorkerToPackMessage, MAX_TRANSACTIONS_PER_MESSAGE, PackToCheckWorkerMessage,
-        PackToWorkerMessage, ProgressMessage, SharableTransactionBatchRegion,
-        SharableTransactionRegion, TpuToPackMessage, WorkerToPackMessage, processed_codes,
-        tpu_message_flags,
+        CheckWorkerToPackMessage, ExecutionWorkerToPackMessage, MAX_TRANSACTIONS_PER_MESSAGE,
+        PackToCheckWorkerMessage, PackToExecutionWorkerMessage, ProgressMessage,
+        SharableTransactionBatchRegion, SharableTransactionRegion, TpuToPackMessage,
+        processed_codes, tpu_message_flags,
         worker_message_types::{self, CheckResponse, ExecutionResponse},
     },
     agave_transaction_view::{
@@ -360,7 +360,7 @@ where
 
         // Write the batch.
         queue
-            .try_write(PackToWorkerMessage {
+            .try_write(PackToExecutionWorkerMessage {
                 flags,
                 max_working_slot,
                 batch,
@@ -483,10 +483,11 @@ where
 
     fn handle_worker_response(
         &mut self,
-        rep: WorkerToPackMessage,
+        rep: ExecutionWorkerToPackMessage,
         callback: &mut impl FnMut(&mut Self, WorkerResponse<'_, M>) -> TxDecision,
     ) {
-        // Get transaction & meta pointers.
+        // SAFETY: execution-worker responses return the same batch region allocated by
+        // `schedule` with this bridge allocator.
         let transactions = unsafe {
             self.allocator
                 .ptr_from_offset(rep.batch.transactions_offset)
@@ -506,18 +507,10 @@ where
                     rep.batch.num_transactions,
                     rep.responses.num_transaction_responses
                 );
+                // SAFETY: a processed execution-worker response with `EXECUTION_RESPONSE` points
+                // to an array of `ExecutionResponse` values allocated by Agave in the shared
+                // allocator.
                 WorkerResponseBatch::Execution(unsafe {
-                    self.allocator
-                        .ptr_from_offset(rep.responses.transaction_responses_offset)
-                        .cast()
-                })
-            }
-            (processed_codes::PROCESSED, worker_message_types::CHECK_RESPONSE) => {
-                assert_eq!(
-                    rep.batch.num_transactions,
-                    rep.responses.num_transaction_responses
-                );
-                WorkerResponseBatch::Check(unsafe {
                     self.allocator
                         .ptr_from_offset(rep.responses.transaction_responses_offset)
                         .cast()

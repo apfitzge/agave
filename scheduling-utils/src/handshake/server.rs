@@ -8,7 +8,7 @@ use {
         },
     },
     agave_scheduler_bindings::{
-        CheckWorkerToPackMessage, PackToCheckWorkerMessage, PackToWorkerMessage,
+        CheckWorkerToPackMessage, PackToCheckWorkerMessage, PackToExecutionWorkerMessage,
     },
     nix::sys::socket::{self, ControlMessage, MsgFlags, UnixAddr},
     rts_alloc::Allocator,
@@ -283,10 +283,11 @@ impl Server {
 
     fn create_consumer(
         capacity: usize,
-    ) -> Result<(File, shaq::spsc::Consumer<PackToWorkerMessage>), ShaqError> {
+    ) -> Result<(File, shaq::spsc::Consumer<PackToExecutionWorkerMessage>), ShaqError> {
         let create = |huge: bool| {
             let file = Self::create_shmem(huge)?;
-            let minimum_file_size = shaq::spsc::minimum_file_size::<PackToWorkerMessage>(capacity);
+            let minimum_file_size =
+                shaq::spsc::minimum_file_size::<PackToExecutionWorkerMessage>(capacity);
             let file_size = Self::align_file_size(minimum_file_size, huge);
 
             // SAFETY: uniquely creating as consumer.

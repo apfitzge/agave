@@ -1,14 +1,17 @@
 use {
     crate::{
-        bridge::{KeyedTransactionMeta, ScheduleBatch, SchedulerBindingsBridge, TransactionKey},
+        bridge::{
+            CheckScheduleBatch, KeyedTransactionMeta, ScheduleBatch, SchedulerBindingsBridge,
+            TransactionKey,
+        },
         handshake::{AgaveSession, ClientLogon, client, server::Server},
         responses_region::{execution_responses_from_iter, resolve_responses_from_iter},
         transaction_ptr::TransactionPtrBatch,
     },
     agave_scheduler_bindings::{
-        ProgressMessage, SharablePubkeys, SharableTransactionBatchRegion,
-        SharableTransactionRegion, TpuToPackMessage, TransactionResponseRegion,
-        WorkerToPackMessage, pack_message_flags, processed_codes,
+        CheckWorkerToPackMessage, ExecutionWorkerToPackMessage, ProgressMessage, SharablePubkeys,
+        SharableTransactionBatchRegion, SharableTransactionRegion, TpuToPackMessage,
+        TransactionResponseRegion, processed_codes,
         worker_message_types::{
             CheckResponse, ExecutionResponse, fee_payer_balance_flags, not_included_reasons,
             resolve_flags, status_check_flags,
@@ -102,9 +105,12 @@ where
         let ptr = allocator
             .allocate(serialized.len().try_into().unwrap())
             .unwrap();
+        // SAFETY: `ptr` points to a fresh allocation of exactly `serialized.len()` bytes, and the
+        // source slice is readable for that same length.
         unsafe {
             std::ptr::copy_nonoverlapping(serialized.as_ptr(), ptr.as_ptr(), serialized.len());
         }
+        // SAFETY: `ptr` was allocated from `allocator`.
         let offset = unsafe { allocator.offset(ptr) };
 
         let msg = TpuToPackMessage {
@@ -122,7 +128,7 @@ where
 
     pub fn queue_check_response_ok(
         &mut self,
-        batch: &ScheduleBatch<Vec<KeyedTransactionMeta<M>>>,
+        batch: &CheckScheduleBatch<Vec<KeyedTransactionMeta<M>>>,
         index: usize,
         keys: Option<Vec<Pubkey>>,
     ) {
@@ -131,63 +137,65 @@ where
 
     pub fn queue_check_response(
         &mut self,
-        batch: &ScheduleBatch<Vec<KeyedTransactionMeta<M>>>,
+        batch: &CheckScheduleBatch<Vec<KeyedTransactionMeta<M>>>,
         index: usize,
         keys: Option<Vec<Pubkey>>,
         mut response: CheckResponse,
     ) {
-        let worker_idx = batch.worker;
+        let (batch_region, responses_region) = {
+            let allocator = self.bridge.allocator();
 
-        // Allocate pubkeys in shared memory if provided.
-        if let Some(keys) = keys {
-            let worker = &mut self.agave.workers[worker_idx];
-            let pubkeys_ptr = worker
-                .allocator
-                .allocate(
-                    (keys
-                        .len()
-                        .checked_mul(std::mem::size_of::<Pubkey>())
-                        .unwrap())
-                    .try_into()
-                    .unwrap(),
-                )
-                .unwrap();
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    keys.as_ptr().cast::<u8>(),
-                    pubkeys_ptr.as_ptr(),
-                    keys.len()
-                        .checked_mul(std::mem::size_of::<Pubkey>())
+            // Allocate pubkeys in shared memory if provided.
+            if let Some(keys) = keys {
+                let pubkeys_ptr = allocator
+                    .allocate(
+                        (keys
+                            .len()
+                            .checked_mul(std::mem::size_of::<Pubkey>())
+                            .unwrap())
+                        .try_into()
                         .unwrap(),
-                );
+                    )
+                    .unwrap();
+                // SAFETY: `pubkeys_ptr` points to a fresh allocation sized for the full `keys`
+                // slice in bytes, and the source slice is valid for the same byte length.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        keys.as_ptr().cast::<u8>(),
+                        pubkeys_ptr.as_ptr(),
+                        keys.len()
+                            .checked_mul(std::mem::size_of::<Pubkey>())
+                            .unwrap(),
+                    );
+                }
+                // SAFETY: `pubkeys_ptr` was allocated from `allocator`.
+                let offset = unsafe { allocator.offset(pubkeys_ptr) };
+                response.resolved_pubkeys = SharablePubkeys {
+                    offset,
+                    num_pubkeys: keys.len() as u32,
+                };
             }
-            let offset = unsafe { worker.allocator.offset(pubkeys_ptr) };
-            response.resolved_pubkeys = SharablePubkeys {
-                offset,
-                num_pubkeys: keys.len() as u32,
-            };
-        }
 
-        // Build the batch region and response region, then send.
-        let batch_region = self.build_single_tx_batch_region(batch, index, worker_idx);
-        let worker = &mut self.agave.workers[worker_idx];
-        let responses_region =
-            resolve_responses_from_iter(&worker.allocator, [response].into_iter()).unwrap();
+            let batch_region = self.build_single_tx_batch_region(&batch.transactions, index);
+            let responses_region =
+                resolve_responses_from_iter(allocator, [response].into_iter()).unwrap();
+            (batch_region, responses_region)
+        };
 
-        let msg = WorkerToPackMessage {
+        let msg = CheckWorkerToPackMessage {
             batch: batch_region,
             processed_code: processed_codes::PROCESSED,
             responses: responses_region,
         };
 
-        worker.worker_to_pack.try_write(msg).unwrap();
-        worker.worker_to_pack.commit();
+        self.agave.check_workers[0]
+            .check_worker_to_pack
+            .try_write(msg)
+            .unwrap();
     }
 
     pub fn queue_all_checks_ok(&mut self) {
-        while let Some(batch) = self.pop_schedule() {
-            assert_eq!(batch.flags & 1, pack_message_flags::CHECK);
-
+        while let Some(batch) = self.pop_check_schedule() {
             for i in 0..batch.transactions.len() {
                 self.queue_check_response_ok(&batch, i, None);
             }
@@ -201,18 +209,20 @@ where
         response: ExecutionResponse,
     ) {
         let worker_idx = batch.worker;
-        let batch_region = self.build_single_tx_batch_region(batch, index, worker_idx);
-        let worker = &mut self.agave.workers[worker_idx];
+        let msg = {
+            let allocator = self.bridge.allocator();
+            let batch_region = self.build_single_tx_batch_region(&batch.transactions, index);
+            let responses_region =
+                execution_responses_from_iter(allocator, [response].into_iter()).unwrap();
 
-        let responses_region =
-            execution_responses_from_iter(&worker.allocator, [response].into_iter()).unwrap();
-
-        let msg = WorkerToPackMessage {
-            batch: batch_region,
-            processed_code: processed_codes::PROCESSED,
-            responses: responses_region,
+            ExecutionWorkerToPackMessage {
+                batch: batch_region,
+                processed_code: processed_codes::PROCESSED,
+                responses: responses_region,
+            }
         };
 
+        let worker = &mut self.agave.workers[worker_idx];
         worker.worker_to_pack.try_write(msg).unwrap();
         worker.worker_to_pack.commit();
     }
@@ -223,19 +233,21 @@ where
         index: usize,
     ) {
         let worker_idx = batch.worker;
-        let batch_region = self.build_single_tx_batch_region(batch, index, worker_idx);
-        let worker = &mut self.agave.workers[worker_idx];
+        let msg = {
+            let batch_region = self.build_single_tx_batch_region(&batch.transactions, index);
 
-        let msg = WorkerToPackMessage {
-            batch: batch_region,
-            processed_code: processed_codes::MAX_WORKING_SLOT_EXCEEDED,
-            responses: TransactionResponseRegion {
-                tag: 0,
-                num_transaction_responses: 0,
-                transaction_responses_offset: 0,
-            },
+            ExecutionWorkerToPackMessage {
+                batch: batch_region,
+                processed_code: processed_codes::MAX_WORKING_SLOT_EXCEEDED,
+                responses: TransactionResponseRegion {
+                    tag: 0,
+                    num_transaction_responses: 0,
+                    transaction_responses_offset: 0,
+                },
+            }
         };
 
+        let worker = &mut self.agave.workers[worker_idx];
         worker.worker_to_pack.try_write(msg).unwrap();
         worker.worker_to_pack.commit();
     }
@@ -247,7 +259,8 @@ where
                 let msg = *msg;
                 worker.pack_to_worker.finalize();
 
-                // Read the batch contents from shared memory.
+                // SAFETY: execution schedules were allocated by the bridge in the shared
+                // allocator before being sent to the Agave execution-worker queue.
                 let batch = unsafe {
                     TransactionPtrBatch::<KeyedTransactionMeta<M>>::from_sharable_transaction_batch_region(
                         &msg.batch,
@@ -257,7 +270,9 @@ where
 
                 let transactions: Vec<_> = batch.iter().map(|(_tx_ptr, meta)| meta).collect();
 
-                // Free the batch container (transactions are managed by the bridge).
+                // SAFETY: the test helper takes ownership of the batch container after reading
+                // the schedule from the queue. Individual transactions are still managed by the
+                // bridge.
                 unsafe { batch.free() };
 
                 return Some(ScheduleBatch {
@@ -270,6 +285,35 @@ where
         }
 
         None
+    }
+
+    pub fn pop_check_schedule(
+        &mut self,
+    ) -> Option<CheckScheduleBatch<Vec<KeyedTransactionMeta<M>>>> {
+        let check_worker = &mut self.agave.check_workers[0];
+        let Some(msg) = check_worker.pack_to_check_worker.try_read() else {
+            return None;
+        };
+
+        // SAFETY: check schedules were allocated by the bridge in the shared allocator
+        // before being sent to the Agave check-worker queue.
+        let batch = unsafe {
+            TransactionPtrBatch::<KeyedTransactionMeta<M>>::from_sharable_transaction_batch_region(
+                &msg.batch,
+                self.bridge.allocator(),
+            )
+        };
+
+        let transactions: Vec<_> = batch.iter().map(|(_tx_ptr, meta)| meta).collect();
+
+        // SAFETY: the test helper takes ownership of the batch container after reading the
+        // schedule from the queue. Individual transactions are still managed by the bridge.
+        unsafe { batch.free() };
+
+        Some(CheckScheduleBatch {
+            transactions,
+            flags: msg.flags,
+        })
     }
 
     pub fn check_ok(&self) -> CheckResponse {
@@ -315,40 +359,44 @@ where
 
     fn build_single_tx_batch_region(
         &self,
-        batch: &ScheduleBatch<Vec<KeyedTransactionMeta<M>>>,
+        batch: &[KeyedTransactionMeta<M>],
         index: usize,
-        worker_idx: usize,
     ) -> SharableTransactionBatchRegion {
         type Batch<'a, M> = TransactionPtrBatch<'a, KeyedTransactionMeta<M>>;
 
-        let meta = batch.transactions[index];
-        let worker_allocator = &self.agave.workers[worker_idx].allocator;
+        let meta = batch[index];
+        let allocator = self.bridge.allocator();
 
-        // Allocate the batch container in worker's shared memory.
-        let batch_ptr = worker_allocator
+        // Allocate the batch container in the bridge's shared allocator.
+        let batch_ptr = allocator
             .allocate(Batch::<M>::TRANSACTION_META_END as u32)
             .unwrap();
-        let batch_offset = unsafe { worker_allocator.offset(batch_ptr) };
+        // SAFETY: `batch_ptr` was allocated from `allocator`.
+        let batch_offset = unsafe { allocator.offset(batch_ptr) };
 
         // Write the transaction region (offset is relative to the shared allocator,
         // which is the same underlying file for both client and worker).
         let tx_state = self.bridge.transaction(meta.key);
+        // SAFETY: the transaction state owns this transaction allocation in the bridge allocator.
         let tx_region = unsafe {
             tx_state
                 .data
                 .inner_data()
-                .to_sharable_transaction_region(self.bridge.allocator())
+                .to_sharable_transaction_region(allocator)
         };
         let tx_ptr = batch_ptr.cast::<SharableTransactionRegion>();
+        // SAFETY: `batch_ptr` was allocated with enough room for one transaction region.
         unsafe { tx_ptr.as_ptr().write(tx_region) };
 
         // Write the metadata.
+        // SAFETY: `TRANSACTION_META_START` is within the allocated batch container layout.
         let meta_ptr = unsafe {
             batch_ptr
                 .as_ptr()
                 .byte_add(Batch::<M>::TRANSACTION_META_START)
                 .cast::<KeyedTransactionMeta<M>>()
         };
+        // SAFETY: `meta_ptr` points within the batch container allocation.
         unsafe { meta_ptr.write(meta) };
 
         SharableTransactionBatchRegion {
