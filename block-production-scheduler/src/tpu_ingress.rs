@@ -1,10 +1,13 @@
 use {
-    crate::progress_tracker::SchedulerState,
+    crate::{
+        progress_tracker::SchedulerState,
+        transaction::{CheckBatch, MAX_PACKETS_PER_CHECK_BATCH, TpuTransactionMeta},
+    },
     agave_scheduler_bindings::{
         PackToCheckWorkerMessage, SharableTransactionBatchRegion, SharableTransactionRegion,
         TpuToPackMessage, check_message_flags, tpu_message_flags,
     },
-    agave_scheduling_utils::transaction_ptr::{TransactionPtr, TransactionPtrBatch},
+    agave_scheduling_utils::transaction_ptr::TransactionPtr,
     agave_transaction_view::transaction_view::SanitizedTransactionView,
     rts_alloc::Allocator,
     solana_cost_model::cost_model::CostModel,
@@ -18,7 +21,6 @@ use {
     std::{ptr::NonNull, time::Duration},
 };
 
-const MAX_PACKETS_PER_CHECK_BATCH: usize = 16;
 const TPU_RECEIVE_TIMEOUT: Duration = Duration::from_millis(10);
 const LAMPORTS_PER_SIGNATURE: u64 = 5_000;
 const BURN_PERCENT: u64 = 50;
@@ -26,17 +28,6 @@ const PRIORITY_MULTIPLIER: u64 = 1_000_000;
 const CHECK_FLAGS: u16 = check_message_flags::STATUS_CHECKS
     | check_message_flags::LOAD_FEE_PAYER_BALANCE
     | check_message_flags::LOAD_ADDRESS_LOOKUP_TABLES;
-
-/// Metadata retained by the scheduler for each transaction sent to a check worker.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(C)]
-pub(crate) struct TpuTransactionMeta {
-    pub(crate) priority: u64,
-    pub(crate) flags: u8,
-    pub(crate) src_addr: [u8; 16],
-}
-
-type Batch<'a> = TransactionPtrBatch<'a, TpuTransactionMeta, MAX_PACKETS_PER_CHECK_BATCH>;
 
 pub(crate) fn drain_tpu(
     tpu_to_scheduler: &mut shaq::spsc::Consumer<TpuToPackMessage>,
@@ -205,7 +196,7 @@ impl ReservedCheckWorkerBatch<'_> {
 }
 
 fn allocate_check_worker_batch(allocator: &Allocator) -> Option<CheckWorkerBatch> {
-    let allocation = allocator.allocate(Batch::TRANSACTION_META_END as u32)?;
+    let allocation = allocator.allocate(CheckBatch::TRANSACTION_META_END as u32)?;
     // SAFETY: `allocation` was allocated by this allocator immediately above.
     let transactions_offset = unsafe { allocator.offset(allocation) };
     // SAFETY: `transactions_offset` was obtained from this allocator immediately above.
@@ -219,7 +210,7 @@ fn allocate_check_worker_batch(allocator: &Allocator) -> Option<CheckWorkerBatch
     let transaction_metas = unsafe {
         allocator
             .ptr_from_offset(transactions_offset)
-            .byte_add(Batch::TRANSACTION_META_START)
+            .byte_add(CheckBatch::TRANSACTION_META_START)
             .cast::<TpuTransactionMeta>()
     };
 
@@ -394,8 +385,9 @@ mod tests {
                 MAX_PACKETS_PER_CHECK_BATCH
             );
             // SAFETY: the ingress function allocated this batch with the same metadata type.
-            let batch =
-                unsafe { Batch::from_sharable_transaction_batch_region(&message.batch, allocator) };
+            let batch = unsafe {
+                CheckBatch::from_sharable_transaction_batch_region(&message.batch, allocator)
+            };
             for (transaction_index, (_, meta)) in batch.iter().enumerate() {
                 assert!(meta.priority > 0);
                 assert_eq!(meta.flags, 0);

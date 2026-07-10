@@ -27,6 +27,7 @@ solana-fee = { workspace = true }
 solana-hash = { workspace = true }
 solana-runtime-transaction = { workspace = true }
 solana-transaction = { workspace = true }
+slab = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

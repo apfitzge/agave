@@ -13,11 +13,18 @@ use {
     },
 };
 
+mod check_response;
 mod config;
 mod progress_tracker;
+mod state_container;
 mod tpu_ingress;
+mod transaction;
 
 pub use config::{ConfigError, SchedulerConfig};
+
+const MAX_TPU_PACKETS_PER_ITERATION: usize = 1024;
+const MAX_CHECK_RESPONSE_BATCHES_PER_ITERATION: usize =
+    MAX_TPU_PACKETS_PER_ITERATION / transaction::MAX_PACKETS_PER_CHECK_BATCH;
 
 /// Connect to Agave's scheduler bindings service and run until `exit` is set.
 pub fn run(config: SchedulerConfig, exit: Arc<AtomicBool>) -> Result<(), SchedulerError> {
@@ -32,6 +39,8 @@ pub fn run(config: SchedulerConfig, exit: Arc<AtomicBool>) -> Result<(), Schedul
         config.handshake_timeout,
     )?;
     let mut state = SchedulerState::new();
+    let mut transaction_state =
+        state_container::StateContainer::new(config.transaction_state_capacity);
 
     while !exit.load(Ordering::Relaxed) {
         progress_tracker::drain_progress(&mut session.progress_tracker, &mut state);
@@ -39,14 +48,21 @@ pub fn run(config: SchedulerConfig, exit: Arc<AtomicBool>) -> Result<(), Schedul
             allocators,
             tpu_to_pack,
             pack_to_check_worker,
+            check_worker_to_pack,
             ..
         } = &mut session;
+        check_response::drain_check_responses(
+            check_worker_to_pack,
+            &allocators[0],
+            &mut transaction_state,
+            MAX_CHECK_RESPONSE_BATCHES_PER_ITERATION,
+        );
         tpu_ingress::drain_tpu(
             tpu_to_pack,
             pack_to_check_worker,
             &allocators[0],
             &state,
-            1024,
+            MAX_TPU_PACKETS_PER_ITERATION,
             |_, _| true,
         );
         thread::yield_now();

@@ -13,6 +13,7 @@ const DEFAULT_PACK_TO_WORKER_CAPACITY: usize = 256;
 const DEFAULT_WORKER_TO_PACK_CAPACITY: usize = 256;
 const DEFAULT_PACK_TO_CHECK_WORKER_CAPACITY: usize = 1 << 13;
 const DEFAULT_CHECK_WORKER_TO_PACK_CAPACITY: usize = 1 << 13;
+const DEFAULT_TRANSACTION_STATE_CAPACITY: usize = 1 << 17;
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// An invalid [`SchedulerConfig`] value.
@@ -38,6 +39,8 @@ pub enum ConfigError {
     PackToCheckWorkerCapacity { capacity: usize },
     #[error("check_worker_to_pack_capacity must be a non-zero power of two; got {capacity}")]
     CheckWorkerToPackCapacity { capacity: usize },
+    #[error("transaction_state_capacity must be greater than zero")]
+    ZeroTransactionStateCapacity,
     #[error("handshake_timeout must be greater than zero")]
     ZeroHandshakeTimeout,
 }
@@ -65,6 +68,8 @@ pub struct SchedulerConfig {
     pub pack_to_check_worker_capacity: usize,
     /// Capacity of the check-worker-to-scheduler queue.
     pub check_worker_to_pack_capacity: usize,
+    /// Maximum number of checked transactions retained for scheduling.
+    pub transaction_state_capacity: usize,
     /// Timeout for the Unix-socket scheduler-bindings handshake.
     pub handshake_timeout: Duration,
 }
@@ -83,6 +88,7 @@ impl SchedulerConfig {
             worker_to_pack_capacity: DEFAULT_WORKER_TO_PACK_CAPACITY,
             pack_to_check_worker_capacity: DEFAULT_PACK_TO_CHECK_WORKER_CAPACITY,
             check_worker_to_pack_capacity: DEFAULT_CHECK_WORKER_TO_PACK_CAPACITY,
+            transaction_state_capacity: DEFAULT_TRANSACTION_STATE_CAPACITY,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
         }
     }
@@ -118,6 +124,9 @@ impl SchedulerConfig {
         validate_queue_capacity(self.check_worker_to_pack_capacity, |capacity| {
             ConfigError::CheckWorkerToPackCapacity { capacity }
         })?;
+        if self.transaction_state_capacity == 0 {
+            return Err(ConfigError::ZeroTransactionStateCapacity);
+        }
         if self.handshake_timeout.is_zero() {
             return Err(ConfigError::ZeroHandshakeTimeout);
         }
@@ -182,6 +191,10 @@ mod tests {
             logon.check_worker_to_pack_capacity,
             DEFAULT_CHECK_WORKER_TO_PACK_CAPACITY
         );
+        assert_eq!(
+            config.transaction_state_capacity,
+            DEFAULT_TRANSACTION_STATE_CAPACITY
+        );
     }
 
     #[test]
@@ -192,6 +205,17 @@ mod tests {
         assert_eq!(
             config.validate(),
             Err(ConfigError::TpuToPackCapacity { capacity: 3 })
+        );
+    }
+
+    #[test]
+    fn rejects_zero_transaction_state_capacity() {
+        let mut config = SchedulerConfig::new("/tmp/scheduler-bindings.ipc");
+        config.transaction_state_capacity = 0;
+
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::ZeroTransactionStateCapacity)
         );
     }
 }

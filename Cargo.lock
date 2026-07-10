@@ -78,6 +78,7 @@ dependencies = [
  "agave-transaction-view",
  "rts-alloc",
  "shaq",
+ "slab",
  "solana-clock",
  "solana-compute-budget-interface",
  "solana-cost-model",
