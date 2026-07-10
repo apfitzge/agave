@@ -2,10 +2,8 @@
 //! External transaction scheduler implementation for Agave scheduler bindings.
 
 use {
-    agave_scheduling_utils::{
-        bridge::SchedulerBindingsBridge,
-        handshake::{ClientHandshakeError, client},
-    },
+    agave_scheduling_utils::handshake::{ClientHandshakeError, ClientSession, client},
+    progress_tracker::SchedulerState,
     std::{
         sync::{
             Arc,
@@ -16,16 +14,9 @@ use {
 };
 
 mod config;
+mod progress_tracker;
 
 pub use config::{ConfigError, SchedulerConfig};
-
-#[derive(Debug, thiserror::Error)]
-pub enum SchedulerError {
-    #[error("invalid scheduler config: {0}")]
-    Config(#[from] ConfigError),
-    #[error("scheduler bindings handshake failed: {0}")]
-    Handshake(#[from] ClientHandshakeError),
-}
 
 /// Connect to Agave's scheduler bindings service and run until `exit` is set.
 pub fn run(config: SchedulerConfig, exit: Arc<AtomicBool>) -> Result<(), SchedulerError> {
@@ -39,13 +30,39 @@ pub fn run(config: SchedulerConfig, exit: Arc<AtomicBool>) -> Result<(), Schedul
         config.client_logon(),
         config.handshake_timeout,
     )?;
-    let _bridge = SchedulerBindingsBridge::<()>::new(session);
+    let mut scheduler = Scheduler::new(session);
 
     while !exit.load(Ordering::Relaxed) {
+        progress_tracker::drain_progress(
+            &mut scheduler.session.progress_tracker,
+            &mut scheduler.state,
+        );
         thread::yield_now();
     }
 
     Ok(())
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SchedulerError {
+    #[error("invalid scheduler config: {0}")]
+    Config(#[from] ConfigError),
+    #[error("scheduler bindings handshake failed: {0}")]
+    Handshake(#[from] ClientHandshakeError),
+}
+
+struct Scheduler {
+    session: ClientSession,
+    state: SchedulerState,
+}
+
+impl Scheduler {
+    fn new(session: ClientSession) -> Self {
+        Self {
+            session,
+            state: SchedulerState::new(),
+        }
+    }
 }
 
 #[cfg(test)]

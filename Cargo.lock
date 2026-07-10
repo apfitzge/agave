@@ -72,7 +72,11 @@ dependencies = [
 name = "agave-block-production-scheduler"
 version = "4.3.0-alpha.0"
 dependencies = [
+ "agave-feature-set",
+ "agave-scheduler-bindings",
  "agave-scheduling-utils",
+ "shaq",
+ "solana-clock",
  "tempfile",
  "thiserror 2.0.18",
 ]
