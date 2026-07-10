@@ -87,6 +87,7 @@ members = [
     "rpc-test",
     "runtime",
     "runtime-transaction",
+    "block-production-scheduler",
     "scheduler-bindings",
     "scheduling-utils",
     "send-transaction-service",
