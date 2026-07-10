@@ -15,6 +15,7 @@ use {
 
 mod config;
 mod progress_tracker;
+mod tpu_ingress;
 
 pub use config::{ConfigError, SchedulerConfig};
 
@@ -25,17 +26,28 @@ pub fn run(config: SchedulerConfig, exit: Arc<AtomicBool>) -> Result<(), Schedul
         return Ok(());
     }
 
-    let session = client::connect(
+    let mut session = client::connect(
         &config.bindings_ipc,
         config.client_logon(),
         config.handshake_timeout,
     )?;
-    let mut scheduler = Scheduler::new(session);
+    let mut state = SchedulerState::new();
 
     while !exit.load(Ordering::Relaxed) {
-        progress_tracker::drain_progress(
-            &mut scheduler.session.progress_tracker,
-            &mut scheduler.state,
+        progress_tracker::drain_progress(&mut session.progress_tracker, &mut state);
+        let ClientSession {
+            allocators,
+            tpu_to_pack,
+            pack_to_check_worker,
+            ..
+        } = &mut session;
+        tpu_ingress::drain_tpu(
+            tpu_to_pack,
+            pack_to_check_worker,
+            &allocators[0],
+            &state,
+            1024,
+            |_, _| true,
         );
         thread::yield_now();
     }
@@ -49,20 +61,6 @@ pub enum SchedulerError {
     Config(#[from] ConfigError),
     #[error("scheduler bindings handshake failed: {0}")]
     Handshake(#[from] ClientHandshakeError),
-}
-
-struct Scheduler {
-    session: ClientSession,
-    state: SchedulerState,
-}
-
-impl Scheduler {
-    fn new(session: ClientSession) -> Self {
-        Self {
-            session,
-            state: SchedulerState::new(),
-        }
-    }
 }
 
 #[cfg(test)]

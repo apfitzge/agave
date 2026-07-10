@@ -59,6 +59,10 @@ impl SchedulerState {
             _ => false,
         }
     }
+
+    pub(crate) fn feature_set(&self) -> &FeatureSet {
+        &self.feature_set
+    }
 }
 
 pub(crate) fn drain_progress(
