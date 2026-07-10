@@ -71,6 +71,8 @@ where
             pack_to_worker_capacity: worker_req_cap,
             worker_to_pack_capacity: 1024,
             flags: 0,
+            pack_to_check_worker_capacity: worker_req_cap,
+            check_worker_to_pack_capacity: 1024,
         };
 
         let (agave, files) = Server::setup_session(logon).unwrap();

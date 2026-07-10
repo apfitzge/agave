@@ -41,6 +41,10 @@ pub struct ClientLogon {
     pub worker_to_pack_capacity: usize,
     /// Flags that control the behavior of the new scheduling session.
     pub flags: u16,
+    /// The minimum capacity of the scheduler-to-check-worker queue in messages.
+    pub pack_to_check_worker_capacity: usize,
+    /// The minimum capacity of the check-worker-to-scheduler queue in messages.
+    pub check_worker_to_pack_capacity: usize,
     // NB: If adding more fields please ensure:
     // - The fields are zeroable.
     // - If possible the fields are backwards compatible:

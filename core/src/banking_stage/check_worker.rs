@@ -770,6 +770,8 @@ mod tests {
             pack_to_worker_capacity: 16,
             worker_to_pack_capacity: 16,
             flags: 0,
+            pack_to_check_worker_capacity: 16,
+            check_worker_to_pack_capacity: 16,
         };
         let (_agave_session, files) = Server::setup_session(logon).unwrap();
         let mut client_session = client::setup_session(&logon, files).unwrap();

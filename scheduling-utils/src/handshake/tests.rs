@@ -176,6 +176,8 @@ fn message_passing_on_all_queues() {
                 pack_to_worker_capacity: 1024,
                 worker_to_pack_capacity: 1024,
                 flags: 0,
+                pack_to_check_worker_capacity: 1024,
+                check_worker_to_pack_capacity: 1024,
             },
             Duration::from_secs(1),
         )
@@ -272,6 +274,48 @@ fn message_passing_on_all_queues() {
 }
 
 #[test]
+fn check_worker_queues_use_dedicated_capacities() {
+    const CHECK_REQUEST_CAPACITY: usize = 1 << 18;
+    const CHECK_RESPONSE_CAPACITY: usize = 1 << 19;
+
+    let logon = ClientLogon {
+        worker_count: 1,
+        check_worker_count: 1,
+        allocator_size: 64 * 1024 * 1024,
+        allocator_handles: 1,
+        tpu_to_pack_capacity: 2,
+        progress_tracker_capacity: 2,
+        pack_to_worker_capacity: 2,
+        worker_to_pack_capacity: 2,
+        flags: 0,
+        pack_to_check_worker_capacity: CHECK_REQUEST_CAPACITY,
+        check_worker_to_pack_capacity: CHECK_RESPONSE_CAPACITY,
+    };
+    let (agave, files) = Server::setup_session(logon).unwrap();
+
+    // The first five files are the global shared-memory regions. Check worker queues are
+    // positions three and four; `ClientSession::setup_session` relies on this same ordering.
+    assert!(
+        files[3].metadata().unwrap().len()
+            >= u64::try_from(shaq::mpmc::minimum_file_size::<PackToCheckWorkerMessage>(
+                CHECK_REQUEST_CAPACITY
+            ))
+            .unwrap()
+    );
+    assert!(
+        files[4].metadata().unwrap().len()
+            >= u64::try_from(shaq::mpmc::minimum_file_size::<CheckWorkerToPackMessage>(
+                CHECK_RESPONSE_CAPACITY
+            ))
+            .unwrap()
+    );
+
+    let client = crate::handshake::client::setup_session(&logon, files).unwrap();
+    assert_eq!(agave.check_workers.len(), 1);
+    assert_eq!(client.workers.len(), 1);
+}
+
+#[test]
 fn accept_worker_count_max() {
     let ipc = NamedTempFile::new().unwrap();
     std::fs::remove_file(ipc.path()).unwrap();
@@ -294,6 +338,8 @@ fn accept_worker_count_max() {
                 pack_to_worker_capacity: 1024,
                 worker_to_pack_capacity: 1024,
                 flags: 0,
+                pack_to_check_worker_capacity: 1024,
+                check_worker_to_pack_capacity: 1024,
             },
             Duration::from_secs(1),
         );
@@ -330,6 +376,8 @@ fn reject_worker_count_low() {
                 pack_to_worker_capacity: 1024,
                 worker_to_pack_capacity: 1024,
                 flags: 0,
+                pack_to_check_worker_capacity: 1024,
+                check_worker_to_pack_capacity: 1024,
             },
             Duration::from_secs(1),
         );
@@ -369,6 +417,8 @@ fn reject_worker_count_high() {
                 pack_to_worker_capacity: 1024,
                 worker_to_pack_capacity: 1024,
                 flags: 0,
+                pack_to_check_worker_capacity: 1024,
+                check_worker_to_pack_capacity: 1024,
             },
             Duration::from_secs(1),
         );
@@ -408,6 +458,8 @@ fn reject_check_worker_count_low() {
                 pack_to_worker_capacity: 1024,
                 worker_to_pack_capacity: 1024,
                 flags: 0,
+                pack_to_check_worker_capacity: 1024,
+                check_worker_to_pack_capacity: 1024,
             },
             Duration::from_secs(1),
         );
@@ -447,6 +499,8 @@ fn reject_check_worker_count_high() {
                 pack_to_worker_capacity: 1024,
                 worker_to_pack_capacity: 1024,
                 flags: 0,
+                pack_to_check_worker_capacity: 1024,
+                check_worker_to_pack_capacity: 1024,
             },
             Duration::from_secs(1),
         );

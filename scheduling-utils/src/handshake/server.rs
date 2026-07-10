@@ -162,10 +162,11 @@ impl Server {
             Self::create_producer(logon.tpu_to_pack_capacity, true)?;
         let (progress_tracker_file, progress_tracker) =
             Self::create_producer(logon.progress_tracker_capacity, false)?;
-        let (pack_to_check_worker_file, _) =
-            Self::create_mpmc_consumer::<PackToCheckWorkerMessage>(logon.pack_to_worker_capacity)?;
+        let (pack_to_check_worker_file, _) = Self::create_mpmc_consumer::<PackToCheckWorkerMessage>(
+            logon.pack_to_check_worker_capacity,
+        )?;
         let (check_worker_to_pack_file, _) = Self::create_mpmc_producer::<CheckWorkerToPackMessage>(
-            logon.worker_to_pack_capacity,
+            logon.check_worker_to_pack_capacity,
             true,
         )?;
 
