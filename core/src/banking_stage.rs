@@ -773,10 +773,12 @@ mod external {
 
                 (poh.shared_leader_state(), poh.ticks_per_slot())
             };
+            let sharable_banks = self.bank_forks.read().unwrap().sharable_banks();
             threads.push(progress_tracker::spawn(
                 self.worker_exit_signal.clone(),
                 progress_tracker,
                 shared_leader_state,
+                sharable_banks,
                 worker_metrics,
                 ticks_per_slot,
             ));

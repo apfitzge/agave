@@ -185,8 +185,8 @@ pub mod scheduler_feature_flags {
     /// Account for `CreateAccountAllowPrefund` when estimating transaction cost.
     pub const CREATE_ACCOUNT_ALLOW_PREFUND: u64 = 1 << 1;
 
-    /// Use the migrated builtin cost model when deriving default compute-unit limits.
-    pub const MIGRATING_BUILTIN_COSTS: u64 = 1 << 2;
+    /// The BLS vote-account pubkey management feature is active.
+    pub const BLS_PUBKEY_MANAGEMENT_IN_VOTE_ACCOUNT: u64 = 1 << 2;
 }
 
 /// Message: [Agave -> Pack]

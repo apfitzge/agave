@@ -4,12 +4,15 @@ use {
         pubkeys_ptr::PubkeysPtr,
         transaction_ptr::{TransactionPtr, TransactionPtrBatch},
     },
-    agave_feature_set::FeatureSet,
+    agave_feature_set::{
+        FeatureSet, bls_pubkey_management_in_vote_account, create_account_allow_prefund,
+        limit_instruction_accounts,
+    },
     agave_scheduler_bindings::{
         CheckWorkerToPackMessage, ExecutionWorkerToPackMessage, MAX_TRANSACTIONS_PER_MESSAGE,
         PackToCheckWorkerMessage, PackToExecutionWorkerMessage, ProgressMessage,
         SharableTransactionBatchRegion, SharableTransactionRegion, TpuToPackMessage,
-        processed_codes, tpu_message_flags,
+        processed_codes, scheduler_feature_flags, tpu_message_flags,
         worker_message_types::{self, CheckResponse, ExecutionResponse},
     },
     agave_transaction_view::{
@@ -92,12 +95,7 @@ where
                 latest_blockhash: [0; 32],
                 scheduler_features: agave_scheduler_bindings::scheduler_feature_flags::NONE,
             },
-            runtime: RuntimeState {
-                feature_set: FeatureSet::all_enabled(),
-                fee_features: FeeFeatures {},
-                lamports_per_signature: 5000,
-                burn_percent: 50,
-            },
+            runtime: RuntimeState::from_scheduler_features(scheduler_feature_flags::NONE),
             state: SlotMap::default(),
 
             _marker: core::marker::PhantomData,
@@ -229,6 +227,8 @@ where
         let mut received = false;
         while let Some(msg) = self.progress_tracker.try_read() {
             self.progress = *msg;
+            self.runtime
+                .set_scheduler_features(self.progress.scheduler_features);
             received = true;
         }
         self.progress_tracker.finalize();
@@ -263,8 +263,15 @@ where
             };
 
             // Sanitize the transaction, drop it immediately if it fails sanitization.
-            let Ok(tx) = SanitizedTransactionView::try_new_sanitized(tx, &sanitize_config(true))
-            else {
+            let Ok(tx) = SanitizedTransactionView::try_new_sanitized(
+                tx,
+                &sanitize_config(
+                    self.runtime
+                        .feature_set
+                        .snapshot()
+                        .limit_instruction_accounts,
+                ),
+            ) else {
                 // SAFETY:
                 // - We own `tx` exclusively.
                 // - The previous `TransactionPtr` has been dropped by `try_new_sanitized`.
@@ -737,6 +744,36 @@ pub struct RuntimeState {
     pub burn_percent: u64,
 }
 
+impl RuntimeState {
+    fn from_scheduler_features(scheduler_features: u64) -> Self {
+        let mut runtime = Self {
+            feature_set: FeatureSet::default(),
+            fee_features: FeeFeatures {},
+            lamports_per_signature: 5000,
+            burn_percent: 50,
+        };
+        runtime.set_scheduler_features(scheduler_features);
+        runtime
+    }
+
+    fn set_scheduler_features(&mut self, scheduler_features: u64) {
+        let mut feature_set = FeatureSet::default();
+        if scheduler_features & scheduler_feature_flags::LIMIT_INSTRUCTION_ACCOUNTS != 0 {
+            feature_set.activate(&limit_instruction_accounts::id(), 0);
+        }
+        if scheduler_features & scheduler_feature_flags::CREATE_ACCOUNT_ALLOW_PREFUND != 0 {
+            feature_set.activate(&create_account_allow_prefund::id(), 0);
+        }
+        if scheduler_features & scheduler_feature_flags::BLS_PUBKEY_MANAGEMENT_IN_VOTE_ACCOUNT != 0
+        {
+            feature_set.activate(&bls_pubkey_management_in_vote_account::id(), 0);
+        }
+
+        self.fee_features = FeeFeatures::from(&feature_set);
+        self.feature_set = feature_set;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScheduleBatch<T> {
     pub worker: usize,
@@ -867,4 +904,23 @@ pub enum TransactionInsertError {
     ParseSanitize(TransactionViewError),
     #[error("Failed to allocate")]
     Allocate,
+}
+
+#[cfg(test)]
+mod tests {
+    use {super::*, agave_scheduler_bindings::scheduler_feature_flags};
+
+    #[test]
+    fn runtime_state_uses_scheduler_feature_mask() {
+        let runtime = RuntimeState::from_scheduler_features(
+            scheduler_feature_flags::LIMIT_INSTRUCTION_ACCOUNTS
+                | scheduler_feature_flags::CREATE_ACCOUNT_ALLOW_PREFUND
+                | scheduler_feature_flags::BLS_PUBKEY_MANAGEMENT_IN_VOTE_ACCOUNT,
+        );
+        let snapshot = runtime.feature_set.snapshot();
+
+        assert!(snapshot.limit_instruction_accounts);
+        assert!(snapshot.create_account_allow_prefund);
+        assert!(snapshot.bls_pubkey_management_in_vote_account);
+    }
 }
