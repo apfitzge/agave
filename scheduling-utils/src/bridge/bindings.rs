@@ -90,6 +90,7 @@ where
                 leader_range_end: u64::MAX,
                 remaining_cost_units: 0,
                 latest_blockhash: [0; 32],
+                scheduler_features: agave_scheduler_bindings::scheduler_feature_flags::NONE,
             },
             runtime: RuntimeState {
                 feature_set: FeatureSet::all_enabled(),

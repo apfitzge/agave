@@ -171,6 +171,24 @@ pub const LEADER_STARTING: u8 = 1;
 /// Transactions can be processed in this state.
 pub const LEADER_READY: u8 = 2;
 
+/// Scheduler-specific feature flags carried in [`ProgressMessage::scheduler_features`].
+///
+/// These flags intentionally cover only feature gates that affect external scheduler parsing,
+/// priority, or cost estimation. They do not represent Agave's complete feature set.
+pub mod scheduler_feature_flags {
+    /// No scheduler-specific features are active.
+    pub const NONE: u64 = 0;
+
+    /// Enforce the instruction-account limit while sanitizing transactions.
+    pub const LIMIT_INSTRUCTION_ACCOUNTS: u64 = 1 << 0;
+
+    /// Account for `CreateAccountAllowPrefund` when estimating transaction cost.
+    pub const CREATE_ACCOUNT_ALLOW_PREFUND: u64 = 1 << 1;
+
+    /// Use the migrated builtin cost model when deriving default compute-unit limits.
+    pub const MIGRATING_BUILTIN_COSTS: u64 = 1 << 2;
+}
+
 /// Message: [Agave -> Pack]
 /// Agave passes leader status to the external pack process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,6 +228,11 @@ pub struct ProgressMessage {
     /// The latest blockhash of the working bank.
     /// Only valid if `leader_state == LEADER_READY`, otherwise zeroed.
     pub latest_blockhash: [u8; 32],
+    /// Scheduler-specific feature gates active for the current epoch.
+    ///
+    /// The value is always populated, including while not leader. See
+    /// [`scheduler_feature_flags`] for the supported bits.
+    pub scheduler_features: u64,
 }
 
 /// Maximum number of transactions allowed in a [`PackToExecutionWorkerMessage`].

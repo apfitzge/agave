@@ -130,6 +130,7 @@ impl ProgressTracker {
                 leader_range_end: next_leader_range_end,
                 remaining_cost_units: self.remaining_block_cost(),
                 latest_blockhash: working_bank.last_blockhash().to_bytes(),
+                scheduler_features: agave_scheduler_bindings::scheduler_feature_flags::NONE,
             }
         } else {
             let current_slot = slot_from_tick_height(tick_height, self.ticks_per_slot);
@@ -151,6 +152,7 @@ impl ProgressTracker {
                 leader_range_end: next_leader_range_end,
                 remaining_cost_units: 0,
                 latest_blockhash: [0; 32],
+                scheduler_features: agave_scheduler_bindings::scheduler_feature_flags::NONE,
             }
         };
 

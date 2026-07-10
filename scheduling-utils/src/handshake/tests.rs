@@ -36,6 +36,7 @@ fn message_passing_on_all_queues() {
         leader_range_end: 16,
         remaining_cost_units: 12_000_000,
         latest_blockhash: [42; 32],
+        scheduler_features: agave_scheduler_bindings::scheduler_feature_flags::NONE,
     };
     let pack_to_worker = PackToExecutionWorkerMessage {
         flags: 123,
