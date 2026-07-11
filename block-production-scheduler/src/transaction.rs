@@ -7,6 +7,7 @@ pub(crate) const MAX_PACKETS_PER_CHECK_BATCH: usize = 16;
 #[repr(C)]
 pub(crate) struct TpuTransactionMeta {
     pub(crate) priority: u64,
+    pub(crate) cost: u64,
     pub(crate) flags: u8,
     pub(crate) src_addr: [u8; 16],
 }

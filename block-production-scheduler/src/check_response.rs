@@ -179,6 +179,7 @@ mod tests {
             transaction_regions.write(transaction);
             transaction_metas.write(TpuTransactionMeta {
                 priority,
+                cost: 0,
                 flags: 0,
                 src_addr: [0; 16],
             });

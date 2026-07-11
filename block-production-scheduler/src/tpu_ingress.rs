@@ -76,8 +76,11 @@ pub(crate) fn drain_tpu(
             let meta =
                 match SanitizedTransactionView::try_new_sanitized(transaction, &sanitize_config) {
                     Ok(transaction) => {
+                        let (priority, cost) =
+                            calculate_priority_and_cost(state, &transaction, message.flags);
                         let meta = TpuTransactionMeta {
-                            priority: calculate_priority(state, &transaction, message.flags),
+                            priority,
+                            cost,
                             flags: message.flags,
                             src_addr: message.src_addr,
                         };
@@ -221,20 +224,20 @@ fn allocate_check_worker_batch(allocator: &Allocator) -> Option<CheckWorkerBatch
     })
 }
 
-fn calculate_priority(
+fn calculate_priority_and_cost(
     state: &SchedulerState,
     transaction: &SanitizedTransactionView<TransactionPtr>,
     flags: u8,
-) -> u64 {
+) -> (u64, u64) {
     let Ok(transaction) = RuntimeTransaction::<&SanitizedTransactionView<TransactionPtr>>::try_new(
         transaction,
         MessageHash::Precomputed(Hash::default()),
         Some(flags & tpu_message_flags::IS_SIMPLE_VOTE != 0),
     ) else {
-        return 0;
+        return (0, 0);
     };
     let Ok(configuration) = transaction.transaction_configuration(state.feature_set()) else {
-        return 0;
+        return (0, 0);
     };
 
     let cost = CostModel::calculate_cost_for_executed_transaction(
@@ -260,9 +263,12 @@ fn calculate_priority(
     );
 
     #[allow(clippy::arithmetic_side_effects)]
-    reward
-        .saturating_mul(PRIORITY_MULTIPLIER)
-        .wrapping_div(cost.saturating_add(1))
+    (
+        reward
+            .saturating_mul(PRIORITY_MULTIPLIER)
+            .wrapping_div(cost.saturating_add(1)),
+        cost,
+    )
 }
 
 fn drop_tpu_packets(
@@ -538,8 +544,8 @@ mod tests {
             &sanitize_config(state.feature_set().snapshot().limit_instruction_accounts),
         )
         .unwrap();
-        let low = calculate_priority(&state, &low_transaction, 0);
-        let high = calculate_priority(&state, &high_transaction, 0);
+        let (low, _) = calculate_priority_and_cost(&state, &low_transaction, 0);
+        let (high, _) = calculate_priority_and_cost(&state, &high_transaction, 0);
 
         assert!(high > low, "higher CU price should produce higher priority");
 
