@@ -15,6 +15,7 @@ use {
 
 mod check_response;
 mod config;
+mod in_flight;
 mod progress_tracker;
 mod state_container;
 mod tpu_ingress;
