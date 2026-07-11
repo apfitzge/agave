@@ -14,6 +14,8 @@ pub(crate) struct SchedulerState {
     leader_state: u8,
     current_slot: u64,
     next_leader_slot: u64,
+    remaining_cost_units: u64,
+    target_scheduled_cus: u64,
     feature_set: FeatureSet,
 }
 
@@ -23,14 +25,22 @@ impl SchedulerState {
             leader_state: NOT_LEADER,
             current_slot: 0,
             next_leader_slot: u64::MAX,
+            remaining_cost_units: 0,
+            target_scheduled_cus: 0,
             feature_set: FeatureSet::default(),
         }
     }
 
     pub(crate) fn update(&mut self, progress: &ProgressMessage) {
+        let is_first_ready_progress = progress.leader_state == LEADER_READY
+            && (self.leader_state != LEADER_READY || self.current_slot != progress.current_slot);
         self.leader_state = progress.leader_state;
         self.current_slot = progress.current_slot;
         self.next_leader_slot = progress.next_leader_slot;
+        self.remaining_cost_units = progress.remaining_cost_units;
+        if is_first_ready_progress {
+            self.target_scheduled_cus = progress.remaining_cost_units / 4;
+        }
         self.feature_set = feature_set_from_scheduler_features(progress.scheduler_features);
         debug_assert!(
             !self.can_process_transactions() || self.should_accept_packets(),
@@ -165,6 +175,35 @@ mod tests {
         assert!(snapshot.limit_instruction_accounts);
         assert!(snapshot.create_account_allow_prefund);
         assert!(snapshot.bls_pubkey_management_in_vote_account);
+    }
+
+    #[test]
+    fn retains_target_scheduled_cus_for_the_leader_bank() {
+        let mut state = SchedulerState::new();
+        let mut starting = progress_message(LEADER_STARTING, 100, 0, 104);
+        starting.remaining_cost_units = 0;
+        state.update(&starting);
+        assert_eq!(state.target_scheduled_cus, 0);
+
+        let mut first_ready = progress_message(LEADER_READY, 100, 50, 104);
+        first_ready.remaining_cost_units = 40;
+        state.update(&first_ready);
+        assert_eq!(state.target_scheduled_cus, 10);
+
+        let mut later = progress_message(LEADER_READY, 100, 60, 104);
+        later.remaining_cost_units = 4;
+        state.update(&later);
+        assert_eq!(state.target_scheduled_cus, 10);
+
+        let mut next_bank = progress_message(LEADER_STARTING, 101, 0, 105);
+        next_bank.remaining_cost_units = 0;
+        state.update(&next_bank);
+        assert_eq!(state.target_scheduled_cus, 10);
+
+        let mut next_ready = progress_message(LEADER_READY, 101, 1, 105);
+        next_ready.remaining_cost_units = 80;
+        state.update(&next_ready);
+        assert_eq!(state.target_scheduled_cus, 20);
     }
 
     #[test]
