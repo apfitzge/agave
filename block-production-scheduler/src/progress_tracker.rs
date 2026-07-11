@@ -123,6 +123,7 @@ mod tests {
             remaining_cost_units: 48_000_000,
             latest_blockhash: [7; 32],
             scheduler_features: scheduler_feature_flags::NONE,
+            target_bank_time_ms: 0,
         }
     }
 

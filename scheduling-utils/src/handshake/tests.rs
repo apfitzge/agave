@@ -37,6 +37,7 @@ fn message_passing_on_all_queues() {
         remaining_cost_units: 12_000_000,
         latest_blockhash: [42; 32],
         scheduler_features: agave_scheduler_bindings::scheduler_feature_flags::NONE,
+        target_bank_time_ms: 0,
     };
     let pack_to_worker = PackToExecutionWorkerMessage {
         flags: 123,
