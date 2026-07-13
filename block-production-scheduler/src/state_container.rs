@@ -11,10 +11,7 @@ use {
 };
 
 /// A transaction that has passed external check-worker validation.
-#[allow(
-    dead_code,
-    reason = "the following scheduling stage consumes checked transactions from this container"
-)]
+#[allow(dead_code)]
 pub(crate) struct CheckedTransaction {
     pub(crate) transaction: TransactionPtr,
     pub(crate) meta: TpuTransactionMeta,
@@ -27,7 +24,8 @@ pub(crate) struct TransactionPriorityId {
     id: usize,
 }
 
-/// Owns checked transactions and orders them by priority for scheduling.
+/// Owns checked transactions for their entire scheduler lifetime and orders queued ones by
+/// priority.
 pub(crate) struct StateContainer {
     capacity: usize,
     transactions: Slab<CheckedTransaction>,
@@ -45,9 +43,14 @@ impl StateContainer {
     }
 
     /// Inserts a checked transaction and returns any transaction evicted for capacity.
+    ///
+    /// In-flight transactions remain in the slab but not the priority queue, so they are never
+    /// evicted to make room for a new transaction.
     pub(crate) fn push(&mut self, transaction: CheckedTransaction) -> Option<CheckedTransaction> {
         if self.transactions.len() == self.capacity {
-            let lowest_priority = *self.queue.first().expect("full state has a queued entry");
+            let Some(lowest_priority) = self.queue.first().copied() else {
+                return Some(transaction);
+            };
             if transaction.meta.priority < lowest_priority.priority {
                 return Some(transaction);
             }
@@ -74,7 +77,7 @@ impl StateContainer {
 
     /// Iterates in descending priority order, resuming strictly below `cursor` when present.
     ///
-    /// The caller must collect selected IDs and remove them only after this iterator is dropped.
+    /// The caller must collect selected IDs and dequeue them only after this iterator is dropped.
     /// When the iterator reaches the bottom of the queue, the caller resets its cursor to `None`
     /// before the next scan.
     #[allow(dead_code)]
@@ -96,25 +99,37 @@ impl StateContainer {
         &self.transactions[priority_id.id]
     }
 
-    /// Removes a transaction selected during a completed priority scan.
+    /// Removes a selected transaction from the priority queue while it is in flight.
     #[allow(dead_code)]
-    pub(crate) fn remove(&mut self, priority_id: TransactionPriorityId) -> CheckedTransaction {
+    pub(crate) fn dequeue(&mut self, priority_id: TransactionPriorityId) {
         assert!(
             self.queue.remove(&priority_id),
             "selected transaction must remain queued until removed"
         );
+    }
+
+    /// Removes a terminal transaction from scheduler state.
+    #[allow(dead_code)]
+    pub(crate) fn remove(&mut self, priority_id: TransactionPriorityId) -> CheckedTransaction {
+        self.queue.remove(&priority_id);
         self.transactions.remove(priority_id.id)
     }
 
     #[cfg(test)]
     pub(crate) fn pop(&mut self) -> Option<CheckedTransaction> {
         let priority_id = *self.queue.last()?;
+        self.dequeue(priority_id);
         Some(self.remove(priority_id))
     }
 
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.queue.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn buffer_len(&self) -> usize {
+        self.transactions.len()
     }
 }
 
@@ -142,7 +157,7 @@ mod tests {
     }
 
     #[test]
-    fn descending_scan_resumes_after_removed_cursor() {
+    fn descending_scan_resumes_after_dequeued_cursor() {
         let mut container = StateContainer::new(4);
         for priority in [5, 10, 5, 1] {
             assert!(container.push(checked_transaction(priority)).is_none());
@@ -165,12 +180,12 @@ mod tests {
             }
         }
 
-        // The iterator's immutable borrow has ended, so remove from both the priority queue and
-        // the slab in a separate pass.
+        // The iterator's immutable borrow has ended, so dequeue selected IDs in a separate pass.
         for priority_id in removal_ids {
-            container.remove(priority_id);
+            container.dequeue(priority_id);
         }
         assert_eq!(container.len(), 2);
+        assert_eq!(container.buffer_len(), 4);
 
         let remaining_priorities = container
             .descending_from(cursor.as_ref())
@@ -184,5 +199,25 @@ mod tests {
             .unwrap();
         assert!(container.descending_from(Some(&bottom)).next().is_none());
         assert_eq!(container.descending_from(None).next().unwrap().priority, 5);
+    }
+
+    #[test]
+    fn does_not_evict_in_flight_transactions() {
+        let mut container = StateContainer::new(2);
+        container.push(checked_transaction(10));
+        container.push(checked_transaction(5));
+
+        let in_flight = *container.descending_from(None).next().unwrap();
+        container.dequeue(in_flight);
+        let dropped = container.push(checked_transaction(7)).unwrap();
+        assert_eq!(dropped.meta.priority, 5);
+        assert_eq!(container.get(in_flight).meta.priority, 10);
+        assert_eq!(container.buffer_len(), 2);
+
+        let queued = *container.descending_from(None).next().unwrap();
+        container.dequeue(queued);
+        let dropped = container.push(checked_transaction(1)).unwrap();
+        assert_eq!(dropped.meta.priority, 1);
+        assert_eq!(container.buffer_len(), 2);
     }
 }
