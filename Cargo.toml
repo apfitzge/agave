@@ -88,6 +88,7 @@ members = [
     "runtime",
     "runtime-transaction",
     "block-production-scheduler",
+    "block-production-scheduler-load-test",
     "scheduler-bindings",
     "scheduling-utils",
     "send-transaction-service",

@@ -103,6 +103,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "agave-block-production-scheduler-load-test"
+version = "4.3.0-alpha.0"
+dependencies = [
+ "agave-scheduler-bindings",
+ "agave-scheduling-utils",
+ "agave-votor-messages",
+ "crossbeam-channel",
+ "rts-alloc",
+ "shaq",
+ "solana-core",
+ "solana-leader-schedule",
+ "solana-ledger",
+ "solana-poh",
+ "solana-poh-config",
+ "solana-pubkey 4.2.0",
+ "solana-runtime",
+ "solana-signer",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "agave-bls-cert-verify"
 version = "4.3.0-alpha.0"
 dependencies = [
