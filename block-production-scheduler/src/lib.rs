@@ -17,6 +17,7 @@ mod check_response;
 mod config;
 mod in_flight;
 mod progress_tracker;
+mod resolved_transaction;
 mod state_container;
 mod tpu_ingress;
 mod transaction;

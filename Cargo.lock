@@ -90,6 +90,7 @@ dependencies = [
  "solana-pubkey 4.2.0",
  "solana-runtime-transaction",
  "solana-signer",
+ "solana-svm-transaction",
  "solana-system-interface 3.2.0",
  "solana-transaction",
  "tempfile",
