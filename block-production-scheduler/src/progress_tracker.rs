@@ -18,6 +18,7 @@ pub(crate) struct SchedulerState {
     current_slot: u64,
     next_leader_slot: u64,
     remaining_cost_units: u64,
+    initial_remaining_cost_units: u64,
     target_scheduled_cus: u64,
     target_bank_time_ms: u16,
     feature_set: FeatureSet,
@@ -31,6 +32,7 @@ impl SchedulerState {
             current_slot: 0,
             next_leader_slot: u64::MAX,
             remaining_cost_units: 0,
+            initial_remaining_cost_units: 0,
             target_scheduled_cus: 0,
             target_bank_time_ms: 0,
             feature_set: FeatureSet::default(),
@@ -46,6 +48,7 @@ impl SchedulerState {
         self.next_leader_slot = progress.next_leader_slot;
         self.remaining_cost_units = progress.remaining_cost_units;
         if is_first_ready_progress {
+            self.initial_remaining_cost_units = progress.remaining_cost_units;
             self.target_scheduled_cus = progress.remaining_cost_units / 4;
             self.target_bank_time_ms = progress.target_bank_time_ms;
         }
@@ -89,22 +92,22 @@ impl SchedulerState {
         &self.reserved_account_keys.active
     }
 
-    #[allow(dead_code)]
     pub(crate) fn current_slot(&self) -> u64 {
         self.current_slot
     }
 
-    #[allow(dead_code)]
     pub(crate) fn remaining_cost_units(&self) -> u64 {
         self.remaining_cost_units
     }
 
-    #[allow(dead_code)]
+    pub(crate) fn initial_remaining_cost_units(&self) -> u64 {
+        self.initial_remaining_cost_units
+    }
+
     pub(crate) fn target_scheduled_cus(&self) -> u64 {
         self.target_scheduled_cus
     }
 
-    #[allow(dead_code)]
     pub(crate) fn target_bank_time_ms(&self) -> u16 {
         self.target_bank_time_ms
     }
@@ -223,6 +226,7 @@ mod tests {
         let mut first_ready = progress_message(LEADER_READY, 100, 50, 104);
         first_ready.remaining_cost_units = 40;
         state.update(&first_ready);
+        assert_eq!(state.initial_remaining_cost_units(), 40);
         assert_eq!(state.target_scheduled_cus, 10);
         assert_eq!(state.target_bank_time_ms(), 400);
 
@@ -230,6 +234,7 @@ mod tests {
         later.remaining_cost_units = 4;
         later.target_bank_time_ms = 300;
         state.update(&later);
+        assert_eq!(state.initial_remaining_cost_units(), 40);
         assert_eq!(state.target_scheduled_cus, 10);
         assert_eq!(state.target_bank_time_ms(), 400);
 
@@ -242,6 +247,7 @@ mod tests {
         next_ready.remaining_cost_units = 80;
         next_ready.target_bank_time_ms = 500;
         state.update(&next_ready);
+        assert_eq!(state.initial_remaining_cost_units(), 80);
         assert_eq!(state.target_scheduled_cus, 20);
         assert_eq!(state.target_bank_time_ms(), 500);
     }

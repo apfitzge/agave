@@ -3,6 +3,7 @@
 
 use {
     agave_scheduling_utils::{
+        cost_pacer::CostPacer,
         handshake::{ClientHandshakeError, ClientSession, client},
         thread_aware_account_locks::ThreadAwareAccountLocks,
     },
@@ -13,6 +14,7 @@ use {
             atomic::{AtomicBool, Ordering},
         },
         thread,
+        time::{Duration, Instant},
     },
 };
 
@@ -65,8 +67,10 @@ fn run_session(config: SchedulerConfig, mut session: ClientSession, exit: Arc<At
         config.transaction_state_capacity,
         config.execution_worker_count,
     );
+    let mut cost_pacer: Option<(u64, CostPacer)> = None;
 
     while !exit.load(Ordering::Relaxed) {
+        let now = Instant::now();
         progress_tracker::drain_progress(&mut session.progress_tracker, &mut state);
         let check_sanitize_config = resolved_transaction::sanitize_config(
             state.feature_set().snapshot().limit_instruction_accounts,
@@ -96,6 +100,25 @@ fn run_session(config: SchedulerConfig, mut session: ClientSession, exit: Arc<At
             MAX_EXECUTION_RESPONSE_BATCHES_PER_ITERATION,
         );
         if state.can_process_transactions() {
+            let current_slot = state.current_slot();
+            let needs_new_cost_pacer = match cost_pacer.as_ref() {
+                Some((slot, _)) => *slot != current_slot,
+                None => true,
+            };
+            if needs_new_cost_pacer {
+                let fill_time = (state.target_bank_time_ms() != 0)
+                    .then(|| Duration::from_millis(u64::from(state.target_bank_time_ms())));
+                cost_pacer = Some((
+                    current_slot,
+                    CostPacer::new(state.initial_remaining_cost_units(), now, fill_time),
+                ));
+            }
+            let (_, cost_pacer) = cost_pacer
+                .as_ref()
+                .expect("leader-ready scheduler state initializes the cost pacer");
+            let consumed_cost_units = state
+                .initial_remaining_cost_units()
+                .saturating_sub(state.remaining_cost_units());
             scheduling::schedule(
                 workers,
                 &allocators[0],
@@ -103,10 +126,12 @@ fn run_session(config: SchedulerConfig, mut session: ClientSession, exit: Arc<At
                 &mut account_locks,
                 &mut in_flight,
                 &mut scheduling_scratch,
-                state.current_slot(),
-                state.remaining_cost_units(),
+                current_slot,
+                cost_pacer.scheduling_budget(&now, consumed_cost_units),
                 state.target_scheduled_cus(),
             );
+        } else {
+            cost_pacer = None;
         }
         tpu_ingress::drain_tpu(
             tpu_to_pack,
