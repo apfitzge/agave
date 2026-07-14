@@ -480,6 +480,8 @@ fn spawn_bank_rotation(
                 }
 
                 let parent = bank_forks.read().unwrap().working_bank();
+                parent.freeze();
+                report_cost_tracker_stats(&parent);
                 let child =
                     Bank::new_from_parent(parent.clone(), leader, parent.slot().saturating_add(1));
                 let child = {
@@ -494,6 +496,22 @@ fn spawn_bank_rotation(
             }
         })
         .expect("bank rotation thread must start")
+}
+
+fn report_cost_tracker_stats(bank: &Bank) {
+    let (total_transaction_fee, total_priority_fee) = {
+        let collector_fee_details = bank.get_collector_fee_details();
+        (
+            collector_fee_details.total_transaction_fee(),
+            collector_fee_details.total_priority_fee(),
+        )
+    };
+    bank.read_cost_tracker().unwrap().report_stats(
+        bank.slot(),
+        true,
+        total_transaction_fee,
+        total_priority_fee,
+    );
 }
 
 #[cfg(test)]

@@ -9,6 +9,7 @@ use {
     },
     agave_scheduling_utils::handshake::server::Server,
     clap::{App, Arg},
+    log::info,
     std::{
         process::exit,
         sync::{Arc, atomic::AtomicBool},
@@ -52,6 +53,7 @@ fn main() {
             eprintln!("failed to register SIGINT handler: {error}");
             exit(1);
         });
+    agave_logger::setup_with_default_filter();
 
     if let Err(error) = run(exit_signal) {
         eprintln!("block-production-scheduler load test failed: {error}");
@@ -99,7 +101,7 @@ fn run(exit_signal: Arc<AtomicBool>) -> Result<(), RunnerError> {
         |bank| scenario.setup(bank),
     )?;
     let result = run_scenario(&mut harness, &mut scenario, |transactions_sent| {
-        eprintln!("transactions_sent_per_second={transactions_sent}");
+        info!("transactions_sent_per_second={transactions_sent}");
     });
     harness.shutdown();
     let scheduler_result = scheduler

@@ -16,14 +16,18 @@ use {
     },
 };
 
-const ACCOUNT_PAIRS: usize = 1_024;
-const ACCOUNT_BALANCE: u64 = 100_000_000_000_000;
+const ACCOUNT_PAIRS: usize = 16 * 1_024;
+const ACCOUNT_PAIRS_U64: u64 = ACCOUNT_PAIRS as u64;
+const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
+const ACCOUNT_BALANCE: u64 = 100 * LAMPORTS_PER_SOL;
+const UNIQUE_TRANSFER_AMOUNTS_PER_PAIR: u64 = 100;
 const REPORT_INTERVAL: Duration = Duration::from_secs(1);
 
 const SIGNATURE_MARKER: [u8; 64] = [0x41; 64];
 const SOURCE_MARKER: [u8; 32] = [0x42; 32];
 const DESTINATION_MARKER: [u8; 32] = [0x43; 32];
 const BLOCKHASH_MARKER: [u8; 32] = [0x44; 32];
+const LAMPORTS_MARKER: u64 = 0xf0e1_d2c3_b4a5_9687;
 
 /// A source of serialized transactions for [`run_scenario`].
 pub trait LoadTestScenario {
@@ -83,13 +87,14 @@ where
 ///
 /// The constructor is the only place this scenario uses SDK transaction types. It serializes one
 /// marked transfer and records its byte offsets. [`Self::next_transaction`] only clones those
-/// bytes and overwrites the signature, account keys, and recent blockhash.
+/// bytes and overwrites the signature, account keys, recent blockhash, and transfer amount.
 pub struct TransferScenario {
     template: Box<[u8]>,
     signature_offset: usize,
     source_offset: usize,
     destination_offset: usize,
     blockhash_offset: usize,
+    lamports_offset: usize,
     accounts: Box<[Pubkey]>,
     transaction_index: u64,
 }
@@ -104,7 +109,7 @@ impl TransferScenario {
             &[system_instruction::transfer(
                 &source_marker,
                 &destination_marker,
-                1,
+                LAMPORTS_MARKER,
             )],
             Some(&source_marker),
             &blockhash_marker,
@@ -119,6 +124,7 @@ impl TransferScenario {
             source_offset: find_unique_offset(&template, &SOURCE_MARKER),
             destination_offset: find_unique_offset(&template, &DESTINATION_MARKER),
             blockhash_offset: find_unique_offset(&template, &BLOCKHASH_MARKER),
+            lamports_offset: find_unique_offset(&template, &LAMPORTS_MARKER.to_le_bytes()),
             template,
             accounts: (0..ACCOUNT_PAIRS.saturating_mul(2))
                 .map(|_| Pubkey::new_unique())
@@ -142,20 +148,25 @@ impl LoadTestScenario for TransferScenario {
 
         #[allow(clippy::arithmetic_side_effects)]
         let pair_index = (transaction_index as usize) % ACCOUNT_PAIRS;
+        let transactions_for_pair = transaction_index.wrapping_div(ACCOUNT_PAIRS_U64);
         #[allow(clippy::arithmetic_side_effects)]
         let first_account = pair_index * 2;
         let second_account = first_account.wrapping_add(1);
-        let (source, destination) = if transaction_index & 1 == 0 {
-            (
-                &self.accounts[first_account],
-                &self.accounts[second_account],
-            )
-        } else {
-            (
-                &self.accounts[second_account],
-                &self.accounts[first_account],
-            )
-        };
+        // Reverse direction every time a pair completes the full amount sequence so its two
+        // accounts retain their original balances over each pair of cycles.
+        let (source, destination) =
+            if transactions_for_pair.wrapping_div(UNIQUE_TRANSFER_AMOUNTS_PER_PAIR) & 1 == 0 {
+                (
+                    &self.accounts[first_account],
+                    &self.accounts[second_account],
+                )
+            } else {
+                (
+                    &self.accounts[second_account],
+                    &self.accounts[first_account],
+                )
+            };
+        let lamports = transfer_lamports(transactions_for_pair).to_le_bytes();
 
         let mut transaction = self.template.to_vec();
         let signature = invalid_signature(transaction_index);
@@ -171,6 +182,8 @@ impl LoadTestScenario for TransferScenario {
         transaction
             [self.blockhash_offset..self.blockhash_offset.wrapping_add(recent_blockhash.len())]
             .copy_from_slice(recent_blockhash);
+        transaction[self.lamports_offset..self.lamports_offset.wrapping_add(lamports.len())]
+            .copy_from_slice(&lamports);
         transaction
     }
 }
@@ -197,6 +210,12 @@ fn invalid_signature(transaction_index: u64) -> [u8; 64] {
     signature
 }
 
+fn transfer_lamports(transactions_for_pair: u64) -> u64 {
+    transactions_for_pair
+        .wrapping_rem(UNIQUE_TRANSFER_AMOUNTS_PER_PAIR)
+        .wrapping_add(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,6 +224,7 @@ mod tests {
     fn transfer_generation_only_patches_the_wire_template() {
         let mut scenario = TransferScenario::new();
         let first = scenario.next_transaction(&[1; 32]);
+        scenario.transaction_index = ACCOUNT_PAIRS_U64;
         let second = scenario.next_transaction(&[2; 32]);
 
         assert_ne!(first, second);
@@ -220,5 +240,32 @@ mod tests {
             &first[scenario.signature_offset..scenario.signature_offset + 64],
             &second[scenario.signature_offset..scenario.signature_offset + 64]
         );
+        assert_eq!(
+            u64::from_le_bytes(
+                first[scenario.lamports_offset..scenario.lamports_offset + 8]
+                    .try_into()
+                    .unwrap(),
+            ),
+            1,
+        );
+        assert_eq!(
+            u64::from_le_bytes(
+                second[scenario.lamports_offset..scenario.lamports_offset + 8]
+                    .try_into()
+                    .unwrap(),
+            ),
+            2,
+        );
+    }
+
+    #[test]
+    fn transfer_amounts_cycle_per_pair() {
+        for transaction_index in 0..UNIQUE_TRANSFER_AMOUNTS_PER_PAIR {
+            assert_eq!(
+                transfer_lamports(transaction_index),
+                transaction_index.wrapping_add(1),
+            );
+        }
+        assert_eq!(transfer_lamports(UNIQUE_TRANSFER_AMOUNTS_PER_PAIR), 1,);
     }
 }

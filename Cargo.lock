@@ -107,11 +107,13 @@ name = "agave-block-production-scheduler-load-test"
 version = "4.3.0-alpha.0"
 dependencies = [
  "agave-block-production-scheduler",
+ "agave-logger",
  "agave-scheduler-bindings",
  "agave-scheduling-utils",
  "agave-votor-messages",
  "clap 2.33.3",
  "crossbeam-channel",
+ "log",
  "rts-alloc",
  "shaq",
  "signal-hook",
