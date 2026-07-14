@@ -119,6 +119,7 @@ dependencies = [
  "signal-hook",
  "solana-account 4.3.1",
  "solana-core",
+ "solana-epoch-schedule",
  "solana-hash 4.5.0",
  "solana-leader-schedule",
  "solana-ledger",

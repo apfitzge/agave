@@ -10,6 +10,7 @@ use {
         consumer::Consumer,
         progress_tracker,
     },
+    solana_epoch_schedule::EpochSchedule,
     solana_leader_schedule::SlotLeader,
     solana_ledger::{blockstore::Blockstore, leader_schedule_cache::LeaderScheduleCache},
     solana_poh::{
@@ -182,6 +183,7 @@ impl Harness {
             &validator_pubkey,
             bootstrap_validator_stake_lamports(),
         );
+        genesis_config_info.genesis_config.epoch_schedule = EpochSchedule::without_warmup();
         let ticks_per_slot = genesis_config_info.genesis_config.ticks_per_slot;
         let target_tick_duration = target_tick_duration(config.slot_duration, ticks_per_slot)?;
         genesis_config_info.genesis_config.poh_config = PohConfig {
