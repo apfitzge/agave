@@ -52,7 +52,6 @@ impl StateContainer {
     /// The caller must collect selected IDs and dequeue them only after this iterator is dropped.
     /// When the iterator reaches the bottom of the queue, the caller resets its cursor to `None`
     /// before the next scan.
-    #[allow(dead_code)]
     pub(crate) fn descending_from(
         &self,
         cursor: Option<&TransactionPriorityId>,
@@ -60,14 +59,16 @@ impl StateContainer {
         self.queue.descending_from(cursor)
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn get(&self, priority_id: TransactionPriorityId) -> &CheckedTransaction {
-        &self.transactions[priority_id.id]
+    pub(crate) fn get(&self, transaction_id: usize) -> &CheckedTransaction {
+        &self.transactions[transaction_id]
     }
 
     /// Removes a selected transaction from the priority queue while it is in flight.
-    #[allow(dead_code)]
-    pub(crate) fn dequeue(&mut self, priority_id: TransactionPriorityId) {
+    pub(crate) fn dequeue(&mut self, transaction_id: usize) {
+        let priority_id = TransactionPriorityId::new(
+            self.transactions[transaction_id].meta.priority,
+            transaction_id,
+        );
         assert!(
             self.queue.remove(&priority_id),
             "selected transaction must remain queued until removed"
@@ -76,9 +77,17 @@ impl StateContainer {
 
     /// Removes a terminal transaction from scheduler state.
     #[allow(dead_code)]
-    pub(crate) fn remove(&mut self, priority_id: TransactionPriorityId) -> CheckedTransaction {
+    pub(crate) fn remove(&mut self, transaction_id: usize) -> CheckedTransaction {
+        let priority_id = TransactionPriorityId::new(
+            self.transactions[transaction_id].meta.priority,
+            transaction_id,
+        );
         self.queue.remove(&priority_id);
-        self.transactions.remove(priority_id.id)
+        self.transactions.remove(transaction_id)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.queue.is_empty()
     }
 
     #[cfg(test)]
@@ -194,7 +203,7 @@ mod tests {
                 // removal below.
                 cursor = Some(priority_id);
                 assert_eq!(
-                    container.get(priority_id).meta.priority,
+                    container.get(priority_id.id).meta.priority,
                     priority_id.priority
                 );
                 removal_ids.push(priority_id);
@@ -203,7 +212,7 @@ mod tests {
 
         // The iterator's immutable borrow has ended, so dequeue selected IDs in a separate pass.
         for priority_id in removal_ids {
-            container.dequeue(priority_id);
+            container.dequeue(priority_id.id);
         }
         assert_eq!(container.len(), 2);
         assert_eq!(container.buffer_len(), 4);
@@ -231,14 +240,14 @@ mod tests {
         container.push(checked_transaction(&allocator, 5));
 
         let in_flight = *container.descending_from(None).next().unwrap();
-        container.dequeue(in_flight);
+        container.dequeue(in_flight.id);
         let dropped = container.push(checked_transaction(&allocator, 7)).unwrap();
         assert_eq!(dropped.meta.priority, 5);
-        assert_eq!(container.get(in_flight).meta.priority, 10);
+        assert_eq!(container.get(in_flight.id).meta.priority, 10);
         assert_eq!(container.buffer_len(), 2);
 
         let queued = *container.descending_from(None).next().unwrap();
-        container.dequeue(queued);
+        container.dequeue(queued.id);
         let dropped = container.push(checked_transaction(&allocator, 1)).unwrap();
         assert_eq!(dropped.meta.priority, 1);
         assert_eq!(container.buffer_len(), 2);

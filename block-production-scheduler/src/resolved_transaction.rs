@@ -245,6 +245,10 @@ impl ResolvedTransaction {
         }
     }
 
+    pub(crate) fn serialized_size(&self) -> usize {
+        AgaveTransactionData::data(&self.transaction).len()
+    }
+
     /// # Safety
     ///
     /// `allocator` must own this transaction allocation.

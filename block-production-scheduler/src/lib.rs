@@ -2,7 +2,10 @@
 //! External transaction scheduler implementation for Agave scheduler bindings.
 
 use {
-    agave_scheduling_utils::handshake::{ClientHandshakeError, ClientSession, client},
+    agave_scheduling_utils::{
+        handshake::{ClientHandshakeError, ClientSession, client},
+        thread_aware_account_locks::ThreadAwareAccountLocks,
+    },
     progress_tracker::SchedulerState,
     std::{
         sync::{
@@ -18,6 +21,7 @@ mod config;
 mod in_flight;
 mod progress_tracker;
 mod resolved_transaction;
+mod scheduling;
 mod state_container;
 mod tpu_ingress;
 mod transaction;
@@ -43,6 +47,15 @@ pub fn run(config: SchedulerConfig, exit: Arc<AtomicBool>) -> Result<(), Schedul
     let mut state = SchedulerState::new();
     let mut transaction_state =
         state_container::StateContainer::new(config.transaction_state_capacity);
+    let mut account_locks = ThreadAwareAccountLocks::new(config.execution_worker_count);
+    let mut in_flight = in_flight::InFlightTracker::new(
+        config.execution_worker_count,
+        config.pack_to_worker_capacity,
+    );
+    let mut scheduling_scratch = scheduling::SchedulingScratch::new(
+        config.transaction_state_capacity,
+        config.execution_worker_count,
+    );
 
     while !exit.load(Ordering::Relaxed) {
         progress_tracker::drain_progress(&mut session.progress_tracker, &mut state);
@@ -54,6 +67,7 @@ pub fn run(config: SchedulerConfig, exit: Arc<AtomicBool>) -> Result<(), Schedul
             tpu_to_pack,
             pack_to_check_worker,
             check_worker_to_pack,
+            workers,
             ..
         } = &mut session;
         check_response::drain_check_responses(
@@ -64,6 +78,19 @@ pub fn run(config: SchedulerConfig, exit: Arc<AtomicBool>) -> Result<(), Schedul
             &mut transaction_state,
             MAX_CHECK_RESPONSE_BATCHES_PER_ITERATION,
         );
+        if state.can_process_transactions() {
+            scheduling::schedule(
+                workers,
+                &allocators[0],
+                &mut transaction_state,
+                &mut account_locks,
+                &mut in_flight,
+                &mut scheduling_scratch,
+                state.current_slot(),
+                state.remaining_cost_units(),
+                state.target_scheduled_cus(),
+            );
+        }
         tpu_ingress::drain_tpu(
             tpu_to_pack,
             pack_to_check_worker,
