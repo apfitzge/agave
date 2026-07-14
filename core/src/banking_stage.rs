@@ -59,10 +59,10 @@ use {
 pub mod transaction_scheduler;
 
 #[cfg(unix)]
-mod check_worker;
-mod committer;
-mod consume_worker;
-mod consumer;
+pub mod check_worker;
+pub mod committer;
+pub mod consume_worker;
+pub mod consumer;
 mod decision_maker;
 mod latest_validator_vote_packet;
 mod leader_slot_metrics;
@@ -74,7 +74,7 @@ mod vote_storage;
 mod vote_worker;
 
 #[cfg(unix)]
-mod progress_tracker;
+pub mod progress_tracker;
 #[cfg(unix)]
 mod tpu_to_pack;
 

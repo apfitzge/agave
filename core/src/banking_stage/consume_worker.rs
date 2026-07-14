@@ -176,7 +176,7 @@ impl<Tx: TransactionWithMeta> ConsumeWorker<Tx> {
 }
 
 #[cfg(unix)]
-pub(crate) mod external {
+pub mod external {
     use {
         super::*,
         crate::banking_stage::{
@@ -215,7 +215,7 @@ pub(crate) mod external {
         AllocationFailure,
     }
 
-    pub(crate) struct ExternalWorker {
+    pub struct ExternalWorker {
         exit: Arc<AtomicBool>,
         consumer: Consumer,
         sender: shaq::spsc::Producer<ExecutionWorkerToPackMessage>,
@@ -1530,7 +1530,7 @@ fn backoff(idle_duration: Duration, sleep_duration: &Duration) -> Duration {
 /// These are atomic, and intended to be reported by the scheduling thread
 /// since the consume worker thread is sleeping unless there is work to be
 /// done.
-pub(crate) struct ConsumeWorkerMetrics {
+pub struct ConsumeWorkerMetrics {
     id: String,
     interval: AtomicInterval,
     has_data: AtomicBool,

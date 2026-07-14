@@ -52,7 +52,7 @@ type Tx = RuntimeTransaction<ResolvedTransactionView<TransactionPtr>>;
 type TxView = SanitizedTransactionView<TransactionPtr>;
 
 #[derive(Debug, Error)]
-pub(crate) enum ExternalCheckWorkerError {
+pub enum ExternalCheckWorkerError {
     #[error("Sender disconnected")]
     SenderDisconnected,
     #[error("Allocation failed")]
@@ -65,7 +65,7 @@ pub(crate) enum IterationResult {
 }
 
 #[allow(dead_code)]
-pub(crate) struct ExternalCheckWorker {
+pub struct ExternalCheckWorker {
     exit: Arc<AtomicBool>,
     receiver: shaq::mpmc::Consumer<PackToCheckWorkerMessage>,
     sender: shaq::mpmc::Producer<CheckWorkerToPackMessage>,
