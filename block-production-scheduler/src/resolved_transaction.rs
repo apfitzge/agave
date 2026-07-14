@@ -8,8 +8,9 @@ use {
     agave_scheduling_utils::{pubkeys_ptr::PubkeysPtr, transaction_ptr::TransactionPtr},
     agave_transaction_view::transaction_data::TransactionData as AgaveTransactionData,
     rts_alloc::Allocator,
-    solana_message::v0::LoadedAddressesView,
+    solana_message::{AccountKeys, v0::LoadedAddressesView},
     solana_pubkey::Pubkey,
+    solana_svm_transaction::svm_message::SVMMessage,
     std::collections::HashSet,
 };
 
@@ -83,6 +84,32 @@ impl<'a> From<&'a ResolvedPubkeys> for LoadedAddressesView<'a> {
     fn from(pubkeys: &'a ResolvedPubkeys) -> Self {
         let (writable, readonly) = pubkeys.as_slice().split_at(pubkeys.num_writable);
         Self { writable, readonly }
+    }
+}
+
+/// Canonical account-lock classification for a resolved transaction.
+#[allow(dead_code)]
+pub(crate) struct TransactionAccountLocks<'a> {
+    account_keys: AccountKeys<'a>,
+    transaction: &'a ResolvedTransactionView<ExternalTransactionData, ResolvedPubkeys>,
+}
+
+#[allow(dead_code)]
+impl TransactionAccountLocks<'_> {
+    pub(crate) fn write_locks(&self) -> impl Iterator<Item = &Pubkey> + Clone {
+        self.account_keys
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| self.transaction.is_writable(*index))
+            .map(|(_, key)| key)
+    }
+
+    pub(crate) fn read_locks(&self) -> impl Iterator<Item = &Pubkey> + Clone {
+        self.account_keys
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !self.transaction.is_writable(*index))
+            .map(|(_, key)| key)
     }
 }
 
@@ -210,6 +237,14 @@ impl ResolvedTransaction {
         &self.view
     }
 
+    pub(crate) fn account_locks(&self) -> TransactionAccountLocks<'_> {
+        let transaction = self.view();
+        TransactionAccountLocks {
+            account_keys: transaction.account_keys(),
+            transaction,
+        }
+    }
+
     /// # Safety
     ///
     /// `allocator` must own this transaction allocation.
@@ -320,6 +355,9 @@ mod tests {
             unsafe { transaction.to_sharable_transaction_region(allocator) }.length as usize,
             bytes.len()
         );
+        let account_locks = transaction.account_locks();
+        assert_eq!(account_locks.write_locks().count(), 2);
+        assert_eq!(account_locks.read_locks().count(), 1);
 
         // SAFETY: `transaction` owns the shared allocation created above.
         unsafe { transaction.free(allocator) };
