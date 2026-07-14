@@ -78,8 +78,10 @@ dependencies = [
  "agave-scheduling-utils",
  "agave-transaction-view 4.3.0",
  "agave-transaction-view 4.3.0-alpha.0",
+ "clap 2.33.3",
  "rts-alloc",
  "shaq",
+ "signal-hook",
  "slab",
  "solana-clock",
  "solana-compute-budget-interface",
@@ -96,6 +98,7 @@ dependencies = [
  "solana-transaction",
  "tempfile",
  "thiserror 2.0.18",
+ "tikv-jemallocator",
  "wincode",
 ]
 
