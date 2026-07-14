@@ -4,8 +4,7 @@ use {
         transaction::{CheckBatch, MAX_PACKETS_PER_CHECK_BATCH, TpuTransactionMeta},
     },
     agave_scheduler_bindings::{
-        PackToCheckWorkerMessage, SharableTransactionBatchRegion, SharableTransactionRegion,
-        TpuToPackMessage, check_message_flags, tpu_message_flags,
+        PackToCheckWorkerMessage, TpuToPackMessage, check_message_flags, tpu_message_flags,
     },
     agave_scheduling_utils::transaction_ptr::TransactionPtr,
     agave_transaction_view::transaction_view::SanitizedTransactionView,
@@ -18,7 +17,7 @@ use {
         transaction_meta::TransactionMeta,
     },
     solana_transaction::sanitized::MessageHash,
-    std::{ptr::NonNull, time::Duration},
+    std::time::Duration,
 };
 
 const TPU_RECEIVE_TIMEOUT: Duration = Duration::from_millis(10);
@@ -58,11 +57,10 @@ pub(crate) fn drain_tpu(
     while remaining_packets > 0 {
         let num_packets = remaining_packets.min(MAX_PACKETS_PER_CHECK_BATCH);
 
-        let Some(mut batch) = allocate_check_worker_batch(allocator) else {
+        let Some(mut batch) = CheckBatch::allocate(allocator) else {
             break;
         };
 
-        let mut num_transactions = 0;
         for _ in 0..num_packets {
             let Some(message) = tpu_to_scheduler.try_read() else {
                 unreachable!("queue length checked before read");
@@ -102,126 +100,35 @@ pub(crate) fn drain_tpu(
                         continue;
                     }
                 };
-            batch.write_transaction(num_transactions, message.transaction, meta);
-            num_transactions = num_transactions.wrapping_add(1);
+            assert!(
+                batch.push(message.transaction, meta).is_ok(),
+                "batch is bounded by the check-worker capacity"
+            );
         }
 
-        if num_transactions == 0 {
-            batch.free(allocator);
+        if batch.is_empty() {
+            // SAFETY: this batch was allocated locally and was not sent to a worker.
+            unsafe { batch.free() };
         } else {
-            match batch.reserve(scheduler_to_check_worker) {
-                Ok(batch) => batch.send(num_transactions),
-                Err(batch) => {
-                    batch.free_with_transactions(allocator, num_transactions);
-                    break;
+            if scheduler_to_check_worker
+                .try_write(PackToCheckWorkerMessage {
+                    flags: CHECK_FLAGS,
+                    batch: batch.to_sharable_transaction_batch_region(),
+                })
+                .is_err()
+            {
+                // SAFETY: this scheduler owns the batch and all transaction allocations until
+                // the batch is accepted by the queue.
+                unsafe {
+                    batch.free_transactions();
+                    batch.free();
                 }
+                break;
             }
         }
         remaining_packets = remaining_packets.wrapping_sub(num_packets);
     }
     tpu_to_scheduler.finalize();
-}
-
-struct CheckWorkerBatch {
-    transaction_regions: NonNull<SharableTransactionRegion>,
-    transaction_metas: NonNull<TpuTransactionMeta>,
-    transactions_offset: usize,
-}
-
-impl CheckWorkerBatch {
-    fn write_transaction(
-        &mut self,
-        index: usize,
-        transaction: SharableTransactionRegion,
-        meta: TpuTransactionMeta,
-    ) {
-        debug_assert!(index < MAX_PACKETS_PER_CHECK_BATCH);
-        // SAFETY: `index` is bounded by the batch capacity, and both pointers reference the
-        // corresponding arrays in this batch's allocation.
-        unsafe {
-            self.transaction_regions.add(index).write(transaction);
-            self.transaction_metas.add(index).write(meta);
-        }
-    }
-
-    fn reserve<'a>(
-        self,
-        scheduler_to_check_worker: &'a shaq::mpmc::Producer<PackToCheckWorkerMessage>,
-    ) -> Result<ReservedCheckWorkerBatch<'a>, Self> {
-        // SAFETY: this scheduler is the sole producer for this queue and fully initializes the
-        // reserved message before the guard is dropped.
-        let Some(check_worker_message) = (unsafe { scheduler_to_check_worker.try_reserve_write() })
-        else {
-            return Err(self);
-        };
-
-        Ok(ReservedCheckWorkerBatch {
-            check_worker_message,
-            batch: self,
-        })
-    }
-
-    fn free(self, allocator: &Allocator) {
-        // SAFETY: this batch container was allocated by `allocate_check_worker_batch` and has
-        // not been sent to a worker.
-        unsafe { allocator.free_offset(self.transactions_offset) };
-    }
-
-    fn free_with_transactions(self, allocator: &Allocator, num_transactions: usize) {
-        for index in 0..num_transactions {
-            // SAFETY: `index` is bounded by the number of transaction regions initialized by
-            // `write_transaction`.
-            let transaction = unsafe { self.transaction_regions.add(index).read() };
-            // SAFETY: this scheduler owns transactions until the batch is accepted by the queue.
-            unsafe { allocator.free_offset(transaction.offset) };
-        }
-        self.free(allocator);
-    }
-}
-
-struct ReservedCheckWorkerBatch<'a> {
-    check_worker_message: shaq::mpmc::WriteGuard<'a, PackToCheckWorkerMessage>,
-    batch: CheckWorkerBatch,
-}
-
-impl ReservedCheckWorkerBatch<'_> {
-    fn send(self, num_transactions: usize) {
-        self.check_worker_message.write(PackToCheckWorkerMessage {
-            flags: CHECK_FLAGS,
-            batch: SharableTransactionBatchRegion {
-                num_transactions: num_transactions
-                    .try_into()
-                    .expect("batch size is at most 16"),
-                transactions_offset: self.batch.transactions_offset,
-            },
-        });
-    }
-}
-
-fn allocate_check_worker_batch(allocator: &Allocator) -> Option<CheckWorkerBatch> {
-    let allocation = allocator.allocate(CheckBatch::TRANSACTION_META_END as u32)?;
-    // SAFETY: `allocation` was allocated by this allocator immediately above.
-    let transactions_offset = unsafe { allocator.offset(allocation) };
-    // SAFETY: `transactions_offset` was obtained from this allocator immediately above.
-    let transaction_regions = unsafe {
-        allocator
-            .ptr_from_offset(transactions_offset)
-            .cast::<SharableTransactionRegion>()
-    };
-    // SAFETY: `transactions_offset` was obtained from this allocator immediately above and
-    // `Batch::TRANSACTION_META_START` lies within the allocation.
-    let transaction_metas = unsafe {
-        allocator
-            .ptr_from_offset(transactions_offset)
-            .byte_add(CheckBatch::TRANSACTION_META_START)
-            .cast::<TpuTransactionMeta>()
-    };
-
-    Some(CheckWorkerBatch {
-        transaction_regions,
-        transaction_metas,
-        transactions_offset,
-    })
 }
 
 fn calculate_priority_and_cost(
@@ -292,7 +199,10 @@ mod tests {
     use {
         super::*,
         crate::SchedulerConfig,
-        agave_scheduler_bindings::{LEADER_READY, ProgressMessage, scheduler_feature_flags},
+        agave_scheduler_bindings::{
+            LEADER_READY, ProgressMessage, SharableTransactionBatchRegion,
+            SharableTransactionRegion, scheduler_feature_flags,
+        },
         agave_scheduling_utils::handshake::{client, server::Server},
         solana_compute_budget_interface::ComputeBudgetInstruction,
         solana_hash::Hash,
