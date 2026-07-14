@@ -3012,28 +3012,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "flatrecord"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a85fb64e06ab69c2c63565f829619fc26a519cf3967fb2f82b6cdf89fc574c6"
-dependencies = [
- "flatrecord-derive",
- "thiserror 2.0.18",
- "wincode",
-]
-
-[[package]]
-name = "flatrecord-derive"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11288e31bdf0ae361eba0599dd4f9ddae3bb22db3913ab5f4081d5149b7ac2c1"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
 name = "float-cmp"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9057,7 +9035,6 @@ dependencies = [
  "crossbeam-channel",
  "dashmap",
  "eager",
- "flatrecord",
  "fs_extra",
  "futures 0.3.32",
  "itertools 0.14.0",
@@ -9144,6 +9121,7 @@ dependencies = [
  "tokio-stream",
  "trees",
  "wincode",
+ "wincode-dynamic",
 ]
 
 [[package]]
@@ -13359,6 +13337,26 @@ name = "wincode-derive"
 version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "15ab90b719560d0fda79c74550ad1c948d17b118765942838055ebaf34d67071"
+dependencies = [
+ "darling",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "wincode-dynamic"
+version = "0.1.0"
+source = "git+https://github.com/cpubot/wincode-dynamic?rev=558283e2c78a00b2b118583b7ccc2e16c5d2d33c#558283e2c78a00b2b118583b7ccc2e16c5d2d33c"
+dependencies = [
+ "wincode",
+ "wincode-dynamic-derive",
+]
+
+[[package]]
+name = "wincode-dynamic-derive"
+version = "0.1.0"
+source = "git+https://github.com/cpubot/wincode-dynamic?rev=558283e2c78a00b2b118583b7ccc2e16c5d2d33c#558283e2c78a00b2b118583b7ccc2e16c5d2d33c"
 dependencies = [
  "darling",
  "proc-macro2",

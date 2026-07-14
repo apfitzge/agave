@@ -42,7 +42,6 @@ chrono-humanize = { workspace = true }
 crossbeam-channel = { workspace = true }
 dashmap = { workspace = true, features = ["rayon", "raw-api"] }
 eager = { workspace = true }
-flatrecord = { workspace = true }
 fs_extra = { workspace = true }
 futures = { workspace = true }
 itertools = { workspace = true }
@@ -124,6 +123,7 @@ tokio = { workspace = true, features = ["full"] }
 tokio-stream = { workspace = true }
 trees = { workspace = true }
 wincode = { workspace = true, features = ["bytes"] }
+wincode-dynamic = { workspace = true }
 
 [dependencies.rocksdb]
 # Avoid the vendored bzip2 within rocksdb-sys that can cause linker conflicts

@@ -1,6 +1,5 @@
 use {
-    flatrecord::{DynamicRecord, PreparedSchema, RootDef, Schema, ValueRef},
-    serde_json::{Map, Number, Value},
+    serde_json::{Map, Number, Value as JsonValue},
     shaq::{broadcast::SliceConsumer, error::WaitError},
     signal_hook::{
         consts::signal::{SIGINT, SIGTERM},
@@ -18,10 +17,14 @@ use {
         },
         time::Duration,
     },
+    wincode::{ReadError, ReadResult},
+    wincode_dynamic::{
+        Decoder, Field, PrimitiveTy, PrimitiveValue, RootSchema, Value as DynamicValue,
+    },
 };
 
 const DEFAULT_QUEUE_NAME: &str = "bank_events";
-const SCHEMA_FILE_EXTENSION: &str = "frs";
+const SCHEMA_FILE_EXTENSION: &str = "wds";
 
 type AppResult<T> = Result<T, AppError>;
 
@@ -67,6 +70,12 @@ impl From<serde_json::Error> for AppError {
 impl From<shaq::error::Error> for AppError {
     fn from(err: shaq::error::Error) -> Self {
         Self::Queue(err)
+    }
+}
+
+impl From<ReadError> for AppError {
+    fn from(err: ReadError) -> Self {
+        Self::InvalidPayload(err.to_string())
     }
 }
 
@@ -145,7 +154,7 @@ Usage:
 
 Options:
   --queue-name <NAME>   queue and schema name [default: {DEFAULT_QUEUE_NAME}]
-  --object <NAME>       only print records with this flatrecord record name
+  --object <NAME>       only print records with this wincode-dynamic variant name
   --from-backlog        start up to one ring behind the current queue frontier
   --once                drain currently available events, then exit
   --poll-ms <MS>        read timeout while waiting for events [default: 1000]
@@ -173,76 +182,101 @@ fn event_schema_path(events_dir: &Path, queue_name: &str) -> PathBuf {
     events_dir.join(format!("{queue_name}.{SCHEMA_FILE_EXTENSION}"))
 }
 
-fn prepare_schema(schema_bytes: &[u8]) -> AppResult<PreparedSchema> {
-    let schema: Schema = wincode::deserialize_exact(schema_bytes)
+struct PreparedDecoder {
+    schema: RootSchema,
+    decoder: Decoder,
+}
+
+fn prepare_schema(schema_bytes: &[u8]) -> AppResult<PreparedDecoder> {
+    let schema: RootSchema = wincode::deserialize_exact(schema_bytes)
         .map_err(|err| AppError::InvalidSchema(format!("failed to decode schema: {err}")))?;
-    PreparedSchema::new(schema)
-        .map_err(|err| AppError::InvalidSchema(format!("failed to prepare schema: {err}")))
+    let decoder = Decoder::new(schema.clone());
+    Ok(PreparedDecoder { schema, decoder })
 }
 
-fn schema_root_name(schema: &Schema) -> &str {
-    match schema.root() {
-        RootDef::Struct => schema
-            .records()
-            .first()
-            .map(|record| record.name())
-            .unwrap_or("<empty>"),
-        RootDef::TaggedUnion { name } => name,
-    }
-}
+fn record_to_json<'meta, 'data>(
+    record_name: &str,
+    fields: impl IntoIterator<Item = ReadResult<Field<'meta, 'data>>>,
+) -> AppResult<JsonValue> {
+    let mut field_values = Map::new();
 
-fn record_to_json(record: &DynamicRecord<'_, '_>) -> AppResult<Value> {
-    let mut fields = Map::new();
-
-    for field in record.fields() {
-        let value = field
-            .value()
-            .map_err(|err| AppError::InvalidPayload(err.to_string()))?;
-        fields.insert(field.name().to_string(), value_to_json(value)?);
+    for field in fields {
+        let field = field.map_err(|err| AppError::InvalidPayload(err.to_string()))?;
+        field_values.insert(field.name().to_string(), value_to_json(field.value())?);
     }
 
     let mut event = Map::new();
-    event.insert(record.record_name().to_string(), Value::Object(fields));
-    Ok(Value::Object(event))
+    event.insert(record_name.to_string(), JsonValue::Object(field_values));
+    Ok(JsonValue::Object(event))
 }
 
-fn value_to_json(value: ValueRef<'_>) -> AppResult<Value> {
+fn value_to_json(value: &DynamicValue<'_>) -> AppResult<JsonValue> {
     match value {
-        ValueRef::U8(value) => Ok(unsigned_value(u64::from(value))),
-        ValueRef::U16(value) => Ok(unsigned_value(u64::from(value))),
-        ValueRef::U32(value) => Ok(unsigned_value(u64::from(value))),
-        ValueRef::U64(value) => Ok(unsigned_value(value)),
-        ValueRef::I8(value) => Ok(integer_value(i64::from(value))),
-        ValueRef::I16(value) => Ok(integer_value(i64::from(value))),
-        ValueRef::I32(value) => Ok(integer_value(i64::from(value))),
-        ValueRef::I64(value) => Ok(integer_value(value)),
-        ValueRef::F32(value) => float_value(f64::from(value)),
-        ValueRef::F64(value) => float_value(value),
-        ValueRef::Bool(value) => Ok(Value::Bool(value)),
-        ValueRef::Bytes(bytes) | ValueRef::ArrayBytes(bytes) => Ok(bytes_to_json(bytes)),
-        ValueRef::Str(value) => Ok(Value::String(value.to_string())),
+        DynamicValue::U8(value) => Ok(unsigned_value(u64::from(*value))),
+        DynamicValue::U16(value) => Ok(unsigned_value(u64::from(*value))),
+        DynamicValue::U32(value) => Ok(unsigned_value(u64::from(*value))),
+        DynamicValue::U64(value) => Ok(unsigned_value(*value)),
+        DynamicValue::I8(value) => Ok(integer_value(i64::from(*value))),
+        DynamicValue::I16(value) => Ok(integer_value(i64::from(*value))),
+        DynamicValue::I32(value) => Ok(integer_value(i64::from(*value))),
+        DynamicValue::I64(value) => Ok(integer_value(*value)),
+        DynamicValue::F32(value) => float_value(f64::from(*value)),
+        DynamicValue::F64(value) => float_value(*value),
+        DynamicValue::Bool(value) => Ok(JsonValue::Bool(*value)),
+        DynamicValue::String(value) => Ok(JsonValue::String(value.to_string())),
+        DynamicValue::Bytes(bytes) => Ok(bytes_to_json(bytes)),
+        DynamicValue::Vec(values) => primitive_values_to_json(
+            values
+                .clone()
+                .into_dyn_vec()
+                .map_err(|err| AppError::InvalidPayload(err.to_string()))?,
+        ),
     }
 }
 
-fn unsigned_value(value: u64) -> Value {
-    Value::Number(Number::from(value))
+fn primitive_values_to_json(values: Vec<PrimitiveValue>) -> AppResult<JsonValue> {
+    values
+        .into_iter()
+        .map(primitive_value_to_json)
+        .collect::<AppResult<Vec<_>>>()
+        .map(JsonValue::Array)
 }
 
-fn integer_value(value: i64) -> Value {
-    Value::Number(Number::from(value))
+fn primitive_value_to_json(value: PrimitiveValue) -> AppResult<JsonValue> {
+    match value {
+        PrimitiveValue::U8(value) => Ok(unsigned_value(u64::from(value))),
+        PrimitiveValue::U16(value) => Ok(unsigned_value(u64::from(value))),
+        PrimitiveValue::U32(value) => Ok(unsigned_value(u64::from(value))),
+        PrimitiveValue::U64(value) => Ok(unsigned_value(value)),
+        PrimitiveValue::I8(value) => Ok(integer_value(i64::from(value))),
+        PrimitiveValue::I16(value) => Ok(integer_value(i64::from(value))),
+        PrimitiveValue::I32(value) => Ok(integer_value(i64::from(value))),
+        PrimitiveValue::I64(value) => Ok(integer_value(value)),
+        PrimitiveValue::F32(value) => float_value(f64::from(value)),
+        PrimitiveValue::F64(value) => float_value(value),
+        PrimitiveValue::Bool(value) => Ok(JsonValue::Bool(value)),
+    }
 }
 
-fn float_value(value: f64) -> AppResult<Value> {
+fn unsigned_value(value: u64) -> JsonValue {
+    JsonValue::Number(Number::from(value))
+}
+
+fn integer_value(value: i64) -> JsonValue {
+    JsonValue::Number(Number::from(value))
+}
+
+fn float_value(value: f64) -> AppResult<JsonValue> {
     Number::from_f64(value)
-        .map(Value::Number)
+        .map(JsonValue::Number)
         .ok_or_else(|| AppError::InvalidPayload(format!("non-finite float value {value}")))
 }
 
-fn bytes_to_json(bytes: &[u8]) -> Value {
-    Value::Array(
+fn bytes_to_json(bytes: &[u8]) -> JsonValue {
+    JsonValue::Array(
         bytes
             .iter()
-            .map(|byte| Value::Number(Number::from(u64::from(*byte))))
+            .map(|byte| JsonValue::Number(Number::from(u64::from(*byte))))
             .collect(),
     )
 }
@@ -254,6 +288,54 @@ fn record_name_matches(record_name: &str, requested_name: Option<&str>) -> bool 
     record_name == requested_name || record_name.rsplit('.').next() == Some(requested_name)
 }
 
+fn record_name<'schema>(schema: &'schema RootSchema, payload: &[u8]) -> AppResult<&'schema str> {
+    match schema {
+        RootSchema::Struct(schema) => Ok(schema.name()),
+        RootSchema::Enum {
+            variants,
+            tag_encoding,
+            ..
+        } => {
+            let tag = read_tag(*tag_encoding, payload)?;
+            variants
+                .get(tag)
+                .map(|schema| schema.name())
+                .ok_or_else(|| AppError::InvalidPayload(format!("invalid event tag {tag}")))
+        }
+    }
+}
+
+fn read_tag(tag_encoding: PrimitiveTy, payload: &[u8]) -> AppResult<usize> {
+    match tag_encoding {
+        PrimitiveTy::U8 => Ok(usize::from(read_value::<u8>(payload)?)),
+        PrimitiveTy::U16 => Ok(usize::from(read_value::<u16>(payload)?)),
+        PrimitiveTy::U32 => usize::try_from(read_value::<u32>(payload)?)
+            .map_err(|_| AppError::InvalidPayload("event tag does not fit usize".to_string())),
+        PrimitiveTy::U64 => usize::try_from(read_value::<u64>(payload)?)
+            .map_err(|_| AppError::InvalidPayload("event tag does not fit usize".to_string())),
+        PrimitiveTy::I8 => signed_tag(read_value::<i8>(payload)?),
+        PrimitiveTy::I16 => signed_tag(read_value::<i16>(payload)?),
+        PrimitiveTy::I32 => signed_tag(read_value::<i32>(payload)?),
+        PrimitiveTy::I64 => signed_tag(read_value::<i64>(payload)?),
+        PrimitiveTy::F32 | PrimitiveTy::F64 | PrimitiveTy::Bool => Err(AppError::InvalidSchema(
+            "event tag encoding must be an integer".to_string(),
+        )),
+    }
+}
+
+fn signed_tag(value: impl TryInto<usize>) -> AppResult<usize> {
+    value
+        .try_into()
+        .map_err(|_| AppError::InvalidPayload("event tag is negative or too large".to_string()))
+}
+
+fn read_value<'de, T>(payload: &'de [u8]) -> Result<T, ReadError>
+where
+    T: wincode::SchemaRead<'de, wincode::config::DefaultConfig, Dst = T>,
+{
+    wincode::deserialize(payload)
+}
+
 fn run() -> AppResult<()> {
     let args = Args::parse()?;
     let shutdown_requested = install_shutdown_signal_handlers()?;
@@ -261,7 +343,7 @@ fn run() -> AppResult<()> {
     let queue_path = args.events_dir.join(&args.queue_name);
     let schema_path = event_schema_path(&args.events_dir, &args.queue_name);
     let schema_bytes = fs::read(&schema_path)?;
-    let prepared_schema = prepare_schema(&schema_bytes)?;
+    let prepared = prepare_schema(&schema_bytes)?;
 
     let queue_file = OpenOptions::new()
         .read(true)
@@ -274,12 +356,10 @@ fn run() -> AppResult<()> {
     };
 
     eprintln!(
-        "queue={} schema={} schema_version={} root={} records={} payload_size={} consumer_index={}",
+        "queue={} schema={} root={} payload_size={} consumer_index={}",
         queue_path.display(),
         schema_path.display(),
-        prepared_schema.schema().schema_version(),
-        schema_root_name(prepared_schema.schema()),
-        prepared_schema.schema().records().len(),
+        prepared.decoder.name(),
         consumer.payload_size(),
         consumer.index()
     );
@@ -287,12 +367,18 @@ fn run() -> AppResult<()> {
     while !shutdown_requested.load(Ordering::Relaxed) {
         match consumer.read_timeout(args.poll_timeout) {
             Ok(payload) => {
-                let record = DynamicRecord::read(&prepared_schema, payload.as_slice())
-                    .map_err(|err| AppError::InvalidPayload(err.to_string()))?;
-                if record_name_matches(record.record_name(), args.object_name.as_deref()) {
-                    println!("{}", serde_json::to_string(&record_to_json(&record)?)?);
+                let payload = payload.as_slice();
+                let record_name = record_name(&prepared.schema, payload)?;
+                if record_name_matches(record_name, args.object_name.as_deref()) {
+                    let fields = prepared
+                        .decoder
+                        .fields(payload)
+                        .map_err(|err| AppError::InvalidPayload(err.to_string()))?;
+                    println!(
+                        "{}",
+                        serde_json::to_string(&record_to_json(record_name, fields)?)?
+                    );
                 }
-                drop(payload);
             }
             Err(WaitError::Timeout) if args.once => return Ok(()),
             Err(WaitError::Timeout) => {}

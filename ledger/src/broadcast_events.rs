@@ -1,5 +1,4 @@
 use {
-    flatrecord::FlatRecord,
     libc::{CLOCK_MONOTONIC, clock_gettime, timespec},
     shaq::broadcast::{BroadcastConfig, Producer},
     solana_runtime::bank::Bank,
@@ -10,42 +9,38 @@ use {
         path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
     },
+    wincode::{SchemaRead, SchemaWrite},
+    wincode_dynamic::SchemaDynamic,
 };
 
-const SCHEMA_FILE_EXTENSION: &str = "frs";
+const SCHEMA_FILE_EXTENSION: &str = "wds";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, FlatRecord)]
-pub struct NewBankEvent {
-    pub timestamp: u64,
-    pub slot: u64,
-    pub parent_slot: u64,
-    pub parent_hash: [u8; 32],
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, FlatRecord)]
-pub struct FrozenBankEvent {
-    pub timestamp: u64,
-    pub slot: u64,
-    pub bank_hash: [u8; 32],
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, FlatRecord)]
-#[schema(version = 1)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, SchemaDynamic, SchemaRead, SchemaWrite)]
+#[wincode(tag_encoding = "u8")]
 pub enum Event {
-    NewBankEvent(NewBankEvent),
-    FrozenBankEvent(FrozenBankEvent),
+    NewBankEvent {
+        timestamp: u64,
+        slot: u64,
+        parent_slot: u64,
+        parent_hash: [u8; 32],
+    },
+    FrozenBankEvent {
+        timestamp: u64,
+        slot: u64,
+        bank_hash: [u8; 32],
+    },
 }
 
 impl Event {
     #[allow(non_upper_case_globals)]
-    pub const size: usize = 58;
+    pub const size: usize = 57;
 }
 
 pub type BankEvent = [u8; Event::size];
 pub type BankEventProducer = Producer<BankEvent>;
 
 pub fn bank_events_schema() -> Vec<u8> {
-    wincode::serialize(&Event::schema()).expect("generated flatrecord schema should serialize")
+    wincode::serialize(&Event::schema()).expect("generated wincode-dynamic schema should serialize")
 }
 
 pub fn create_event_queue<T>(
@@ -104,28 +99,28 @@ pub fn event_schema_path(events_dir: &Path, queue_name: &str) -> PathBuf {
 }
 
 pub fn new_bank_event(bank: &Bank) -> BankEvent {
-    encode_event(&Event::NewBankEvent(NewBankEvent {
+    encode_event(&Event::NewBankEvent {
         timestamp: monotonic_clock_timestamp_ns(),
         slot: bank.slot(),
         parent_slot: bank.parent_slot(),
         parent_hash: bank.parent_hash().to_bytes(),
-    }))
+    })
 }
 
 pub fn frozen_bank_event(bank: &Bank) -> BankEvent {
-    encode_event(&Event::FrozenBankEvent(FrozenBankEvent {
+    encode_event(&Event::FrozenBankEvent {
         timestamp: monotonic_clock_timestamp_ns(),
         slot: bank.slot(),
         bank_hash: bank.hash().to_bytes(),
-    }))
+    })
 }
 
 fn encode_event(event: &Event) -> BankEvent {
     let mut bytes = [0; Event::size];
-    let written = event
-        .write_record(&mut bytes)
-        .expect("bank event should fit in the fixed queue payload");
+    let serialized = wincode::serialize(event).expect("bank event should serialize");
+    let written = serialized.len();
     debug_assert!(written <= Event::size);
+    bytes[..written].copy_from_slice(&serialized);
     bytes
 }
 
@@ -205,28 +200,39 @@ mod tests {
         let before_new_bank = monotonic_clock_timestamp_ns();
         let new_bank = new_bank_event(&bank);
         let after_new_bank = monotonic_clock_timestamp_ns();
-        let new_bank = Event::from_record_bytes(&new_bank).unwrap();
-        let Event::NewBankEvent(new_bank) = new_bank else {
+        let new_bank: Event = wincode::deserialize(&new_bank).unwrap();
+        let Event::NewBankEvent {
+            timestamp,
+            slot,
+            parent_slot,
+            parent_hash,
+        } = new_bank
+        else {
             panic!("expected new bank event");
         };
-        assert!(new_bank.timestamp >= before_new_bank);
-        assert!(new_bank.timestamp <= after_new_bank);
-        assert_eq!(new_bank.slot, bank.slot());
-        assert_eq!(new_bank.parent_slot, bank.parent_slot());
-        assert_eq!(new_bank.parent_hash, bank.parent_hash().to_bytes());
+        assert!(timestamp >= before_new_bank);
+        assert!(timestamp <= after_new_bank);
+        assert_eq!(slot, bank.slot());
+        assert_eq!(parent_slot, bank.parent_slot());
+        assert_eq!(parent_hash, bank.parent_hash().to_bytes());
 
         bank.freeze();
         let before_frozen_bank = monotonic_clock_timestamp_ns();
         let frozen_bank = frozen_bank_event(&bank);
         let after_frozen_bank = monotonic_clock_timestamp_ns();
-        let frozen_bank = Event::from_record_bytes(&frozen_bank).unwrap();
-        let Event::FrozenBankEvent(frozen_bank) = frozen_bank else {
+        let frozen_bank: Event = wincode::deserialize(&frozen_bank).unwrap();
+        let Event::FrozenBankEvent {
+            timestamp,
+            slot,
+            bank_hash,
+        } = frozen_bank
+        else {
             panic!("expected frozen bank event");
         };
-        assert!(frozen_bank.timestamp >= before_frozen_bank);
-        assert!(frozen_bank.timestamp <= after_frozen_bank);
-        assert_eq!(frozen_bank.slot, bank.slot());
-        assert_eq!(frozen_bank.bank_hash, bank.hash().to_bytes());
+        assert!(timestamp >= before_frozen_bank);
+        assert!(timestamp <= after_frozen_bank);
+        assert_eq!(slot, bank.slot());
+        assert_eq!(bank_hash, bank.hash().to_bytes());
     }
 
     #[test]
@@ -244,8 +250,23 @@ mod tests {
             schema
         );
 
-        let decoded: flatrecord::Schema = wincode::deserialize_exact(&schema).unwrap();
-        assert_eq!(decoded, Event::schema());
+        let wincode_dynamic::RootSchema::Enum {
+            name,
+            variants,
+            size,
+            tag_encoding,
+        } = wincode::deserialize_exact(&schema).unwrap()
+        else {
+            panic!("expected event enum schema");
+        };
+        assert_eq!(name, "Event");
+        assert_eq!(size, None);
+        assert_eq!(tag_encoding, wincode_dynamic::PrimitiveTy::U8);
+        assert_eq!(variants.len(), 2);
+        assert_eq!(variants[0].name(), "NewBankEvent");
+        assert_eq!(variants[0].size(), Some(56));
+        assert_eq!(variants[1].name(), "FrozenBankEvent");
+        assert_eq!(variants[1].size(), Some(48));
     }
 
     #[test]
@@ -271,7 +292,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let events_dir = temp_dir.path();
         let stale_queue = events_dir.join(".bank_events.stale.queue.tmp");
-        let stale_schema = events_dir.join(".bank_events.stale.frs.tmp");
+        let stale_schema = events_dir.join(".bank_events.stale.wds.tmp");
         let schema = bank_events_schema();
         fs::write(&stale_queue, b"stale").unwrap();
         fs::write(&stale_schema, b"stale").unwrap();
@@ -297,6 +318,6 @@ mod tests {
             create_event_queue::<BankEvent>(&events_dir, "bank_events", &schema, 8, 1, 1).unwrap();
 
         assert!(real_events_dir.join("bank_events").is_file());
-        assert!(real_events_dir.join("bank_events.frs").is_file());
+        assert!(real_events_dir.join("bank_events.wds").is_file());
     }
 }
