@@ -54,94 +54,134 @@ pub fn run(config: SchedulerConfig, exit: Arc<AtomicBool>) -> Result<(), Schedul
     Ok(())
 }
 
-fn run_session(config: SchedulerConfig, mut session: ClientSession, exit: Arc<AtomicBool>) {
-    let mut state = SchedulerState::new();
-    let mut transaction_state =
-        state_container::StateContainer::new(config.transaction_state_capacity);
-    let mut account_locks = ThreadAwareAccountLocks::new(config.execution_worker_count);
-    let mut in_flight = in_flight::InFlightTracker::new(
-        config.execution_worker_count,
-        config.pack_to_worker_capacity,
-    );
-    let mut scheduling_scratch = scheduling::SchedulingScratch::new(
-        config.transaction_state_capacity,
-        config.execution_worker_count,
-    );
-    let mut cost_pacer: Option<(u64, CostPacer)> = None;
+fn run_session(config: SchedulerConfig, session: ClientSession, exit: Arc<AtomicBool>) {
+    let mut scheduler = Scheduler::new(config, session);
 
     while !exit.load(Ordering::Relaxed) {
-        let now = Instant::now();
-        progress_tracker::drain_progress(&mut session.progress_tracker, &mut state);
+        scheduler.run_iteration(Instant::now());
+        thread::yield_now();
+    }
+}
+
+struct Scheduler {
+    session: ClientSession,
+    state: SchedulerState,
+    transaction_state: state_container::StateContainer,
+    account_locks: ThreadAwareAccountLocks,
+    in_flight: in_flight::InFlightTracker,
+    scheduling_scratch: scheduling::SchedulingScratch,
+    cost_pacer: Option<(u64, CostPacer)>,
+}
+
+impl Scheduler {
+    fn new(config: SchedulerConfig, session: ClientSession) -> Self {
+        Self {
+            session,
+            state: SchedulerState::new(),
+            transaction_state: state_container::StateContainer::new(
+                config.transaction_state_capacity,
+            ),
+            account_locks: ThreadAwareAccountLocks::new(config.execution_worker_count),
+            in_flight: in_flight::InFlightTracker::new(
+                config.execution_worker_count,
+                config.pack_to_worker_capacity,
+            ),
+            scheduling_scratch: scheduling::SchedulingScratch::new(
+                config.transaction_state_capacity,
+                config.execution_worker_count,
+            ),
+            cost_pacer: None,
+        }
+    }
+
+    fn run_iteration(&mut self, now: Instant) {
+        self.drain_progress();
+        self.drain_check_responses();
+        self.drain_execution_responses();
+        self.schedule(now);
+        self.ingest_tpu();
+    }
+
+    fn drain_progress(&mut self) {
+        progress_tracker::drain_progress(&mut self.session.progress_tracker, &mut self.state);
+    }
+
+    fn drain_check_responses(&mut self) {
         let check_sanitize_config = resolved_transaction::sanitize_config(
-            state.feature_set().snapshot().limit_instruction_accounts,
+            self.state
+                .feature_set()
+                .snapshot()
+                .limit_instruction_accounts,
         );
-        let ClientSession {
-            allocators,
-            tpu_to_pack,
-            pack_to_check_worker,
-            check_worker_to_pack,
-            workers,
-            ..
-        } = &mut session;
         check_response::drain_check_responses(
-            check_worker_to_pack,
-            &allocators[0],
+            &self.session.check_worker_to_pack,
+            &self.session.allocators[0],
             &check_sanitize_config,
-            state.reserved_account_keys(),
-            &mut transaction_state,
+            self.state.reserved_account_keys(),
+            &mut self.transaction_state,
             MAX_CHECK_RESPONSE_BATCHES_PER_ITERATION,
         );
+    }
+
+    fn drain_execution_responses(&mut self) {
         execution_response::drain_execution_responses(
-            workers,
-            &allocators[0],
-            &mut transaction_state,
-            &mut account_locks,
-            &mut in_flight,
+            &mut self.session.workers,
+            &self.session.allocators[0],
+            &mut self.transaction_state,
+            &mut self.account_locks,
+            &mut self.in_flight,
             MAX_EXECUTION_RESPONSE_BATCHES_PER_ITERATION,
         );
-        if state.can_process_transactions() {
-            let current_slot = state.current_slot();
-            let needs_new_cost_pacer = match cost_pacer.as_ref() {
+    }
+
+    fn schedule(&mut self, now: Instant) {
+        if self.state.can_process_transactions() {
+            let current_slot = self.state.current_slot();
+            let needs_new_cost_pacer = match self.cost_pacer.as_ref() {
                 Some((slot, _)) => *slot != current_slot,
                 None => true,
             };
             if needs_new_cost_pacer {
-                let fill_time = (state.target_bank_time_ms() != 0)
-                    .then(|| Duration::from_millis(u64::from(state.target_bank_time_ms())));
-                cost_pacer = Some((
+                let fill_time = (self.state.target_bank_time_ms() != 0)
+                    .then(|| Duration::from_millis(u64::from(self.state.target_bank_time_ms())));
+                self.cost_pacer = Some((
                     current_slot,
-                    CostPacer::new(state.initial_remaining_cost_units(), now, fill_time),
+                    CostPacer::new(self.state.initial_remaining_cost_units(), now, fill_time),
                 ));
             }
-            let (_, cost_pacer) = cost_pacer
+            let (_, cost_pacer) = self
+                .cost_pacer
                 .as_ref()
                 .expect("leader-ready scheduler state initializes the cost pacer");
-            let consumed_cost_units = state
+            let consumed_cost_units = self
+                .state
                 .initial_remaining_cost_units()
-                .saturating_sub(state.remaining_cost_units());
+                .saturating_sub(self.state.remaining_cost_units());
             scheduling::schedule(
-                workers,
-                &allocators[0],
-                &mut transaction_state,
-                &mut account_locks,
-                &mut in_flight,
-                &mut scheduling_scratch,
+                &mut self.session.workers,
+                &self.session.allocators[0],
+                &mut self.transaction_state,
+                &mut self.account_locks,
+                &mut self.in_flight,
+                &mut self.scheduling_scratch,
                 current_slot,
                 cost_pacer.scheduling_budget(&now, consumed_cost_units),
-                state.target_scheduled_cus(),
+                self.state.target_scheduled_cus(),
             );
         } else {
-            cost_pacer = None;
+            self.cost_pacer = None;
         }
+    }
+
+    fn ingest_tpu(&mut self) {
         tpu_ingress::drain_tpu(
-            tpu_to_pack,
-            pack_to_check_worker,
-            &allocators[0],
-            &state,
+            &mut self.session.tpu_to_pack,
+            &self.session.pack_to_check_worker,
+            &self.session.allocators[0],
+            &self.state,
             MAX_TPU_PACKETS_PER_ITERATION,
             |_, _| true,
         );
-        thread::yield_now();
     }
 }
 
