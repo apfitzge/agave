@@ -1,13 +1,11 @@
 use {
-    crate::transaction::{TpuTransactionMeta, TransactionId},
+    crate::transaction::TpuTransactionMeta,
     agave_scheduler_bindings::SharablePubkeys,
-    agave_scheduling_utils::transaction_ptr::TransactionPtr,
-    slab::Slab,
-    std::{
-        collections::{BTreeSet, btree_set::Range},
-        iter::Rev,
-        ops::Bound,
+    agave_scheduling_utils::{
+        transaction_priority_queue::{TransactionPriorityId, TransactionPriorityQueue},
+        transaction_ptr::TransactionPtr,
     },
+    slab::Slab,
 };
 
 /// A transaction that has passed external check-worker validation.
@@ -18,34 +16,19 @@ pub(crate) struct CheckedTransaction {
     pub(crate) resolved_pubkeys: SharablePubkeys,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct TransactionPriorityId {
-    priority: u64,
-    id: TransactionId,
-}
-
-impl TransactionPriorityId {
-    #[allow(dead_code)]
-    pub(crate) const fn transaction_id(self) -> TransactionId {
-        self.id
-    }
-}
-
 /// Owns checked transactions for their entire scheduler lifetime and orders queued ones by
 /// priority.
 pub(crate) struct StateContainer {
-    capacity: usize,
     transactions: Slab<CheckedTransaction>,
-    queue: BTreeSet<TransactionPriorityId>,
+    queue: TransactionPriorityQueue,
 }
 
 impl StateContainer {
     pub(crate) fn new(capacity: usize) -> Self {
         assert!(capacity > 0, "transaction state capacity must be non-zero");
         Self {
-            capacity,
-            transactions: Slab::with_capacity(capacity),
-            queue: BTreeSet::new(),
+            transactions: Slab::with_capacity(capacity.saturating_add(1)),
+            queue: TransactionPriorityQueue::with_capacity(capacity),
         }
     }
 
@@ -54,32 +37,17 @@ impl StateContainer {
     /// In-flight transactions remain in the slab but not the priority queue, so they are never
     /// evicted to make room for a new transaction.
     pub(crate) fn push(&mut self, transaction: CheckedTransaction) -> Option<CheckedTransaction> {
-        if self.transactions.len() == self.capacity {
-            let Some(lowest_priority) = self.queue.first().copied() else {
-                return Some(transaction);
-            };
-            if transaction.meta.priority < lowest_priority.priority {
-                return Some(transaction);
-            }
-
-            self.queue.remove(&lowest_priority);
-            let dropped = self.transactions.remove(lowest_priority.id);
-            self.insert(transaction);
-            return Some(dropped);
-        }
-
-        self.insert(transaction);
-        None
-    }
-
-    fn insert(&mut self, transaction: CheckedTransaction) {
         let entry = self.transactions.vacant_entry();
         let id = entry.key();
-        self.queue.insert(TransactionPriorityId {
-            priority: transaction.meta.priority,
-            id,
-        });
+        let priority_id = TransactionPriorityId::new(transaction.meta.priority, id);
         entry.insert(transaction);
+
+        let (queue, transactions) = (&mut self.queue, &mut self.transactions);
+        let mut dropped = None;
+        queue.push(std::iter::once(priority_id), transactions.len(), |id| {
+            dropped = Some(transactions.remove(id.id));
+        });
+        dropped
     }
 
     /// Iterates in descending priority order, resuming strictly below `cursor` when present.
@@ -91,14 +59,8 @@ impl StateContainer {
     pub(crate) fn descending_from(
         &self,
         cursor: Option<&TransactionPriorityId>,
-    ) -> Rev<Range<'_, TransactionPriorityId>> {
-        match cursor {
-            None => self.queue.range(..).rev(),
-            Some(cursor) => self
-                .queue
-                .range((Bound::Unbounded, Bound::Excluded(cursor)))
-                .rev(),
-        }
+    ) -> std::iter::Rev<std::collections::btree_set::Range<'_, TransactionPriorityId>> {
+        self.queue.descending_from(cursor)
     }
 
     #[allow(dead_code)]
@@ -124,9 +86,8 @@ impl StateContainer {
 
     #[cfg(test)]
     pub(crate) fn pop(&mut self) -> Option<CheckedTransaction> {
-        let priority_id = *self.queue.last()?;
-        self.dequeue(priority_id);
-        Some(self.remove(priority_id))
+        let priority_id = self.queue.pop_highest()?;
+        Some(self.transactions.remove(priority_id.id))
     }
 
     #[cfg(test)]
