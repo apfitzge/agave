@@ -75,7 +75,8 @@ dependencies = [
  "agave-feature-set",
  "agave-scheduler-bindings",
  "agave-scheduling-utils",
- "agave-transaction-view",
+ "agave-transaction-view 4.3.0",
+ "agave-transaction-view 4.3.0-alpha.0",
  "rts-alloc",
  "shaq",
  "slab",
@@ -325,7 +326,7 @@ version = "4.3.0-alpha.0"
 dependencies = [
  "agave-feature-set",
  "agave-scheduler-bindings",
- "agave-transaction-view",
+ "agave-transaction-view 4.3.0-alpha.0",
  "ahash 0.8.12",
  "libc",
  "nix",
@@ -385,7 +386,7 @@ dependencies = [
 name = "agave-transaction-view"
 version = "4.3.0-alpha.0"
 dependencies = [
- "agave-transaction-view",
+ "agave-transaction-view 4.3.0-alpha.0",
  "bincode",
  "criterion",
  "solana-hash 4.5.0",
@@ -402,6 +403,22 @@ dependencies = [
  "solana-system-interface 3.2.0",
  "solana-transaction",
  "wincode",
+]
+
+[[package]]
+name = "agave-transaction-view"
+version = "4.3.0"
+source = "git+https://github.com/apfitzge/agave-sdk.git?rev=3a586f082b9213b91ee14ea123845869d8103f0d#3a586f082b9213b91ee14ea123845869d8103f0d"
+dependencies = [
+ "solana-hash 4.5.0",
+ "solana-message",
+ "solana-packet 4.2.0",
+ "solana-pubkey 4.2.0",
+ "solana-sdk-ids",
+ "solana-short-vec",
+ "solana-signature",
+ "solana-svm-transaction",
+ "solana-transaction",
 ]
 
 [[package]]
@@ -8054,7 +8071,7 @@ dependencies = [
  "agave-scheduler-bindings",
  "agave-scheduling-utils",
  "agave-snapshots",
- "agave-transaction-view",
+ "agave-transaction-view 4.3.0-alpha.0",
  "agave-votor",
  "agave-votor-messages",
  "agave-xdp",
@@ -9481,7 +9498,7 @@ version = "4.3.0-alpha.0"
 dependencies = [
  "agave-logger",
  "agave-random",
- "agave-transaction-view",
+ "agave-transaction-view 4.3.0-alpha.0",
  "ahash 0.8.12",
  "arc-swap",
  "assert_matches",
@@ -10264,7 +10281,7 @@ dependencies = [
  "agave-precompiles",
  "agave-reserved-account-keys",
  "agave-snapshots",
- "agave-transaction-view",
+ "agave-transaction-view 4.3.0-alpha.0",
  "agave-votor-messages",
  "ahash 0.8.12",
  "aquamarine",
@@ -10402,7 +10419,7 @@ version = "4.3.0-alpha.0"
 dependencies = [
  "agave-feature-set",
  "agave-reserved-account-keys",
- "agave-transaction-view",
+ "agave-transaction-view 4.3.0-alpha.0",
  "criterion",
  "rand 0.9.4",
  "solana-compute-budget",
