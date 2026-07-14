@@ -2,7 +2,7 @@ use {
     crate::{
         resolved_transaction::ResolvedTransaction,
         state_container::{CheckedTransaction, StateContainer},
-        transaction::CheckBatch,
+        transaction::{CheckBatch, CheckTransactionMeta, TpuTransactionMeta},
     },
     agave_external_transaction_view::sanitize::SanitizeConfig,
     agave_scheduler_bindings::{
@@ -53,12 +53,14 @@ fn handle_check_response(
     let batch =
         unsafe { CheckBatch::from_sharable_transaction_batch_region(&response.batch, allocator) };
 
-    if response.processed_code != processed_codes::PROCESSED
-        || response.responses.tag != CHECK_RESPONSE
-        || response.responses.num_transaction_responses != response.batch.num_transactions
-    {
-        free_batch_transactions(batch, allocator);
-        free_check_response_region_if_present(&response, allocator);
+    let response_is_valid = response.processed_code == processed_codes::PROCESSED
+        && response.responses.tag == CHECK_RESPONSE
+        && response.responses.num_transaction_responses == response.batch.num_transactions;
+    if !response_is_valid {
+        discard_unprocessed_batch(batch, allocator, state);
+        if response.processed_code == processed_codes::PROCESSED {
+            free_check_response_region_if_present(&response, allocator);
+        }
         return;
     }
 
@@ -69,33 +71,19 @@ fn handle_check_response(
     };
 
     for ((transaction, meta), check_response) in batch.iter().zip(responses.iter()) {
-        if response_is_valid(check_response) {
-            // SAFETY: successful checks transfer ownership of the transaction and resolved
-            // pubkey allocations to this scheduler.
-            match unsafe {
-                ResolvedTransaction::try_new(
-                    transaction,
-                    check_response.resolved_pubkeys,
-                    allocator,
-                    sanitize_config,
-                    reserved_account_keys,
-                )
-            } {
-                Ok(transaction) => {
-                    if let Some(dropped) = state.push(CheckedTransaction { transaction, meta }) {
-                        free_checked_transaction(dropped, allocator);
-                    }
-                }
-                Err(transaction) => {
-                    // SAFETY: this scheduler retains ownership after the external-view parse
-                    // fails, and must release both shared allocations.
-                    unsafe { transaction.free(allocator) };
-                }
+        match meta {
+            CheckTransactionMeta::Tpu(meta) => handle_tpu_check_response(
+                transaction,
+                meta,
+                check_response,
+                allocator,
+                sanitize_config,
+                reserved_account_keys,
+                state,
+            ),
+            CheckTransactionMeta::Recheck { transaction_id } => {
+                handle_recheck_response(transaction_id, check_response, allocator, state);
             }
-        } else {
-            // SAFETY: rejected transactions are still owned by this scheduler.
-            unsafe { transaction.free(allocator) };
-            free_resolved_pubkeys(check_response.resolved_pubkeys, allocator);
         }
     }
 
@@ -108,7 +96,71 @@ fn handle_check_response(
     }
 }
 
-fn response_is_valid(response: &CheckResponse) -> bool {
+fn handle_tpu_check_response(
+    transaction: agave_scheduling_utils::transaction_ptr::TransactionPtr,
+    meta: TpuTransactionMeta,
+    check_response: &CheckResponse,
+    allocator: &Allocator,
+    sanitize_config: &SanitizeConfig,
+    reserved_account_keys: &HashSet<Pubkey>,
+    state: &mut StateContainer,
+) {
+    if initial_response_is_valid(check_response) {
+        // SAFETY: successful checks transfer ownership of the transaction and resolved pubkey
+        // allocations to this scheduler.
+        match unsafe {
+            ResolvedTransaction::try_new(
+                transaction,
+                check_response.resolved_pubkeys,
+                allocator,
+                sanitize_config,
+                reserved_account_keys,
+            )
+        } {
+            Ok(transaction) => {
+                if let Some(dropped) = state.push(CheckedTransaction::new(transaction, meta)) {
+                    free_checked_transaction(dropped, allocator);
+                }
+            }
+            Err(transaction) => {
+                // SAFETY: this scheduler retains ownership after the external-view parse fails,
+                // and must release both shared allocations.
+                unsafe { transaction.free(allocator) };
+            }
+        }
+    } else {
+        // SAFETY: rejected transactions are still owned by this scheduler.
+        unsafe { transaction.free(allocator) };
+        free_resolved_pubkeys(check_response.resolved_pubkeys, allocator);
+    }
+}
+
+fn handle_recheck_response(
+    transaction_id: usize,
+    response: &CheckResponse,
+    allocator: &Allocator,
+    state: &mut StateContainer,
+) {
+    if let Some(transaction) =
+        state.complete_recheck(transaction_id, recheck_response_is_valid(response))
+    {
+        free_checked_transaction(transaction, allocator);
+    }
+}
+
+fn initial_response_is_valid(response: &CheckResponse) -> bool {
+    response_is_status_valid(response)
+        && response.fee_payer_balance_flags & fee_payer_balance_flags::PERFORMED != 0
+        && response.resolve_flags & resolve_flags::PERFORMED != 0
+        && response.resolve_flags & resolve_flags::FAILED == 0
+}
+
+fn recheck_response_is_valid(response: &CheckResponse) -> bool {
+    response_is_status_valid(response)
+        && response.fee_payer_balance_flags & fee_payer_balance_flags::PERFORMED != 0
+}
+
+fn response_is_status_valid(response: &CheckResponse) -> bool {
     const STATUS_FAILURE_FLAGS: u8 = status_check_flags::TOO_OLD
         | status_check_flags::ALREADY_PROCESSED
         | status_check_flags::INVALID_NONCE
@@ -117,15 +169,21 @@ fn response_is_valid(response: &CheckResponse) -> bool {
     response.parsing_and_sanitization_flags & parsing_and_sanitization_flags::FAILED == 0
         && response.status_check_flags & status_check_flags::PERFORMED != 0
         && response.status_check_flags & STATUS_FAILURE_FLAGS == 0
-        && response.fee_payer_balance_flags & fee_payer_balance_flags::PERFORMED != 0
-        && response.resolve_flags & resolve_flags::PERFORMED != 0
-        && response.resolve_flags & resolve_flags::FAILED == 0
 }
 
-fn free_batch_transactions(batch: CheckBatch, allocator: &Allocator) {
-    for (transaction, _) in batch.iter() {
-        // SAFETY: this scheduler owns transactions that were not successfully checked.
-        unsafe { transaction.free(allocator) };
+fn discard_unprocessed_batch(batch: CheckBatch, allocator: &Allocator, state: &mut StateContainer) {
+    for (transaction, meta) in batch.iter() {
+        match meta {
+            CheckTransactionMeta::Tpu(_) => {
+                // SAFETY: this scheduler owns transactions that were not successfully checked.
+                unsafe { transaction.free(allocator) };
+            }
+            CheckTransactionMeta::Recheck { transaction_id } => {
+                if let Some(transaction) = state.complete_recheck(transaction_id, true) {
+                    free_checked_transaction(transaction, allocator);
+                }
+            }
+        }
     }
     // SAFETY: this scheduler owns the returned batch container.
     unsafe { batch.free() };
@@ -226,17 +284,17 @@ mod tests {
             allocator
                 .ptr_from_offset(batch_offset)
                 .byte_add(CheckBatch::TRANSACTION_META_START)
-                .cast::<TpuTransactionMeta>()
+                .cast::<CheckTransactionMeta>()
         };
         // SAFETY: both arrays have space for at least one element.
         unsafe {
             transaction_regions.write(transaction);
-            transaction_metas.write(TpuTransactionMeta {
+            transaction_metas.write(CheckTransactionMeta::Tpu(TpuTransactionMeta {
                 priority,
                 cost: 0,
                 flags: 0,
                 src_addr: [0; 16],
-            });
+            }));
         }
 
         SharableTransactionBatchRegion {

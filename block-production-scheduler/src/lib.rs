@@ -23,6 +23,7 @@ mod config;
 mod execution_response;
 mod in_flight;
 mod progress_tracker;
+mod recheck;
 mod resolved_transaction;
 mod scheduling;
 mod state_container;
@@ -70,6 +71,7 @@ struct Scheduler {
     account_locks: ThreadAwareAccountLocks,
     in_flight: in_flight::InFlightTracker,
     scheduling_scratch: scheduling::SchedulingScratch,
+    recheck_scratch: recheck::RecheckScratch,
     cost_pacer: Option<(u64, CostPacer)>,
 }
 
@@ -90,6 +92,7 @@ impl Scheduler {
                 config.transaction_state_capacity,
                 config.execution_worker_count,
             ),
+            recheck_scratch: recheck::RecheckScratch::new(),
             cost_pacer: None,
         }
     }
@@ -99,6 +102,7 @@ impl Scheduler {
         self.drain_check_responses();
         self.drain_execution_responses();
         self.schedule(now);
+        self.recheck_transactions();
         self.ingest_tpu();
     }
 
@@ -181,6 +185,19 @@ impl Scheduler {
             &self.state,
             MAX_TPU_PACKETS_PER_ITERATION,
             |_, _| true,
+        );
+    }
+
+    fn recheck_transactions(&mut self) {
+        if self.state.is_leader() {
+            return;
+        }
+        recheck::send_rechecks(
+            &self.session.pack_to_check_worker,
+            &self.session.allocators[0],
+            &mut self.transaction_state,
+            &mut self.recheck_scratch,
+            recheck::MAX_RECHECK_PACKETS_PER_ITERATION,
         );
     }
 }

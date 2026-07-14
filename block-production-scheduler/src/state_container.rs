@@ -10,6 +10,20 @@ use {
 pub(crate) struct CheckedTransaction {
     pub(crate) transaction: ResolvedTransaction,
     pub(crate) meta: TpuTransactionMeta,
+    // References held by execution or recheck work outside this container.
+    reference_count: u8,
+    should_drop: bool,
+}
+
+impl CheckedTransaction {
+    pub(crate) fn new(transaction: ResolvedTransaction, meta: TpuTransactionMeta) -> Self {
+        Self {
+            transaction,
+            meta,
+            reference_count: 0,
+            should_drop: false,
+        }
+    }
 }
 
 /// Owns checked transactions for their entire scheduler lifetime and orders queued ones by
@@ -72,6 +86,7 @@ impl StateContainer {
             self.queue.remove(&priority_id),
             "selected transaction must remain queued until removed"
         );
+        self.acquire_reference(transaction_id);
     }
 
     /// Removes a terminal transaction from scheduler state.
@@ -82,6 +97,67 @@ impl StateContainer {
         );
         self.queue.remove(&priority_id);
         self.transactions.remove(transaction_id)
+    }
+
+    /// Marks a transaction as owned by an outstanding recheck request.
+    pub(crate) fn start_recheck(&mut self, transaction_id: usize) {
+        self.acquire_reference(transaction_id);
+    }
+
+    pub(crate) fn has_references(&self, transaction_id: usize) -> bool {
+        self.transactions[transaction_id].reference_count != 0
+    }
+
+    /// Completes a recheck and returns a transaction that can now be freed.
+    pub(crate) fn complete_recheck(
+        &mut self,
+        transaction_id: usize,
+        valid: bool,
+    ) -> Option<CheckedTransaction> {
+        if !valid {
+            self.transactions[transaction_id].should_drop = true;
+        }
+        self.release_reference(transaction_id)
+    }
+
+    /// Completes execution, returning a terminal transaction that can now be freed.
+    pub(crate) fn complete_execution(
+        &mut self,
+        transaction_id: usize,
+        retryability: Option<bool>,
+        mut on_evict: impl FnMut(CheckedTransaction),
+    ) -> Option<CheckedTransaction> {
+        let should_retry = retryability.is_some() && !self.transactions[transaction_id].should_drop;
+        if !should_retry {
+            self.transactions[transaction_id].should_drop = true;
+        }
+        let dropped = self.release_reference(transaction_id);
+        if dropped.is_some() {
+            return dropped;
+        }
+
+        if should_retry {
+            let immediately_retryable =
+                retryability.expect("retryable response must have a reason");
+            self.retry(transaction_id, immediately_retryable, &mut on_evict);
+        }
+        None
+    }
+
+    fn acquire_reference(&mut self, transaction_id: usize) {
+        self.transactions[transaction_id].reference_count = self.transactions[transaction_id]
+            .reference_count
+            .wrapping_add(1);
+    }
+
+    fn release_reference(&mut self, transaction_id: usize) -> Option<CheckedTransaction> {
+        let transaction = &mut self.transactions[transaction_id];
+        transaction.reference_count = transaction.reference_count.wrapping_sub(1);
+        if transaction.should_drop && transaction.reference_count == 0 {
+            Some(self.remove(transaction_id))
+        } else {
+            None
+        }
     }
 
     /// Requeue a completed transaction, either immediately or after the next slot transition.
@@ -190,15 +266,15 @@ mod tests {
             )
         }
         .unwrap();
-        CheckedTransaction {
+        CheckedTransaction::new(
             transaction,
-            meta: TpuTransactionMeta {
+            TpuTransactionMeta {
                 priority,
                 cost: 0,
                 flags: 0,
                 src_addr: [0; 16],
             },
-        }
+        )
     }
 
     fn session() -> agave_scheduling_utils::handshake::AgaveSession {
@@ -297,6 +373,50 @@ mod tests {
         container.flush_held(|_| unreachable!());
         let transaction = container.pop().unwrap();
         assert_eq!(transaction.meta.priority, 10);
+        // SAFETY: the test has removed the transaction from scheduler state.
+        unsafe { transaction.transaction.free(allocator) };
+    }
+
+    #[test]
+    fn invalid_recheck_waits_for_execution_to_complete() {
+        let session = session();
+        let allocator = &session.tpu_to_pack.allocator;
+        let mut container = StateContainer::new(1);
+        assert!(container.push(checked_transaction(allocator, 10)).is_none());
+        let transaction_id = container.descending_from(None).next().unwrap().id;
+
+        container.start_recheck(transaction_id);
+        container.dequeue(transaction_id);
+        assert!(container.complete_recheck(transaction_id, false).is_none());
+        assert_eq!(container.buffer_len(), 1);
+
+        let transaction = container
+            .complete_execution(transaction_id, Some(true), |_| unreachable!())
+            .expect("invalid recheck drops after execution completes");
+        // SAFETY: the test has removed the transaction from scheduler state.
+        unsafe { transaction.transaction.free(allocator) };
+    }
+
+    #[test]
+    fn terminal_execution_waits_for_recheck_to_complete() {
+        let session = session();
+        let allocator = &session.tpu_to_pack.allocator;
+        let mut container = StateContainer::new(1);
+        assert!(container.push(checked_transaction(allocator, 10)).is_none());
+        let transaction_id = container.descending_from(None).next().unwrap().id;
+
+        container.start_recheck(transaction_id);
+        container.dequeue(transaction_id);
+        assert!(
+            container
+                .complete_execution(transaction_id, None, |_| unreachable!())
+                .is_none()
+        );
+        assert_eq!(container.buffer_len(), 1);
+
+        let transaction = container
+            .complete_recheck(transaction_id, true)
+            .expect("terminal execution drops after recheck completes");
         // SAFETY: the test has removed the transaction from scheduler state.
         unsafe { transaction.transaction.free(allocator) };
     }

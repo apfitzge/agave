@@ -445,15 +445,15 @@ mod tests {
             )
         }
         .unwrap();
-        CheckedTransaction {
+        CheckedTransaction::new(
             transaction,
-            meta: TpuTransactionMeta {
+            TpuTransactionMeta {
                 priority,
                 cost,
                 flags: 0,
                 src_addr: [0; 16],
             },
-        }
+        )
     }
 
     #[test]

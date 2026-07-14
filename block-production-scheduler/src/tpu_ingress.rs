@@ -1,7 +1,9 @@
 use {
     crate::{
         progress_tracker::SchedulerState,
-        transaction::{CheckBatch, MAX_PACKETS_PER_CHECK_BATCH, TpuTransactionMeta},
+        transaction::{
+            CheckBatch, CheckTransactionMeta, MAX_PACKETS_PER_CHECK_BATCH, TpuTransactionMeta,
+        },
     },
     agave_scheduler_bindings::{
         PackToCheckWorkerMessage, TpuToPackMessage, check_message_flags, tpu_message_flags,
@@ -101,7 +103,9 @@ pub(crate) fn drain_tpu(
                     }
                 };
             assert!(
-                batch.push(message.transaction, meta).is_ok(),
+                batch
+                    .push(message.transaction, CheckTransactionMeta::Tpu(meta))
+                    .is_ok(),
                 "batch is bounded by the check-worker capacity"
             );
         }
@@ -306,6 +310,9 @@ mod tests {
                 CheckBatch::from_sharable_transaction_batch_region(&message.batch, allocator)
             };
             for (transaction_index, (_, meta)) in batch.iter().enumerate() {
+                let CheckTransactionMeta::Tpu(meta) = meta else {
+                    panic!("TPU ingress must retain TPU metadata");
+                };
                 assert!(meta.priority > 0);
                 assert_eq!(meta.flags, 0);
                 assert_eq!(

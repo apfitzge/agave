@@ -16,8 +16,16 @@ pub(crate) struct TpuTransactionMeta {
     pub(crate) src_addr: [u8; 16],
 }
 
+/// Scheduler metadata for a transaction sent to a check worker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub(crate) enum CheckTransactionMeta {
+    Tpu(TpuTransactionMeta),
+    Recheck { transaction_id: TransactionId },
+}
+
 pub(crate) type CheckBatch<'a> =
-    TransactionPtrBatch<'a, TpuTransactionMeta, MAX_PACKETS_PER_CHECK_BATCH>;
+    TransactionPtrBatch<'a, CheckTransactionMeta, MAX_PACKETS_PER_CHECK_BATCH>;
 
 /// Scheduler state associated with a transaction sent to an execution worker.
 #[allow(dead_code)]

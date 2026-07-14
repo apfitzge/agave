@@ -134,14 +134,12 @@ fn complete_transaction(
         account_locks.unlock_accounts(locks.write_locks(), locks.read_locks(), worker_id);
         transaction.meta.cost
     };
-
-    match retryability {
-        Some(immediately_retryable) => {
-            state.retry(transaction_id, immediately_retryable, |transaction| {
-                free_checked_transaction(transaction, allocator)
-            })
-        }
-        None => free_checked_transaction(state.remove(transaction_id), allocator),
+    if let Some(transaction) =
+        state.complete_execution(transaction_id, retryability, |transaction| {
+            free_checked_transaction(transaction, allocator)
+        })
+    {
+        free_checked_transaction(transaction, allocator);
     }
     scheduled_cost
 }
@@ -241,15 +239,15 @@ mod tests {
             )
         }
         .unwrap();
-        CheckedTransaction {
+        CheckedTransaction::new(
             transaction,
-            meta: TpuTransactionMeta {
+            TpuTransactionMeta {
                 priority: 1,
                 cost,
                 flags: 0,
                 src_addr: [0; 16],
             },
-        }
+        )
     }
 
     fn dispatch_transaction(
