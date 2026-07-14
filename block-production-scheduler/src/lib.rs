@@ -39,11 +39,17 @@ pub fn run(config: SchedulerConfig, exit: Arc<AtomicBool>) -> Result<(), Schedul
         return Ok(());
     }
 
-    let mut session = client::connect(
+    let session = client::connect(
         &config.bindings_ipc,
         config.client_logon(),
         config.handshake_timeout,
     )?;
+    run_session(config, session, exit);
+
+    Ok(())
+}
+
+fn run_session(config: SchedulerConfig, mut session: ClientSession, exit: Arc<AtomicBool>) {
     let mut state = SchedulerState::new();
     let mut transaction_state =
         state_container::StateContainer::new(config.transaction_state_capacity);
@@ -101,8 +107,6 @@ pub fn run(config: SchedulerConfig, exit: Arc<AtomicBool>) -> Result<(), Schedul
         );
         thread::yield_now();
     }
-
-    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -116,8 +120,9 @@ pub enum SchedulerError {
 #[cfg(test)]
 mod tests {
     use {
-        super::*, agave_scheduling_utils::handshake::server::Server, std::sync::atomic::AtomicBool,
-        tempfile::NamedTempFile,
+        super::*,
+        agave_scheduling_utils::handshake::{client, server::Server},
+        std::sync::atomic::AtomicBool,
     };
 
     #[test]
@@ -140,19 +145,13 @@ mod tests {
     }
 
     #[test]
-    fn connects_then_exits() {
-        let ipc = NamedTempFile::new().unwrap();
-        std::fs::remove_file(ipc.path()).unwrap();
-        let mut server = Server::new(ipc.path()).unwrap();
-        let mut config = SchedulerConfig::new(ipc.path());
+    fn exits_without_running_when_already_signaled() {
+        let mut config = SchedulerConfig::new("/unused");
         config.allocator_size = 64 * 1024 * 1024;
+        let logon = config.client_logon();
+        let (_agave_session, files) = Server::setup_session(logon).unwrap();
+        let client_session = client::setup_session(&logon, files).unwrap();
 
-        let exit = Arc::new(AtomicBool::new(false));
-        let runner_exit = Arc::clone(&exit);
-        let runner = thread::spawn(move || run(config, runner_exit));
-
-        let _session = server.accept().unwrap();
-        exit.store(true, Ordering::Relaxed);
-        runner.join().unwrap().unwrap();
+        run_session(config, client_session, Arc::new(AtomicBool::new(true)));
     }
 }
