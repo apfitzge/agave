@@ -214,7 +214,25 @@ pub enum SchedulerError {
 mod tests {
     use {
         super::*,
-        agave_scheduling_utils::handshake::{client, server::Server},
+        agave_scheduler_bindings::{
+            CheckWorkerToPackMessage, ExecutionWorkerToPackMessage, LEADER_READY, ProgressMessage,
+            SharablePubkeys, TpuToPackMessage, processed_codes,
+            worker_message_types::{
+                CheckResponse, ExecutionResponse, fee_payer_balance_flags, resolve_flags,
+                status_check_flags,
+            },
+        },
+        agave_scheduling_utils::{
+            handshake::{client, server::Server},
+            responses_region::{execution_responses_from_iter, resolve_responses_from_iter},
+        },
+        solana_hash::Hash,
+        solana_keypair::Keypair,
+        solana_message::Message,
+        solana_pubkey::Pubkey,
+        solana_signer::Signer,
+        solana_system_interface::instruction as system_instruction,
+        solana_transaction::{Transaction, versioned::VersionedTransaction},
         std::sync::atomic::AtomicBool,
     };
 
@@ -246,5 +264,151 @@ mod tests {
         let client_session = client::setup_session(&logon, files).unwrap();
 
         run_session(config, client_session, Arc::new(AtomicBool::new(true)));
+    }
+
+    fn leader_ready_progress() -> ProgressMessage {
+        ProgressMessage {
+            leader_state: LEADER_READY,
+            current_slot_progress: 0,
+            epoch: 0,
+            current_slot: 1,
+            next_leader_slot: 10,
+            leader_range_end: 13,
+            remaining_cost_units: 48_000_000,
+            latest_blockhash: [0; 32],
+            scheduler_features: 0,
+            target_bank_time_ms: 0,
+        }
+    }
+
+    fn valid_check_response() -> CheckResponse {
+        CheckResponse {
+            parsing_and_sanitization_flags: 0,
+            status_check_flags: status_check_flags::REQUESTED | status_check_flags::PERFORMED,
+            fee_payer_balance_flags: fee_payer_balance_flags::REQUESTED
+                | fee_payer_balance_flags::PERFORMED,
+            resolve_flags: resolve_flags::REQUESTED | resolve_flags::PERFORMED,
+            included_slot: 0,
+            balance_slot: 0,
+            fee_payer_balance: 0,
+            resolution_slot: 0,
+            min_alt_deactivation_slot: u64::MAX,
+            resolved_pubkeys: SharablePubkeys {
+                offset: 0,
+                num_pubkeys: 0,
+            },
+        }
+    }
+
+    fn transaction_bytes() -> Vec<u8> {
+        let payer = Keypair::new();
+        let message = Message::new(
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                &Pubkey::new_from_array([1; 32]),
+                1,
+            )],
+            Some(&payer.pubkey()),
+        );
+        wincode::serialize(&VersionedTransaction::from(Transaction::new(
+            &[&payer],
+            message,
+            Hash::default(),
+        )))
+        .unwrap()
+    }
+
+    #[test]
+    fn runs_a_transaction_from_tpu_through_execution() {
+        let mut config = SchedulerConfig::new("/unused");
+        config.allocator_size = 64 * 1024 * 1024;
+        config.execution_worker_count = 1;
+        config.check_worker_count = 1;
+        let logon = config.client_logon();
+        let (mut agave_session, files) = Server::setup_session(logon).unwrap();
+        let client_session = client::setup_session(&logon, files).unwrap();
+        let allocator = &agave_session.tpu_to_pack.allocator;
+        let mut scheduler = Scheduler::new(config, client_session);
+
+        agave_session
+            .progress_tracker
+            .try_write(leader_ready_progress())
+            .unwrap();
+        agave_session.progress_tracker.commit();
+
+        let bytes = transaction_bytes();
+        let transaction = allocator.allocate(bytes.len().try_into().unwrap()).unwrap();
+        // SAFETY: `transaction` is a fresh allocation with room for `bytes`.
+        unsafe {
+            transaction.copy_from_nonoverlapping(
+                core::ptr::NonNull::new(bytes.as_ptr().cast_mut()).unwrap(),
+                bytes.len(),
+            );
+        }
+        // SAFETY: `transaction` was allocated by this allocator immediately above.
+        let offset = unsafe { allocator.offset(transaction) };
+        agave_session
+            .tpu_to_pack
+            .producer
+            .try_write(TpuToPackMessage {
+                transaction: agave_scheduler_bindings::SharableTransactionRegion {
+                    offset,
+                    length: bytes.len().try_into().unwrap(),
+                },
+                flags: 0,
+                src_addr: [0; 16],
+            })
+            .unwrap();
+        agave_session.tpu_to_pack.producer.commit();
+
+        scheduler.run_iteration(Instant::now());
+        let check = agave_session.check_workers[0]
+            .pack_to_check_worker
+            .try_read()
+            .unwrap();
+        let responses =
+            resolve_responses_from_iter(allocator, std::iter::once(valid_check_response()))
+                .unwrap();
+        agave_session.check_workers[0]
+            .check_worker_to_pack
+            .try_write(CheckWorkerToPackMessage {
+                batch: check.batch,
+                processed_code: processed_codes::PROCESSED,
+                responses,
+            })
+            .unwrap();
+
+        scheduler.run_iteration(Instant::now());
+        assert_eq!(scheduler.transaction_state.buffer_len(), 1);
+        assert_eq!(scheduler.transaction_state.len(), 0);
+        let batch = {
+            let worker = &mut agave_session.workers[0];
+            worker.pack_to_worker.sync();
+            let batch = worker.pack_to_worker.try_read().unwrap().batch;
+            worker.pack_to_worker.finalize();
+            batch
+        };
+        let responses = execution_responses_from_iter(
+            allocator,
+            std::iter::once(ExecutionResponse {
+                execution_slot: 1,
+                not_included_reason: 0,
+                cost_units: 0,
+                fee_payer_balance: 0,
+            }),
+        )
+        .unwrap();
+        agave_session.workers[0]
+            .worker_to_pack
+            .try_write(ExecutionWorkerToPackMessage {
+                batch,
+                processed_code: processed_codes::PROCESSED,
+                responses,
+            })
+            .unwrap();
+        agave_session.workers[0].worker_to_pack.commit();
+
+        scheduler.run_iteration(Instant::now());
+        assert_eq!(scheduler.transaction_state.buffer_len(), 0);
     }
 }
