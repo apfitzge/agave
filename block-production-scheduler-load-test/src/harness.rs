@@ -169,6 +169,7 @@ impl Harness {
     pub fn start(
         session: AgaveSession,
         config: HarnessConfig,
+        exit: Arc<AtomicBool>,
         setup: impl FnOnce(&Arc<Bank>),
     ) -> Result<Self, HarnessError> {
         if config.slot_duration.is_zero() {
@@ -206,7 +207,6 @@ impl Harness {
         let blockstore =
             Arc::new(Blockstore::open(ledger.path()).map_err(HarnessError::Blockstore)?);
         let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(&root_bank));
-        let exit = Arc::new(AtomicBool::new(false));
         let (clear_bank_sender, clear_bank_receiver) = bounded(1);
         let (poh_recorder, entry_receiver) = PohRecorder::new_with_clear_signal(
             root_bank.tick_height(),
@@ -525,7 +525,13 @@ mod tests {
         let logon = test_logon();
         let (agave_session, files) = Server::setup_session(logon).unwrap();
         let mut scheduler_session = client::setup_session(&logon, files).unwrap();
-        let mut harness = Harness::start(agave_session, HarnessConfig::default(), |_| {}).unwrap();
+        let mut harness = Harness::start(
+            agave_session,
+            HarnessConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
 
         let transaction = [1, 2, 3, 4];
         let injector = harness.injector();
@@ -562,6 +568,7 @@ mod tests {
             HarnessConfig {
                 slot_duration: Duration::from_millis(20),
             },
+            Arc::new(AtomicBool::new(false)),
             |_| {},
         )
         .unwrap();
