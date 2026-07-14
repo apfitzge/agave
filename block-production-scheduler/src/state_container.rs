@@ -1,5 +1,5 @@
 use {
-    crate::transaction::TpuTransactionMeta,
+    crate::transaction::{TpuTransactionMeta, TransactionId},
     agave_scheduler_bindings::SharablePubkeys,
     agave_scheduling_utils::transaction_ptr::TransactionPtr,
     slab::Slab,
@@ -21,7 +21,14 @@ pub(crate) struct CheckedTransaction {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct TransactionPriorityId {
     priority: u64,
-    id: usize,
+    id: TransactionId,
+}
+
+impl TransactionPriorityId {
+    #[allow(dead_code)]
+    pub(crate) const fn transaction_id(self) -> TransactionId {
+        self.id
+    }
 }
 
 /// Owns checked transactions for their entire scheduler lifetime and orders queued ones by
