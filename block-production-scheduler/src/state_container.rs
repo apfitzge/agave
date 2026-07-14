@@ -1,9 +1,7 @@
 use {
-    crate::transaction::TpuTransactionMeta,
-    agave_scheduler_bindings::SharablePubkeys,
-    agave_scheduling_utils::{
-        transaction_priority_queue::{TransactionPriorityId, TransactionPriorityQueue},
-        transaction_ptr::TransactionPtr,
+    crate::{resolved_transaction::ResolvedTransaction, transaction::TpuTransactionMeta},
+    agave_scheduling_utils::transaction_priority_queue::{
+        TransactionPriorityId, TransactionPriorityQueue,
     },
     slab::Slab,
 };
@@ -11,9 +9,8 @@ use {
 /// A transaction that has passed external check-worker validation.
 #[allow(dead_code)]
 pub(crate) struct CheckedTransaction {
-    pub(crate) transaction: TransactionPtr,
+    pub(crate) transaction: ResolvedTransaction,
     pub(crate) meta: TpuTransactionMeta,
-    pub(crate) resolved_pubkeys: SharablePubkeys,
 }
 
 /// Owns checked transactions for their entire scheduler lifetime and orders queued ones by
@@ -103,12 +100,59 @@ impl StateContainer {
 
 #[cfg(test)]
 mod tests {
-    use {super::*, core::ptr::NonNull};
+    use {
+        super::*,
+        crate::{SchedulerConfig, resolved_transaction::sanitize_config},
+        agave_scheduler_bindings::SharablePubkeys,
+        agave_scheduling_utils::{handshake::server::Server, transaction_ptr::TransactionPtr},
+        rts_alloc::Allocator,
+        solana_hash::Hash,
+        solana_keypair::Keypair,
+        solana_message::Message,
+        solana_pubkey::Pubkey,
+        solana_signer::Signer,
+        solana_system_interface::instruction as system_instruction,
+        solana_transaction::{Transaction, versioned::VersionedTransaction},
+        std::collections::HashSet,
+    };
 
-    fn checked_transaction(priority: u64) -> CheckedTransaction {
-        // SAFETY: the test only uses the pointer as scheduler state; it never dereferences or
-        // frees it.
-        let transaction = unsafe { TransactionPtr::from_raw_parts(NonNull::dangling(), 0) };
+    fn checked_transaction(allocator: &Allocator, priority: u64) -> CheckedTransaction {
+        let payer = Keypair::new();
+        let message = Message::new(
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                &Pubkey::new_from_array([1; 32]),
+                1,
+            )],
+            Some(&payer.pubkey()),
+        );
+        let bytes = wincode::serialize(&VersionedTransaction::from(Transaction::new(
+            &[&payer],
+            message,
+            Hash::default(),
+        )))
+        .unwrap();
+        let allocation = allocator.allocate(bytes.len() as u32).unwrap();
+        // SAFETY: both pointers are valid for `bytes.len()` bytes and do not overlap.
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), allocation.as_ptr(), bytes.len());
+        }
+        // SAFETY: `allocation` was created by this allocator immediately above.
+        let transaction = unsafe { TransactionPtr::from_raw_parts(allocation, bytes.len()) };
+        // SAFETY: this test owns the transaction allocation and has no resolved pubkeys.
+        let transaction = unsafe {
+            ResolvedTransaction::try_new(
+                transaction,
+                SharablePubkeys {
+                    offset: 0,
+                    num_pubkeys: 0,
+                },
+                allocator,
+                &sanitize_config(false),
+                &HashSet::new(),
+            )
+        }
+        .unwrap();
         CheckedTransaction {
             transaction,
             meta: TpuTransactionMeta {
@@ -117,18 +161,27 @@ mod tests {
                 flags: 0,
                 src_addr: [0; 16],
             },
-            resolved_pubkeys: SharablePubkeys {
-                offset: 0,
-                num_pubkeys: 0,
-            },
         }
+    }
+
+    fn session() -> agave_scheduling_utils::handshake::AgaveSession {
+        let mut config = SchedulerConfig::new("/unused");
+        config.allocator_size = 64 * 1024 * 1024;
+        let (session, _) = Server::setup_session(config.client_logon()).unwrap();
+        session
     }
 
     #[test]
     fn descending_scan_resumes_after_dequeued_cursor() {
+        let session = session();
+        let allocator = &session.tpu_to_pack.allocator;
         let mut container = StateContainer::new(4);
         for priority in [5, 10, 5, 1] {
-            assert!(container.push(checked_transaction(priority)).is_none());
+            assert!(
+                container
+                    .push(checked_transaction(&allocator, priority))
+                    .is_none()
+            );
         }
 
         let mut cursor = None;
@@ -171,20 +224,22 @@ mod tests {
 
     #[test]
     fn does_not_evict_in_flight_transactions() {
+        let session = session();
+        let allocator = &session.tpu_to_pack.allocator;
         let mut container = StateContainer::new(2);
-        container.push(checked_transaction(10));
-        container.push(checked_transaction(5));
+        container.push(checked_transaction(&allocator, 10));
+        container.push(checked_transaction(&allocator, 5));
 
         let in_flight = *container.descending_from(None).next().unwrap();
         container.dequeue(in_flight);
-        let dropped = container.push(checked_transaction(7)).unwrap();
+        let dropped = container.push(checked_transaction(&allocator, 7)).unwrap();
         assert_eq!(dropped.meta.priority, 5);
         assert_eq!(container.get(in_flight).meta.priority, 10);
         assert_eq!(container.buffer_len(), 2);
 
         let queued = *container.descending_from(None).next().unwrap();
         container.dequeue(queued);
-        let dropped = container.push(checked_transaction(1)).unwrap();
+        let dropped = container.push(checked_transaction(&allocator, 1)).unwrap();
         assert_eq!(dropped.meta.priority, 1);
         assert_eq!(container.buffer_len(), 2);
     }

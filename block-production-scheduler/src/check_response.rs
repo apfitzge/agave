@@ -1,8 +1,10 @@
 use {
     crate::{
+        resolved_transaction::ResolvedTransaction,
         state_container::{CheckedTransaction, StateContainer},
         transaction::CheckBatch,
     },
+    agave_external_transaction_view::sanitize::SanitizeConfig,
     agave_scheduler_bindings::{
         CheckWorkerToPackMessage, SharablePubkeys, processed_codes,
         worker_message_types::{
@@ -12,12 +14,16 @@ use {
     },
     agave_scheduling_utils::responses_region::CheckResponsesPtr,
     rts_alloc::Allocator,
+    solana_pubkey::Pubkey,
+    std::collections::HashSet,
 };
 
 /// Drain check-worker responses, dropping rejected transactions and queuing accepted ones.
 pub(crate) fn drain_check_responses(
     check_worker_to_scheduler: &shaq::mpmc::Consumer<CheckWorkerToPackMessage>,
     allocator: &Allocator,
+    sanitize_config: &SanitizeConfig,
+    reserved_account_keys: &HashSet<Pubkey>,
     state: &mut StateContainer,
     max_batches: usize,
 ) {
@@ -25,13 +31,21 @@ pub(crate) fn drain_check_responses(
         let Some(response) = check_worker_to_scheduler.try_read() else {
             break;
         };
-        handle_check_response(response, allocator, state);
+        handle_check_response(
+            response,
+            allocator,
+            sanitize_config,
+            reserved_account_keys,
+            state,
+        );
     }
 }
 
 fn handle_check_response(
     response: CheckWorkerToPackMessage,
     allocator: &Allocator,
+    sanitize_config: &SanitizeConfig,
+    reserved_account_keys: &HashSet<Pubkey>,
     state: &mut StateContainer,
 ) {
     // SAFETY: check-worker responses return batch allocations created by TPU ingress with the
@@ -56,12 +70,27 @@ fn handle_check_response(
 
     for ((transaction, meta), check_response) in batch.iter().zip(responses.iter()) {
         if response_is_valid(check_response) {
-            if let Some(dropped) = state.push(CheckedTransaction {
-                transaction,
-                meta,
-                resolved_pubkeys: check_response.resolved_pubkeys,
-            }) {
-                free_checked_transaction(dropped, allocator);
+            // SAFETY: successful checks transfer ownership of the transaction and resolved
+            // pubkey allocations to this scheduler.
+            match unsafe {
+                ResolvedTransaction::try_new(
+                    transaction,
+                    check_response.resolved_pubkeys,
+                    allocator,
+                    sanitize_config,
+                    reserved_account_keys,
+                )
+            } {
+                Ok(transaction) => {
+                    if let Some(dropped) = state.push(CheckedTransaction { transaction, meta }) {
+                        free_checked_transaction(dropped, allocator);
+                    }
+                }
+                Err(transaction) => {
+                    // SAFETY: this scheduler retains ownership after the external-view parse
+                    // fails, and must release both shared allocations.
+                    unsafe { transaction.free(allocator) };
+                }
             }
         } else {
             // SAFETY: rejected transactions are still owned by this scheduler.
@@ -126,14 +155,15 @@ fn free_checked_transaction(transaction: CheckedTransaction, allocator: &Allocat
     // SAFETY: state-container eviction transfers ownership of this checked transaction back to
     // the response handler.
     unsafe { transaction.transaction.free(allocator) };
-    free_resolved_pubkeys(transaction.resolved_pubkeys, allocator);
 }
 
 #[cfg(test)]
 mod tests {
     use {
         super::*,
-        crate::{SchedulerConfig, transaction::TpuTransactionMeta},
+        crate::{
+            SchedulerConfig, resolved_transaction::sanitize_config, transaction::TpuTransactionMeta,
+        },
         agave_scheduler_bindings::{
             SharableTransactionBatchRegion, SharableTransactionRegion, TransactionResponseRegion,
             worker_message_types,
@@ -142,17 +172,41 @@ mod tests {
             handshake::{client, server::Server},
             responses_region::resolve_responses_from_iter,
         },
+        solana_hash::Hash,
+        solana_keypair::Keypair,
+        solana_message::Message,
+        solana_pubkey::Pubkey,
+        solana_signer::Signer,
+        solana_system_interface::instruction as system_instruction,
+        solana_transaction::{Transaction, versioned::VersionedTransaction},
     };
 
     fn make_batch(allocator: &Allocator, priority: u64) -> SharableTransactionBatchRegion {
-        let transaction = allocator.allocate(1).unwrap();
-        // SAFETY: `transaction` points to a fresh one-byte allocation.
-        unsafe { transaction.as_ptr().write(0) };
+        let payer = Keypair::new();
+        let message = Message::new(
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                &Pubkey::new_from_array([1; 32]),
+                1,
+            )],
+            Some(&payer.pubkey()),
+        );
+        let bytes = wincode::serialize(&VersionedTransaction::from(Transaction::new(
+            &[&payer],
+            message,
+            Hash::default(),
+        )))
+        .unwrap();
+        let transaction = allocator.allocate(bytes.len() as u32).unwrap();
+        // SAFETY: both pointers are valid for `bytes.len()` bytes and do not overlap.
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), transaction.as_ptr(), bytes.len());
+        }
         // SAFETY: `transaction` was allocated by this allocator immediately above.
         let transaction_offset = unsafe { allocator.offset(transaction) };
         let transaction = SharableTransactionRegion {
             offset: transaction_offset,
-            length: 1,
+            length: bytes.len() as u32,
         };
 
         let batch = allocator
@@ -240,9 +294,13 @@ mod tests {
         queue_response(make_batch(allocator, 3), invalid_response);
 
         let mut state = StateContainer::new(1);
+        let sanitize_config = sanitize_config(false);
+        let reserved_account_keys = HashSet::new();
         drain_check_responses(
             &client_session.check_worker_to_pack,
             allocator,
+            &sanitize_config,
+            &reserved_account_keys,
             &mut state,
             2,
         );
@@ -251,16 +309,16 @@ mod tests {
         drain_check_responses(
             &client_session.check_worker_to_pack,
             allocator,
+            &sanitize_config,
+            &reserved_account_keys,
             &mut state,
             1,
         );
         let first = state.pop().unwrap();
         assert_eq!(first.meta.priority, 2);
-        assert_eq!(first.resolved_pubkeys.num_pubkeys, 0);
         assert!(state.pop().is_none());
 
-        // SAFETY: this is the valid transaction allocation transferred into `state`.
-        unsafe { first.transaction.free(allocator) };
+        free_checked_transaction(first, allocator);
     }
 
     #[test]
@@ -286,9 +344,13 @@ mod tests {
             .unwrap();
 
         let mut state = StateContainer::new(1);
+        let sanitize_config = sanitize_config(false);
+        let reserved_account_keys = HashSet::new();
         drain_check_responses(
             &client_session.check_worker_to_pack,
             allocator,
+            &sanitize_config,
+            &reserved_account_keys,
             &mut state,
             usize::MAX,
         );

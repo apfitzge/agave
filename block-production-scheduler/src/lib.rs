@@ -46,6 +46,9 @@ pub fn run(config: SchedulerConfig, exit: Arc<AtomicBool>) -> Result<(), Schedul
 
     while !exit.load(Ordering::Relaxed) {
         progress_tracker::drain_progress(&mut session.progress_tracker, &mut state);
+        let check_sanitize_config = resolved_transaction::sanitize_config(
+            state.feature_set().snapshot().limit_instruction_accounts,
+        );
         let ClientSession {
             allocators,
             tpu_to_pack,
@@ -56,6 +59,8 @@ pub fn run(config: SchedulerConfig, exit: Arc<AtomicBool>) -> Result<(), Schedul
         check_response::drain_check_responses(
             check_worker_to_pack,
             &allocators[0],
+            &check_sanitize_config,
+            state.reserved_account_keys(),
             &mut transaction_state,
             MAX_CHECK_RESPONSE_BATCHES_PER_ITERATION,
         );

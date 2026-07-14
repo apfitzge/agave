@@ -51,24 +51,27 @@ pub(crate) struct ResolvedPubkeys {
 }
 
 impl ResolvedPubkeys {
-    unsafe fn from_sharable_pubkeys(
+    unsafe fn try_from_sharable_pubkeys(
         pubkeys: SharablePubkeys,
         num_writable: usize,
         allocator: &Allocator,
-    ) -> Self {
+    ) -> Option<Self> {
         let len = pubkeys.num_pubkeys as usize;
-        assert!(
-            num_writable <= len,
-            "check worker returned fewer resolved pubkeys than writable address lookups"
-        );
-        Self {
-            pubkeys: (len > 0).then(|| {
-                // SAFETY: a non-empty resolved-pubkey region is owned by this scheduler after
-                // the check response and remains allocated for the lifetime of the external view.
-                unsafe { PubkeysPtr::from_sharable_pubkeys(&pubkeys, allocator) }
-            }),
-            num_writable,
+        if num_writable > len {
+            return None;
         }
+
+        let pubkeys = if len == 0 {
+            None
+        } else {
+            // SAFETY: a non-empty resolved-pubkey region is owned by this scheduler after the
+            // check response and remains allocated for the lifetime of the external view.
+            Some(unsafe { PubkeysPtr::from_sharable_pubkeys(&pubkeys, allocator) })
+        };
+        Some(Self {
+            pubkeys,
+            num_writable,
+        })
     }
 
     fn as_slice(&self) -> &[Pubkey] {
@@ -144,43 +147,61 @@ impl ResolvedTransaction {
         let transaction_data = ExternalTransactionData(unsafe {
             TransactionPtr::from_sharable_transaction_region(&transaction_region, allocator)
         });
-        let view = (|| {
-            let view =
-                SanitizedTransactionView::try_new_sanitized(transaction_data, sanitize_config)?;
-
-            let needs_resolved_pubkeys = matches!(view.version(), TransactionVersion::V0)
-                || view.total_writable_lookup_accounts() != 0
-                || view.total_readonly_lookup_accounts() != 0;
-            let resolved_pubkeys_source = needs_resolved_pubkeys.then(|| {
-                // SAFETY: the check response owns a valid writable-then-readonly pubkey allocation.
-                unsafe {
-                    ResolvedPubkeys::from_sharable_pubkeys(
+        let view =
+            match SanitizedTransactionView::try_new_sanitized(transaction_data, sanitize_config) {
+                Ok(view) => view,
+                Err(error) => {
+                    return Err(UnresolvedTransaction {
+                        error,
+                        transaction,
                         resolved_pubkeys,
-                        view.total_writable_lookup_accounts() as usize,
-                        allocator,
-                    )
+                    });
                 }
-            });
+            };
 
-            ResolvedTransactionView::try_new_with_source(
-                view,
-                resolved_pubkeys_source,
-                reserved_account_keys,
-            )
-        })();
+        let needs_resolved_pubkeys = matches!(view.version(), TransactionVersion::V0)
+            || view.total_writable_lookup_accounts() != 0
+            || view.total_readonly_lookup_accounts() != 0;
+        let resolved_pubkeys_source = if needs_resolved_pubkeys {
+            // SAFETY: the check response owns a valid writable-then-readonly pubkey allocation.
+            let Some(pubkeys) = (unsafe {
+                ResolvedPubkeys::try_from_sharable_pubkeys(
+                    resolved_pubkeys,
+                    view.total_writable_lookup_accounts() as usize,
+                    allocator,
+                )
+            }) else {
+                return Err(UnresolvedTransaction {
+                    error:
+                        agave_external_transaction_view::result::TransactionViewError::AddressLookupMismatch,
+                    transaction,
+                    resolved_pubkeys,
+                });
+            };
+            Some(pubkeys)
+        } else {
+            None
+        };
 
-        match view {
-            Ok(view) => Ok(Self {
-                transaction,
-                resolved_pubkeys,
-                view,
-            }),
-            Err(error) => Err(UnresolvedTransaction {
-                error,
-                transaction,
-                resolved_pubkeys,
-            }),
-        }
+        let view = match ResolvedTransactionView::try_new_with_source(
+            view,
+            resolved_pubkeys_source,
+            reserved_account_keys,
+        ) {
+            Ok(view) => view,
+            Err(error) => {
+                return Err(UnresolvedTransaction {
+                    error,
+                    transaction,
+                    resolved_pubkeys,
+                });
+            }
+        };
+        Ok(Self {
+            transaction,
+            resolved_pubkeys,
+            view,
+        })
     }
 
     pub(crate) fn view(

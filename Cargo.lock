@@ -73,6 +73,7 @@ name = "agave-block-production-scheduler"
 version = "4.3.0-alpha.0"
 dependencies = [
  "agave-feature-set",
+ "agave-reserved-account-keys",
  "agave-scheduler-bindings",
  "agave-scheduling-utils",
  "agave-transaction-view 4.3.0",

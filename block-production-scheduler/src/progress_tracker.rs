@@ -3,10 +3,13 @@ use {
         FeatureSet, bls_pubkey_management_in_vote_account, create_account_allow_prefund,
         limit_instruction_accounts,
     },
+    agave_reserved_account_keys::ReservedAccountKeys,
     agave_scheduler_bindings::{
         LEADER_READY, LEADER_STARTING, NOT_LEADER, ProgressMessage, scheduler_feature_flags,
     },
     solana_clock::FORWARD_TRANSACTIONS_TO_LEADER_AT_SLOT_OFFSET,
+    solana_pubkey::Pubkey,
+    std::collections::HashSet,
 };
 
 /// Scheduler state derived from the latest progress message.
@@ -18,6 +21,7 @@ pub(crate) struct SchedulerState {
     target_scheduled_cus: u64,
     target_bank_time_ms: u16,
     feature_set: FeatureSet,
+    reserved_account_keys: ReservedAccountKeys,
 }
 
 impl SchedulerState {
@@ -30,6 +34,7 @@ impl SchedulerState {
             target_scheduled_cus: 0,
             target_bank_time_ms: 0,
             feature_set: FeatureSet::default(),
+            reserved_account_keys: ReservedAccountKeys::default(),
         }
     }
 
@@ -45,6 +50,9 @@ impl SchedulerState {
             self.target_bank_time_ms = progress.target_bank_time_ms;
         }
         self.feature_set = feature_set_from_scheduler_features(progress.scheduler_features);
+        self.reserved_account_keys = ReservedAccountKeys::default();
+        self.reserved_account_keys
+            .update_active_set(&self.feature_set);
         debug_assert!(
             !self.can_process_transactions() || self.should_accept_packets(),
             "a scheduler that can process transactions must accept packets"
@@ -75,6 +83,10 @@ impl SchedulerState {
 
     pub(crate) fn feature_set(&self) -> &FeatureSet {
         &self.feature_set
+    }
+
+    pub(crate) fn reserved_account_keys(&self) -> &HashSet<Pubkey> {
+        &self.reserved_account_keys.active
     }
 
     #[allow(dead_code)]
