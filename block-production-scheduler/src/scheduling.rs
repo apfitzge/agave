@@ -160,7 +160,17 @@ pub(crate) fn schedule(
     remaining_cost_units: u64,
     target_scheduled_cus: u64,
 ) {
-    if transactions.is_empty() || !in_flight.enter_slot(current_slot) {
+    let is_new_slot = in_flight.scheduling_slot() != Some(current_slot);
+    if !in_flight.enter_slot(current_slot) {
+        return;
+    }
+    if is_new_slot {
+        transactions.flush_held(|transaction| {
+            // SAFETY: state-container eviction returns ownership of both scheduler allocations.
+            unsafe { transaction.transaction.free(allocator) };
+        });
+    }
+    if transactions.is_empty() {
         return;
     }
 

@@ -18,6 +18,7 @@ use {
 
 mod check_response;
 mod config;
+mod execution_response;
 mod in_flight;
 mod progress_tracker;
 mod resolved_transaction;
@@ -31,6 +32,8 @@ pub use config::{ConfigError, SchedulerConfig};
 const MAX_TPU_PACKETS_PER_ITERATION: usize = 1024;
 const MAX_CHECK_RESPONSE_BATCHES_PER_ITERATION: usize =
     MAX_TPU_PACKETS_PER_ITERATION / transaction::MAX_PACKETS_PER_CHECK_BATCH;
+const MAX_EXECUTION_RESPONSE_BATCHES_PER_ITERATION: usize =
+    MAX_TPU_PACKETS_PER_ITERATION / transaction::MAX_PACKETS_PER_EXEC_BATCH;
 
 /// Connect to Agave's scheduler bindings service and run until `exit` is set.
 pub fn run(config: SchedulerConfig, exit: Arc<AtomicBool>) -> Result<(), SchedulerError> {
@@ -83,6 +86,14 @@ fn run_session(config: SchedulerConfig, mut session: ClientSession, exit: Arc<At
             state.reserved_account_keys(),
             &mut transaction_state,
             MAX_CHECK_RESPONSE_BATCHES_PER_ITERATION,
+        );
+        execution_response::drain_execution_responses(
+            workers,
+            &allocators[0],
+            &mut transaction_state,
+            &mut account_locks,
+            &mut in_flight,
+            MAX_EXECUTION_RESPONSE_BATCHES_PER_ITERATION,
         );
         if state.can_process_transactions() {
             scheduling::schedule(

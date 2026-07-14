@@ -7,7 +7,6 @@ use {
 };
 
 /// A transaction that has passed external check-worker validation.
-#[allow(dead_code)]
 pub(crate) struct CheckedTransaction {
     pub(crate) transaction: ResolvedTransaction,
     pub(crate) meta: TpuTransactionMeta,
@@ -76,7 +75,6 @@ impl StateContainer {
     }
 
     /// Removes a terminal transaction from scheduler state.
-    #[allow(dead_code)]
     pub(crate) fn remove(&mut self, transaction_id: usize) -> CheckedTransaction {
         let priority_id = TransactionPriorityId::new(
             self.transactions[transaction_id].meta.priority,
@@ -84,6 +82,36 @@ impl StateContainer {
         );
         self.queue.remove(&priority_id);
         self.transactions.remove(transaction_id)
+    }
+
+    /// Requeue a completed transaction, either immediately or after the next slot transition.
+    pub(crate) fn retry(
+        &mut self,
+        transaction_id: usize,
+        immediately_retryable: bool,
+        mut on_evict: impl FnMut(CheckedTransaction),
+    ) {
+        let priority_id = TransactionPriorityId::new(
+            self.transactions[transaction_id].meta.priority,
+            transaction_id,
+        );
+        if !immediately_retryable {
+            self.queue.hold(priority_id);
+            return;
+        }
+
+        let (queue, transactions) = (&mut self.queue, &mut self.transactions);
+        queue.push(std::iter::once(priority_id), transactions.len(), |id| {
+            on_evict(transactions.remove(id.id));
+        });
+    }
+
+    /// Returns delayed retries to the priority queue at a slot boundary.
+    pub(crate) fn flush_held(&mut self, mut on_evict: impl FnMut(CheckedTransaction)) {
+        let (queue, transactions) = (&mut self.queue, &mut self.transactions);
+        queue.flush_held(transactions.len(), |id| {
+            on_evict(transactions.remove(id.id));
+        });
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -251,5 +279,25 @@ mod tests {
         let dropped = container.push(checked_transaction(&allocator, 1)).unwrap();
         assert_eq!(dropped.meta.priority, 1);
         assert_eq!(container.buffer_len(), 2);
+    }
+
+    #[test]
+    fn returns_delayed_retries_to_the_queue_on_flush() {
+        let session = session();
+        let allocator = &session.tpu_to_pack.allocator;
+        let mut container = StateContainer::new(1);
+        assert!(container.push(checked_transaction(allocator, 10)).is_none());
+        let transaction_id = container.descending_from(None).next().unwrap().id;
+        container.dequeue(transaction_id);
+
+        container.retry(transaction_id, false, |_| unreachable!());
+        assert!(container.is_empty());
+        assert_eq!(container.buffer_len(), 1);
+
+        container.flush_held(|_| unreachable!());
+        let transaction = container.pop().unwrap();
+        assert_eq!(transaction.meta.priority, 10);
+        // SAFETY: the test has removed the transaction from scheduler state.
+        unsafe { transaction.transaction.free(allocator) };
     }
 }

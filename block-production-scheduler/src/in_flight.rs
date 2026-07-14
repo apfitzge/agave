@@ -47,6 +47,10 @@ impl InFlightTracker {
         }
     }
 
+    pub(crate) fn scheduling_slot(&self) -> Option<u64> {
+        self.scheduling_slot
+    }
+
     pub(crate) fn num_in_flight_per_worker(&self) -> &[usize] {
         &self.num_in_flight_per_worker
     }
