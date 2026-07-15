@@ -27,6 +27,7 @@ pub(crate) fn drain_tpu(
     allocator: &Allocator,
     state: &SchedulerState,
     max_packets: usize,
+    minimum_priority: u64,
 ) -> TpuIngressStats {
     // sleep only while not in the near-leader holding window where packets
     // should be buffered eagerly. The futex wait first checks the queue, so
@@ -85,7 +86,7 @@ pub(crate) fn drain_tpu(
             if scheduler_to_check_worker
                 .try_write(PackToCheckWorkerMessage {
                     flags: CHECK_FLAGS,
-                    minimum_priority: 0,
+                    minimum_priority,
                     batch: batch.to_sharable_transaction_batch_region(),
                 })
                 .is_err()
@@ -200,6 +201,7 @@ mod tests {
         let transaction_bytes = transaction_bytes(&payer);
 
         let max_packets = MAX_PACKETS_PER_CHECK_BATCH * 2;
+        let minimum_priority = 123;
         for packet_index in 0..=max_packets {
             let transaction = allocate_transaction(allocator, &transaction_bytes);
             offsets.push(transaction.offset);
@@ -223,6 +225,7 @@ mod tests {
             allocator,
             &state,
             max_packets,
+            minimum_priority,
         );
         assert_eq!(stats.dropped_not_accepting_packets, 0);
         assert_eq!(stats.dropped_check_worker_queue_full_packets, 0);
@@ -233,6 +236,7 @@ mod tests {
                 .try_read()
                 .unwrap();
             assert_eq!(message.flags, CHECK_FLAGS);
+            assert_eq!(message.minimum_priority, minimum_priority);
             assert_eq!(message.flags & check_message_flags::STATUS_CHECKS, 0);
             assert_ne!(
                 message.flags & check_message_flags::CALCULATE_SCHEDULING_DETAILS,
@@ -322,6 +326,7 @@ mod tests {
             allocator,
             &state,
             MAX_PACKETS_PER_CHECK_BATCH,
+            0,
         );
         assert_eq!(stats.dropped_not_accepting_packets, 0);
         assert_eq!(stats.dropped_check_worker_queue_full_packets, 1);
@@ -358,6 +363,7 @@ mod tests {
             allocator,
             &SchedulerState::new(),
             1,
+            0,
         );
 
         assert_eq!(stats.dropped_not_accepting_packets, 1);
@@ -395,6 +401,7 @@ mod tests {
             allocator,
             &state,
             1,
+            0,
         );
         assert_eq!(stats.dropped_not_accepting_packets, 0);
         assert_eq!(stats.dropped_check_worker_queue_full_packets, 0);

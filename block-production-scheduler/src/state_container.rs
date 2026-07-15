@@ -6,6 +6,8 @@ use {
     slab::Slab,
 };
 
+const MINIMUM_PRIORITY_FILTER_CAPACITY_PERCENT: usize = 70;
+
 /// A transaction that has passed external check-worker validation.
 pub(crate) struct CheckedTransaction {
     pub(crate) transaction: ResolvedTransaction,
@@ -30,6 +32,7 @@ impl CheckedTransaction {
 /// priority.
 pub(crate) struct StateContainer {
     capacity: usize,
+    minimum_priority_filter_threshold: usize,
     transactions: Slab<CheckedTransaction>,
     queue: TransactionPriorityQueue,
 }
@@ -39,6 +42,9 @@ impl StateContainer {
         assert!(capacity > 0, "transaction state capacity must be non-zero");
         Self {
             capacity,
+            minimum_priority_filter_threshold: capacity
+                .saturating_mul(MINIMUM_PRIORITY_FILTER_CAPACITY_PERCENT)
+                .saturating_div(100),
             transactions: Slab::with_capacity(capacity.saturating_add(1)),
             queue: TransactionPriorityQueue::with_capacity(capacity),
         }
@@ -52,6 +58,19 @@ impl StateContainer {
                 .queue
                 .min_priority()
                 .is_some_and(|minimum_priority| priority > minimum_priority)
+    }
+
+    /// Returns the priority floor to apply before sending another batch to the check workers.
+    ///
+    /// Only enable filtering once retained scheduler state is strictly more than 70% occupied.
+    /// In-flight and held transactions consume state capacity but have no queue priority, so a
+    /// queue without a retained minimum leaves the filter disabled.
+    pub(crate) fn check_worker_minimum_priority(&self) -> u64 {
+        if self.transactions.len() > self.minimum_priority_filter_threshold {
+            self.queue.min_priority().unwrap_or_default()
+        } else {
+            0
+        }
     }
 
     /// Inserts a checked transaction and returns any transaction evicted for capacity.
@@ -379,6 +398,25 @@ mod tests {
         assert!(!container.can_admit_priority(5));
         assert!(!container.can_admit_priority(4));
         assert!(container.can_admit_priority(6));
+    }
+
+    #[test]
+    fn enables_check_worker_priority_floor_above_seventy_percent_capacity() {
+        let session = session();
+        let allocator = &session.tpu_to_pack.allocator;
+        let mut container = StateContainer::new(10);
+        for priority in [10, 20, 30, 40, 50, 60, 70] {
+            assert!(
+                container
+                    .push(checked_transaction(allocator, priority))
+                    .is_none()
+            );
+        }
+
+        assert_eq!(container.check_worker_minimum_priority(), 0);
+
+        assert!(container.push(checked_transaction(allocator, 80)).is_none());
+        assert_eq!(container.check_worker_minimum_priority(), 10);
     }
 
     #[test]
