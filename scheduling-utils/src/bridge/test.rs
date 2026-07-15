@@ -327,7 +327,11 @@ where
             fee_payer_balance_flags: fee_payer_balance_flags::REQUESTED
                 | fee_payer_balance_flags::PERFORMED,
             resolve_flags: resolve_flags::REQUESTED | resolve_flags::PERFORMED,
+            scheduling_details_flags: 0,
             included_slot: progress.current_slot,
+            transaction_fee: 0,
+            prioritization_fee: 0,
+            estimated_cost_units: 0,
             balance_slot: progress.current_slot,
             fee_payer_balance: u64::from(u32::MAX),
             resolution_slot: progress.current_slot,
