@@ -96,6 +96,7 @@ impl SchedulerState {
         self.current_slot
     }
 
+    #[allow(dead_code)]
     pub(crate) fn remaining_cost_units(&self) -> u64 {
         self.remaining_cost_units
     }
@@ -108,6 +109,7 @@ impl SchedulerState {
         self.target_scheduled_cus
     }
 
+    #[allow(dead_code)]
     pub(crate) fn target_bank_time_ms(&self) -> u16 {
         self.target_bank_time_ms
     }

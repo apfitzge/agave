@@ -15,6 +15,27 @@ use {
     rts_alloc::Allocator,
 };
 
+#[derive(Default)]
+pub(crate) struct ExecutionResponseStats {
+    pub(crate) execution_slot: Option<u64>,
+    pub(crate) completed_transactions: u64,
+    pub(crate) recorded_transactions: u64,
+    pub(crate) retrying_transactions: u64,
+    pub(crate) cost_limit_retries: u64,
+    pub(crate) slot_boundary_retries: u64,
+}
+
+impl ExecutionResponseStats {
+    fn record_execution_slot(&mut self, execution_slot: u64) {
+        match self.execution_slot {
+            Some(previous_execution_slot) => {
+                debug_assert_eq!(previous_execution_slot, execution_slot);
+            }
+            None => self.execution_slot = Some(execution_slot),
+        }
+    }
+}
+
 /// Drain up to `max_batches` execution responses, round-robin across workers.
 pub(crate) fn drain_execution_responses(
     workers: &mut [ClientWorkerSession],
@@ -23,6 +44,7 @@ pub(crate) fn drain_execution_responses(
     account_locks: &mut ThreadAwareAccountLocks,
     in_flight: &mut InFlightTracker,
     max_batches: usize,
+    mut record_stats: impl FnMut(Option<u64>, ExecutionResponseStats),
 ) {
     for worker in workers.iter_mut() {
         worker.worker_to_pack.sync();
@@ -38,7 +60,7 @@ pub(crate) fn drain_execution_responses(
             let Some(response) = worker.worker_to_pack.try_read() else {
                 continue;
             };
-            handle_execution_response(
+            let response_stats = handle_execution_response(
                 worker_id,
                 *response,
                 allocator,
@@ -46,6 +68,7 @@ pub(crate) fn drain_execution_responses(
                 account_locks,
                 in_flight,
             );
+            record_stats(response_stats.execution_slot, response_stats);
             remaining_batches = remaining_batches.saturating_sub(1);
             handled_response = true;
         }
@@ -66,7 +89,7 @@ fn handle_execution_response(
     state: &mut StateContainer,
     account_locks: &mut ThreadAwareAccountLocks,
     in_flight: &mut InFlightTracker,
-) {
+) -> ExecutionResponseStats {
     // SAFETY: execution-worker responses return batch allocations created by the scheduler with
     // the same metadata layout.
     let batch = unsafe {
@@ -78,6 +101,14 @@ fn handle_execution_response(
         && response.responses.num_transaction_responses == response.batch.num_transactions;
 
     let mut total_scheduled_cost = 0_u64;
+    let mut stats = ExecutionResponseStats {
+        execution_slot: None,
+        completed_transactions: num_transactions as u64,
+        recorded_transactions: 0,
+        retrying_transactions: 0,
+        cost_limit_retries: 0,
+        slot_boundary_retries: 0,
+    };
     if response_is_valid {
         // SAFETY: the response tag and count were checked above, and execution workers transfer
         // ownership of this response allocation to the scheduler.
@@ -85,10 +116,30 @@ fn handle_execution_response(
             ExecutionResponsesPtr::from_transaction_response_region(&response.responses, allocator)
         };
         for ((_, meta), execution_response) in batch.iter().zip(responses.iter()) {
+            if execution_response.execution_slot != 0
+                || execution_response.not_included_reason
+                    != not_included_reasons::BANK_NOT_AVAILABLE
+            {
+                stats.record_execution_slot(execution_response.execution_slot);
+            }
+            if execution_response.not_included_reason == not_included_reasons::NONE {
+                stats.recorded_transactions = stats.recorded_transactions.wrapping_add(1);
+            }
+            let retryability = retryability(execution_response);
+            if let Some(immediately_retryable) = retryability {
+                stats.retrying_transactions = stats.retrying_transactions.wrapping_add(1);
+                if !immediately_retryable {
+                    stats.cost_limit_retries = stats.cost_limit_retries.wrapping_add(1);
+                } else if execution_response.not_included_reason
+                    == not_included_reasons::BANK_NOT_AVAILABLE
+                {
+                    stats.slot_boundary_retries = stats.slot_boundary_retries.wrapping_add(1);
+                }
+            }
             total_scheduled_cost = total_scheduled_cost.saturating_add(complete_transaction(
                 worker_id,
                 meta.transaction_id,
-                retryability(execution_response),
+                retryability,
                 allocator,
                 state,
                 account_locks,
@@ -99,6 +150,14 @@ fn handle_execution_response(
     } else {
         let retryability =
             (response.processed_code == processed_codes::MAX_WORKING_SLOT_EXCEEDED).then_some(true);
+        if retryability.is_some() {
+            stats.retrying_transactions = stats
+                .retrying_transactions
+                .wrapping_add(num_transactions as u64);
+            stats.slot_boundary_retries = stats
+                .slot_boundary_retries
+                .wrapping_add(num_transactions as u64);
+        }
         for (_, meta) in batch.iter() {
             total_scheduled_cost = total_scheduled_cost.saturating_add(complete_transaction(
                 worker_id,
@@ -118,6 +177,7 @@ fn handle_execution_response(
     // SAFETY: this scheduler owns the returned batch container. Transaction allocations remain
     // owned by `state` until they are terminally dropped.
     unsafe { batch.free() };
+    stats
 }
 
 fn complete_transaction(
@@ -305,7 +365,9 @@ mod tests {
 
     fn execution_response(not_included_reason: u8) -> ExecutionResponse {
         ExecutionResponse {
-            execution_slot: 1,
+            execution_slot: (not_included_reason != not_included_reasons::BANK_NOT_AVAILABLE)
+                .then_some(1)
+                .unwrap_or_default(),
             not_included_reason,
             cost_units: 0,
             fee_payer_balance: 0,
@@ -340,6 +402,7 @@ mod tests {
             .unwrap();
         agave_session.workers[0].worker_to_pack.commit();
 
+        let mut stats = None;
         drain_execution_responses(
             &mut client_session.workers,
             allocator,
@@ -347,8 +410,16 @@ mod tests {
             &mut account_locks,
             &mut in_flight,
             1,
+            |execution_slot, response_stats| {
+                assert_eq!(execution_slot, Some(1));
+                stats = Some(response_stats);
+            },
         );
+        let stats = stats.expect("the queued execution response must be drained");
 
+        assert_eq!(stats.completed_transactions, 1);
+        assert_eq!(stats.recorded_transactions, 1);
+        assert_eq!(stats.retrying_transactions, 0);
         assert!(state.is_empty());
         assert_eq!(state.buffer_len(), 0);
         assert!(in_flight.is_empty());
@@ -392,6 +463,7 @@ mod tests {
             .unwrap();
         agave_session.workers[0].worker_to_pack.commit();
 
+        let mut stats = None;
         drain_execution_responses(
             &mut client_session.workers,
             allocator,
@@ -399,8 +471,18 @@ mod tests {
             &mut account_locks,
             &mut in_flight,
             1,
+            |execution_slot, response_stats| {
+                assert_eq!(execution_slot, None);
+                stats = Some(response_stats);
+            },
         );
+        let stats = stats.expect("the queued execution response must be drained");
 
+        assert_eq!(stats.completed_transactions, 1);
+        assert_eq!(stats.recorded_transactions, 0);
+        assert_eq!(stats.retrying_transactions, 1);
+        assert_eq!(stats.cost_limit_retries, 0);
+        assert_eq!(stats.slot_boundary_retries, 1);
         assert_eq!(state.len(), 1);
         assert_eq!(state.buffer_len(), 1);
         assert!(in_flight.is_empty());

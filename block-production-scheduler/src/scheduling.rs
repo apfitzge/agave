@@ -159,10 +159,10 @@ pub(crate) fn schedule(
     current_slot: u64,
     remaining_cost_units: u64,
     target_scheduled_cus: u64,
-) {
+) -> usize {
     let is_new_slot = in_flight.scheduling_slot() != Some(current_slot);
     if !in_flight.enter_slot(current_slot) {
-        return;
+        return 0;
     }
     if is_new_slot {
         transactions.flush_held(|transaction| {
@@ -171,7 +171,7 @@ pub(crate) fn schedule(
         });
     }
     if transactions.is_empty() {
-        return;
+        return 0;
     }
 
     let in_flight_cost_units = in_flight
@@ -182,7 +182,7 @@ pub(crate) fn schedule(
         .min(target_scheduled_cus)
         .saturating_sub(in_flight_cost_units);
     if budget == 0 {
-        return;
+        return 0;
     }
 
     let SchedulingScratch {
@@ -200,7 +200,7 @@ pub(crate) fn schedule(
         target_cus_per_worker,
     );
     if allowed_workers.is_empty() {
-        return;
+        return 0;
     }
 
     {
@@ -307,9 +307,11 @@ pub(crate) fn schedule(
         }
     }
 
+    let scheduled_transactions = removal_ids.len();
     for transaction_id in removal_ids.drain(..) {
         transactions.dequeue(transaction_id);
     }
+    scheduled_transactions
 }
 
 fn prepare_workers(

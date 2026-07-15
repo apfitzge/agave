@@ -26,9 +26,8 @@ const TPU_RECEIVE_TIMEOUT: Duration = Duration::from_millis(10);
 const LAMPORTS_PER_SIGNATURE: u64 = 5_000;
 const BURN_PERCENT: u64 = 50;
 const PRIORITY_MULTIPLIER: u64 = 1_000_000;
-const CHECK_FLAGS: u16 = check_message_flags::STATUS_CHECKS
-    | check_message_flags::LOAD_FEE_PAYER_BALANCE
-    | check_message_flags::LOAD_ADDRESS_LOOKUP_TABLES;
+const CHECK_FLAGS: u16 =
+    check_message_flags::LOAD_FEE_PAYER_BALANCE | check_message_flags::LOAD_ADDRESS_LOOKUP_TABLES;
 
 pub(crate) fn drain_tpu(
     tpu_to_scheduler: &mut shaq::spsc::Consumer<TpuToPackMessage>,
@@ -301,6 +300,7 @@ mod tests {
                 .try_read()
                 .unwrap();
             assert_eq!(message.flags, CHECK_FLAGS);
+            assert_eq!(message.flags & check_message_flags::STATUS_CHECKS, 0);
             assert_eq!(
                 usize::from(message.batch.num_transactions),
                 MAX_PACKETS_PER_CHECK_BATCH

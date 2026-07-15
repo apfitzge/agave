@@ -18,6 +18,12 @@ use {
     std::collections::HashSet,
 };
 
+#[derive(Default)]
+pub(crate) struct CheckResponseStats {
+    pub(crate) checked_transactions: u64,
+    pub(crate) accepted_transactions: u64,
+}
+
 /// Drain check-worker responses, dropping rejected transactions and queuing accepted ones.
 pub(crate) fn drain_check_responses(
     check_worker_to_scheduler: &shaq::mpmc::Consumer<CheckWorkerToPackMessage>,
@@ -26,19 +32,27 @@ pub(crate) fn drain_check_responses(
     reserved_account_keys: &HashSet<Pubkey>,
     state: &mut StateContainer,
     max_batches: usize,
-) {
+) -> CheckResponseStats {
+    let mut stats = CheckResponseStats::default();
     for _ in 0..max_batches {
         let Some(response) = check_worker_to_scheduler.try_read() else {
             break;
         };
-        handle_check_response(
+        let response_stats = handle_check_response(
             response,
             allocator,
             sanitize_config,
             reserved_account_keys,
             state,
         );
+        stats.checked_transactions = stats
+            .checked_transactions
+            .wrapping_add(response_stats.checked_transactions);
+        stats.accepted_transactions = stats
+            .accepted_transactions
+            .wrapping_add(response_stats.accepted_transactions);
     }
+    stats
 }
 
 fn handle_check_response(
@@ -47,7 +61,7 @@ fn handle_check_response(
     sanitize_config: &SanitizeConfig,
     reserved_account_keys: &HashSet<Pubkey>,
     state: &mut StateContainer,
-) {
+) -> CheckResponseStats {
     // SAFETY: check-worker responses return batch allocations created by TPU ingress with the
     // same metadata layout.
     let batch =
@@ -57,11 +71,14 @@ fn handle_check_response(
         && response.responses.tag == CHECK_RESPONSE
         && response.responses.num_transaction_responses == response.batch.num_transactions;
     if !response_is_valid {
-        discard_unprocessed_batch(batch, allocator, state);
+        let checked_transactions = discard_unprocessed_batch(batch, allocator, state);
         if response.processed_code == processed_codes::PROCESSED {
             free_check_response_region_if_present(&response, allocator);
         }
-        return;
+        return CheckResponseStats {
+            checked_transactions,
+            accepted_transactions: 0,
+        };
     }
 
     // SAFETY: `CHECK_RESPONSE` and matching count were checked above. The response allocation is
@@ -70,17 +87,23 @@ fn handle_check_response(
         CheckResponsesPtr::from_transaction_response_region(&response.responses, allocator)
     };
 
+    let mut stats = CheckResponseStats::default();
     for ((transaction, meta), check_response) in batch.iter().zip(responses.iter()) {
         match meta {
-            CheckTransactionMeta::Tpu(meta) => handle_tpu_check_response(
-                transaction,
-                meta,
-                check_response,
-                allocator,
-                sanitize_config,
-                reserved_account_keys,
-                state,
-            ),
+            CheckTransactionMeta::Tpu(meta) => {
+                stats.checked_transactions = stats.checked_transactions.wrapping_add(1);
+                if handle_tpu_check_response(
+                    transaction,
+                    meta,
+                    check_response,
+                    allocator,
+                    sanitize_config,
+                    reserved_account_keys,
+                    state,
+                ) {
+                    stats.accepted_transactions = stats.accepted_transactions.wrapping_add(1);
+                }
+            }
             CheckTransactionMeta::Recheck { transaction_id } => {
                 handle_recheck_response(transaction_id, check_response, allocator, state);
             }
@@ -94,6 +117,7 @@ fn handle_check_response(
         batch.free();
         responses.free(allocator);
     }
+    stats
 }
 
 fn handle_tpu_check_response(
@@ -104,7 +128,7 @@ fn handle_tpu_check_response(
     sanitize_config: &SanitizeConfig,
     reserved_account_keys: &HashSet<Pubkey>,
     state: &mut StateContainer,
-) {
+) -> bool {
     if initial_response_is_valid(check_response) {
         // SAFETY: successful checks transfer ownership of the transaction and resolved pubkey
         // allocations to this scheduler.
@@ -121,17 +145,20 @@ fn handle_tpu_check_response(
                 if let Some(dropped) = state.push(CheckedTransaction::new(transaction, meta)) {
                     free_checked_transaction(dropped, allocator);
                 }
+                true
             }
             Err(transaction) => {
                 // SAFETY: this scheduler retains ownership after the external-view parse fails,
                 // and must release both shared allocations.
                 unsafe { transaction.free(allocator) };
+                false
             }
         }
     } else {
         // SAFETY: rejected transactions are still owned by this scheduler.
         unsafe { transaction.free(allocator) };
         free_resolved_pubkeys(check_response.resolved_pubkeys, allocator);
+        false
     }
 }
 
@@ -149,7 +176,7 @@ fn handle_recheck_response(
 }
 
 fn initial_response_is_valid(response: &CheckResponse) -> bool {
-    response_is_status_valid(response)
+    response.parsing_and_sanitization_flags & parsing_and_sanitization_flags::FAILED == 0
         && response.fee_payer_balance_flags & fee_payer_balance_flags::PERFORMED != 0
         && response.resolve_flags & resolve_flags::PERFORMED != 0
         && response.resolve_flags & resolve_flags::FAILED == 0
@@ -171,10 +198,16 @@ fn response_is_status_valid(response: &CheckResponse) -> bool {
         && response.status_check_flags & STATUS_FAILURE_FLAGS == 0
 }
 
-fn discard_unprocessed_batch(batch: CheckBatch, allocator: &Allocator, state: &mut StateContainer) {
+fn discard_unprocessed_batch(
+    batch: CheckBatch,
+    allocator: &Allocator,
+    state: &mut StateContainer,
+) -> u64 {
+    let mut checked_transactions = 0u64;
     for (transaction, meta) in batch.iter() {
         match meta {
             CheckTransactionMeta::Tpu(_) => {
+                checked_transactions = checked_transactions.wrapping_add(1);
                 // SAFETY: this scheduler owns transactions that were not successfully checked.
                 unsafe { transaction.free(allocator) };
             }
@@ -187,6 +220,7 @@ fn discard_unprocessed_batch(batch: CheckBatch, allocator: &Allocator, state: &m
     }
     // SAFETY: this scheduler owns the returned batch container.
     unsafe { batch.free() };
+    checked_transactions
 }
 
 fn free_check_response_region_if_present(
@@ -306,7 +340,7 @@ mod tests {
     fn valid_response() -> CheckResponse {
         CheckResponse {
             parsing_and_sanitization_flags: 0,
-            status_check_flags: status_check_flags::REQUESTED | status_check_flags::PERFORMED,
+            status_check_flags: 0,
             fee_payer_balance_flags: fee_payer_balance_flags::REQUESTED
                 | fee_payer_balance_flags::PERFORMED,
             resolve_flags: resolve_flags::REQUESTED | resolve_flags::PERFORMED,
@@ -320,6 +354,14 @@ mod tests {
                 num_pubkeys: 0,
             },
         }
+    }
+
+    #[test]
+    fn initial_responses_do_not_require_status_checks() {
+        let response = valid_response();
+
+        assert!(initial_response_is_valid(&response));
+        assert!(!recheck_response_is_valid(&response));
     }
 
     #[test]
@@ -354,7 +396,7 @@ mod tests {
         let mut state = StateContainer::new(1);
         let sanitize_config = sanitize_config(false);
         let reserved_account_keys = HashSet::new();
-        drain_check_responses(
+        let stats = drain_check_responses(
             &client_session.check_worker_to_pack,
             allocator,
             &sanitize_config,
@@ -362,9 +404,11 @@ mod tests {
             &mut state,
             2,
         );
+        assert_eq!(stats.checked_transactions, 2);
+        assert_eq!(stats.accepted_transactions, 2);
 
         assert_eq!(state.len(), 1);
-        drain_check_responses(
+        let stats = drain_check_responses(
             &client_session.check_worker_to_pack,
             allocator,
             &sanitize_config,
@@ -372,6 +416,8 @@ mod tests {
             &mut state,
             1,
         );
+        assert_eq!(stats.checked_transactions, 1);
+        assert_eq!(stats.accepted_transactions, 0);
         let first = state.pop().unwrap();
         assert_eq!(first.meta.priority, 2);
         assert!(state.pop().is_none());
@@ -404,7 +450,7 @@ mod tests {
         let mut state = StateContainer::new(1);
         let sanitize_config = sanitize_config(false);
         let reserved_account_keys = HashSet::new();
-        drain_check_responses(
+        let stats = drain_check_responses(
             &client_session.check_worker_to_pack,
             allocator,
             &sanitize_config,
@@ -413,6 +459,8 @@ mod tests {
             usize::MAX,
         );
 
+        assert_eq!(stats.checked_transactions, 1);
+        assert_eq!(stats.accepted_transactions, 0);
         assert!(state.pop().is_none());
     }
 }

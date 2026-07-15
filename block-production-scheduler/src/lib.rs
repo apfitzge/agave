@@ -7,14 +7,16 @@ use {
         handshake::{ClientHandshakeError, ClientSession, client},
         thread_aware_account_locks::ThreadAwareAccountLocks,
     },
+    log::info,
     progress_tracker::SchedulerState,
     std::{
+        collections::BTreeMap,
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
         },
         thread,
-        time::{Duration, Instant},
+        time::Instant,
     },
 };
 
@@ -37,6 +39,116 @@ const MAX_CHECK_RESPONSE_BATCHES_PER_ITERATION: usize =
     MAX_TPU_PACKETS_PER_ITERATION / transaction::MAX_PACKETS_PER_CHECK_BATCH;
 const MAX_EXECUTION_RESPONSE_BATCHES_PER_ITERATION: usize =
     MAX_TPU_PACKETS_PER_ITERATION / transaction::MAX_PACKETS_PER_EXEC_BATCH;
+
+struct SchedulerStats {
+    slots: BTreeMap<u64, SlotStats>,
+}
+
+#[derive(Default)]
+struct SlotStats {
+    checked_transactions: u64,
+    accepted_transactions: u64,
+    scheduled_transactions: u64,
+    completed_transactions: u64,
+    recorded_transactions: u64,
+    retrying_transactions: u64,
+    cost_limit_retries: u64,
+    slot_boundary_retries: u64,
+}
+
+impl SchedulerStats {
+    fn new() -> Self {
+        Self {
+            slots: BTreeMap::new(),
+        }
+    }
+
+    fn record_check_responses(&mut self, slot: u64, stats: check_response::CheckResponseStats) {
+        let stats_for_slot = self.slot_mut(slot);
+        stats_for_slot.checked_transactions = stats_for_slot
+            .checked_transactions
+            .wrapping_add(stats.checked_transactions);
+        stats_for_slot.accepted_transactions = stats_for_slot
+            .accepted_transactions
+            .wrapping_add(stats.accepted_transactions);
+    }
+
+    fn record_scheduled_transactions(&mut self, slot: u64, scheduled_transactions: usize) {
+        let stats_for_slot = self.slot_mut(slot);
+        stats_for_slot.scheduled_transactions = stats_for_slot
+            .scheduled_transactions
+            .wrapping_add(scheduled_transactions as u64);
+    }
+
+    fn record_execution_responses(
+        &mut self,
+        slot: u64,
+        stats: execution_response::ExecutionResponseStats,
+    ) {
+        let stats_for_slot = self.slot_mut(slot);
+        stats_for_slot.completed_transactions = stats_for_slot
+            .completed_transactions
+            .wrapping_add(stats.completed_transactions);
+        stats_for_slot.recorded_transactions = stats_for_slot
+            .recorded_transactions
+            .wrapping_add(stats.recorded_transactions);
+        stats_for_slot.retrying_transactions = stats_for_slot
+            .retrying_transactions
+            .wrapping_add(stats.retrying_transactions);
+        stats_for_slot.cost_limit_retries = stats_for_slot
+            .cost_limit_retries
+            .wrapping_add(stats.cost_limit_retries);
+        stats_for_slot.slot_boundary_retries = stats_for_slot
+            .slot_boundary_retries
+            .wrapping_add(stats.slot_boundary_retries);
+    }
+
+    fn report_completed_slots(
+        &mut self,
+        current_slot: u64,
+        in_flight: &in_flight::InFlightTracker,
+    ) {
+        if !in_flight.is_empty() {
+            return;
+        }
+
+        while self
+            .slots
+            .first_key_value()
+            .is_some_and(|(slot, _)| *slot < current_slot)
+        {
+            let (slot, stats) = self
+                .slots
+                .pop_first()
+                .expect("first key was present immediately before removal");
+            info!(
+                "scheduler_slot={slot} check_transactions={} check_accepted_transactions={} \
+                 check_rejected_transactions={} scheduled_transactions={} \
+                 execution_completed_transactions={} execution_recorded_transactions={} \
+                 execution_not_recorded_transactions={} execution_retries={} \
+                 execution_cost_limit_retries={} execution_slot_boundary_retries={}",
+                stats.checked_transactions,
+                stats.accepted_transactions,
+                stats
+                    .checked_transactions
+                    .saturating_sub(stats.accepted_transactions),
+                stats.scheduled_transactions,
+                stats.completed_transactions,
+                stats.recorded_transactions,
+                stats
+                    .completed_transactions
+                    .saturating_sub(stats.recorded_transactions),
+                stats.retrying_transactions,
+                stats.cost_limit_retries,
+                stats.slot_boundary_retries,
+            );
+        }
+    }
+
+    fn slot_mut(&mut self, slot: u64) -> &mut SlotStats {
+        self.slots.entry(slot).or_default()
+    }
+}
 
 /// Connect to Agave's scheduler bindings service and run until `exit` is set.
 pub fn run(config: SchedulerConfig, exit: Arc<AtomicBool>) -> Result<(), SchedulerError> {
@@ -73,6 +185,7 @@ struct Scheduler {
     scheduling_scratch: scheduling::SchedulingScratch,
     recheck_scratch: recheck::RecheckScratch,
     cost_pacer: Option<(u64, CostPacer)>,
+    stats: SchedulerStats,
 }
 
 impl Scheduler {
@@ -94,6 +207,7 @@ impl Scheduler {
             ),
             recheck_scratch: recheck::RecheckScratch::new(),
             cost_pacer: None,
+            stats: SchedulerStats::new(),
         }
     }
 
@@ -101,6 +215,8 @@ impl Scheduler {
         self.drain_progress();
         self.drain_check_responses();
         self.drain_execution_responses();
+        self.stats
+            .report_completed_slots(self.state.current_slot(), &self.in_flight);
         self.schedule(now);
         self.recheck_transactions();
         self.ingest_tpu();
@@ -117,7 +233,7 @@ impl Scheduler {
                 .snapshot()
                 .limit_instruction_accounts,
         );
-        check_response::drain_check_responses(
+        let stats = check_response::drain_check_responses(
             &self.session.check_worker_to_pack,
             &self.session.allocators[0],
             &check_sanitize_config,
@@ -125,9 +241,16 @@ impl Scheduler {
             &mut self.transaction_state,
             MAX_CHECK_RESPONSE_BATCHES_PER_ITERATION,
         );
+        self.stats
+            .record_check_responses(self.state.current_slot(), stats);
     }
 
     fn drain_execution_responses(&mut self) {
+        let fallback_slot = self
+            .in_flight
+            .scheduling_slot()
+            .unwrap_or(self.state.current_slot());
+        let stats = &mut self.stats;
         execution_response::drain_execution_responses(
             &mut self.session.workers,
             &self.session.allocators[0],
@@ -135,6 +258,12 @@ impl Scheduler {
             &mut self.account_locks,
             &mut self.in_flight,
             MAX_EXECUTION_RESPONSE_BATCHES_PER_ITERATION,
+            |execution_slot, stats_for_response| {
+                stats.record_execution_responses(
+                    execution_slot.unwrap_or(fallback_slot),
+                    stats_for_response,
+                );
+            },
         );
     }
 
@@ -146,22 +275,12 @@ impl Scheduler {
                 None => true,
             };
             if needs_new_cost_pacer {
-                let fill_time = (self.state.target_bank_time_ms() != 0)
-                    .then(|| Duration::from_millis(u64::from(self.state.target_bank_time_ms())));
                 self.cost_pacer = Some((
                     current_slot,
-                    CostPacer::new(self.state.initial_remaining_cost_units(), now, fill_time),
+                    CostPacer::new(self.state.initial_remaining_cost_units(), now, None),
                 ));
             }
-            let (_, cost_pacer) = self
-                .cost_pacer
-                .as_ref()
-                .expect("leader-ready scheduler state initializes the cost pacer");
-            let consumed_cost_units = self
-                .state
-                .initial_remaining_cost_units()
-                .saturating_sub(self.state.remaining_cost_units());
-            scheduling::schedule(
+            let scheduled_transactions = scheduling::schedule(
                 &mut self.session.workers,
                 &self.session.allocators[0],
                 &mut self.transaction_state,
@@ -169,9 +288,12 @@ impl Scheduler {
                 &mut self.in_flight,
                 &mut self.scheduling_scratch,
                 current_slot,
-                cost_pacer.scheduling_budget(&now, consumed_cost_units),
+                // Temporarily bypass the cost-based scheduling budget for load testing.
+                u64::MAX,
                 self.state.target_scheduled_cus(),
             );
+            self.stats
+                .record_scheduled_transactions(current_slot, scheduled_transactions);
         } else {
             self.cost_pacer = None;
         }

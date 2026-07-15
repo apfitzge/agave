@@ -23,6 +23,7 @@ agave-transaction-view = { workspace = true }
 agave-external-transaction-view = { package = "agave-transaction-view", git = "https://github.com/apfitzge/agave-sdk.git", rev = "3a586f082b9213b91ee14ea123845869d8103f0d" }
 clap = { workspace = true }
 jemallocator = { workspace = true }
+log = { workspace = true }
 rts-alloc = { workspace = true }
 shaq = { workspace = true }
 signal-hook = { workspace = true }
