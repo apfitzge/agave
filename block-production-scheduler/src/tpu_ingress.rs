@@ -5,29 +5,15 @@ use {
             CheckBatch, CheckTransactionMeta, MAX_PACKETS_PER_CHECK_BATCH, TpuTransactionMeta,
         },
     },
-    agave_scheduler_bindings::{
-        PackToCheckWorkerMessage, TpuToPackMessage, check_message_flags, tpu_message_flags,
-    },
-    agave_scheduling_utils::transaction_ptr::TransactionPtr,
-    agave_transaction_view::transaction_view::SanitizedTransactionView,
+    agave_scheduler_bindings::{PackToCheckWorkerMessage, TpuToPackMessage, check_message_flags},
     rts_alloc::Allocator,
-    solana_cost_model::cost_model::CostModel,
-    solana_fee::FeeFeatures,
-    solana_hash::Hash,
-    solana_runtime_transaction::{
-        runtime_transaction::RuntimeTransaction, sanitize_config::sanitize_config,
-        transaction_meta::TransactionMeta,
-    },
-    solana_transaction::sanitized::MessageHash,
     std::time::Duration,
 };
 
 const TPU_RECEIVE_TIMEOUT: Duration = Duration::from_millis(10);
-const LAMPORTS_PER_SIGNATURE: u64 = 5_000;
-const BURN_PERCENT: u64 = 50;
-const PRIORITY_MULTIPLIER: u64 = 1_000_000;
-const CHECK_FLAGS: u16 =
-    check_message_flags::LOAD_FEE_PAYER_BALANCE | check_message_flags::LOAD_ADDRESS_LOOKUP_TABLES;
+const CHECK_FLAGS: u16 = check_message_flags::LOAD_FEE_PAYER_BALANCE
+    | check_message_flags::LOAD_ADDRESS_LOOKUP_TABLES
+    | check_message_flags::CALCULATE_SCHEDULING_DETAILS;
 
 pub(crate) fn drain_tpu(
     tpu_to_scheduler: &mut shaq::spsc::Consumer<TpuToPackMessage>,
@@ -35,7 +21,6 @@ pub(crate) fn drain_tpu(
     allocator: &Allocator,
     state: &SchedulerState,
     max_packets: usize,
-    mut filter: impl FnMut(&SanitizedTransactionView<TransactionPtr>, &TpuTransactionMeta) -> bool,
 ) {
     // sleep only while not in the near-leader holding window where packets
     // should be buffered eagerly. The futex wait first checks the queue, so
@@ -51,9 +36,6 @@ pub(crate) fn drain_tpu(
         return;
     }
 
-    let sanitize_config =
-        sanitize_config(state.feature_set().snapshot().limit_instruction_accounts);
-
     let mut remaining_packets = tpu_to_scheduler.len().min(max_packets);
     while remaining_packets > 0 {
         let num_packets = remaining_packets.min(MAX_PACKETS_PER_CHECK_BATCH);
@@ -67,43 +49,17 @@ pub(crate) fn drain_tpu(
                 unreachable!("queue length checked before read");
             };
 
-            // SAFETY: the TPU queue hands ownership of this transaction allocation to the
-            // scheduler. This temporary view does not free or modify that allocation.
-            let transaction = unsafe {
-                TransactionPtr::from_sharable_transaction_region(&message.transaction, allocator)
-            };
-            let meta =
-                match SanitizedTransactionView::try_new_sanitized(transaction, &sanitize_config) {
-                    Ok(transaction) => {
-                        let (priority, cost) =
-                            calculate_priority_and_cost(state, &transaction, message.flags);
-                        let meta = TpuTransactionMeta {
-                            priority,
-                            cost,
-                            flags: message.flags,
-                            src_addr: message.src_addr,
-                        };
-                        if !filter(&transaction, &meta) {
-                            // SAFETY: this packet was consumed from the TPU queue and has not been
-                            // sent to a worker.
-                            unsafe { allocator.free_offset(message.transaction.offset) };
-                            continue;
-                        }
-                        meta
-                    }
-                    Err(_) => {
-                        // Can only occur if a mismatch in sanitize configuration between sigverify
-                        // and scheduler.
-
-                        // SAFETY: this packet was consumed from the TPU queue and has not been sent
-                        // to a worker.
-                        unsafe { allocator.free_offset(message.transaction.offset) };
-                        continue;
-                    }
-                };
             assert!(
                 batch
-                    .push(message.transaction, CheckTransactionMeta::Tpu(meta))
+                    .push(
+                        message.transaction,
+                        CheckTransactionMeta::Tpu(TpuTransactionMeta {
+                            priority: 0,
+                            cost: 0,
+                            flags: message.flags,
+                            src_addr: message.src_addr,
+                        }),
+                    )
                     .is_ok(),
                 "batch is bounded by the check-worker capacity"
             );
@@ -134,53 +90,6 @@ pub(crate) fn drain_tpu(
     tpu_to_scheduler.finalize();
 }
 
-fn calculate_priority_and_cost(
-    state: &SchedulerState,
-    transaction: &SanitizedTransactionView<TransactionPtr>,
-    flags: u8,
-) -> (u64, u64) {
-    let Ok(transaction) = RuntimeTransaction::<&SanitizedTransactionView<TransactionPtr>>::try_new(
-        transaction,
-        MessageHash::Precomputed(Hash::default()),
-        Some(flags & tpu_message_flags::IS_SIMPLE_VOTE != 0),
-    ) else {
-        return (0, 0);
-    };
-    let Ok(configuration) = transaction.transaction_configuration(state.feature_set()) else {
-        return (0, 0);
-    };
-
-    let cost = CostModel::calculate_cost_for_executed_transaction(
-        &transaction,
-        u64::from(configuration.compute_unit_limit),
-        configuration.loaded_accounts_data_size_limit,
-        state.feature_set(),
-    )
-    .sum();
-    let fee_details = solana_fee::calculate_fee_details(
-        &transaction,
-        LAMPORTS_PER_SIGNATURE,
-        configuration.priority_fee_lamports,
-        FeeFeatures::from(state.feature_set()),
-    );
-    let transaction_fee = fee_details.transaction_fee();
-    let reward = fee_details.prioritization_fee().saturating_add(
-        transaction_fee.saturating_sub(
-            transaction_fee
-                .saturating_mul(BURN_PERCENT)
-                .wrapping_div(100),
-        ),
-    );
-
-    #[allow(clippy::arithmetic_side_effects)]
-    (
-        reward
-            .saturating_mul(PRIORITY_MULTIPLIER)
-            .wrapping_div(cost.saturating_add(1)),
-        cost,
-    )
-}
-
 fn drop_tpu_packets(
     tpu_to_scheduler: &mut shaq::spsc::Consumer<TpuToPackMessage>,
     allocator: &Allocator,
@@ -207,7 +116,6 @@ mod tests {
             SharableTransactionRegion, scheduler_feature_flags,
         },
         agave_scheduling_utils::handshake::{client, server::Server},
-        solana_compute_budget_interface::ComputeBudgetInstruction,
         solana_hash::Hash,
         solana_keypair::Keypair,
         solana_message::Message,
@@ -232,11 +140,15 @@ mod tests {
         }
     }
 
-    fn transaction_bytes(payer: &Keypair, compute_unit_price: u64) -> Vec<u8> {
-        let transfer =
-            system_instruction::transfer(&payer.pubkey(), &Pubkey::new_from_array([1; 32]), 1);
-        let priority = ComputeBudgetInstruction::set_compute_unit_price(compute_unit_price);
-        let message = Message::new(&[transfer, priority], Some(&payer.pubkey()));
+    fn transaction_bytes(payer: &Keypair) -> Vec<u8> {
+        let message = Message::new(
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                &Pubkey::new_from_array([1; 32]),
+                1,
+            )],
+            Some(&payer.pubkey()),
+        );
         let transaction = Transaction::new(&[payer], message, Hash::default());
 
         wincode::serialize(&VersionedTransaction::from(transaction)).unwrap()
@@ -265,7 +177,7 @@ mod tests {
         let allocator = &client_session.allocators[0];
         let mut offsets = Vec::new();
         let payer = Keypair::new();
-        let transaction_bytes = transaction_bytes(&payer, 1);
+        let transaction_bytes = transaction_bytes(&payer);
 
         let max_packets = MAX_PACKETS_PER_CHECK_BATCH * 2;
         for packet_index in 0..=max_packets {
@@ -291,7 +203,6 @@ mod tests {
             allocator,
             &state,
             max_packets,
-            |_, _| true,
         );
 
         for batch_index in 0..2 {
@@ -301,6 +212,10 @@ mod tests {
                 .unwrap();
             assert_eq!(message.flags, CHECK_FLAGS);
             assert_eq!(message.flags & check_message_flags::STATUS_CHECKS, 0);
+            assert_ne!(
+                message.flags & check_message_flags::CALCULATE_SCHEDULING_DETAILS,
+                0
+            );
             assert_eq!(
                 usize::from(message.batch.num_transactions),
                 MAX_PACKETS_PER_CHECK_BATCH
@@ -313,7 +228,8 @@ mod tests {
                 let CheckTransactionMeta::Tpu(meta) = meta else {
                     panic!("TPU ingress must retain TPU metadata");
                 };
-                assert!(meta.priority > 0);
+                assert_eq!(meta.priority, 0);
+                assert_eq!(meta.cost, 0);
                 assert_eq!(meta.flags, 0);
                 assert_eq!(
                     meta.src_addr,
@@ -350,7 +266,7 @@ mod tests {
         let mut client_session = client::setup_session(&logon, files).unwrap();
         let allocator = &client_session.allocators[0];
         let payer = Keypair::new();
-        let transaction = allocate_transaction(allocator, &transaction_bytes(&payer, 1));
+        let transaction = allocate_transaction(allocator, &transaction_bytes(&payer));
 
         let occupied_message = PackToCheckWorkerMessage {
             flags: CHECK_FLAGS,
@@ -383,7 +299,6 @@ mod tests {
             allocator,
             &state,
             MAX_PACKETS_PER_CHECK_BATCH,
-            |_, _| true,
         );
 
         client_session.tpu_to_pack.sync();
@@ -392,15 +307,14 @@ mod tests {
     }
 
     #[test]
-    fn filters_packets_before_check_worker_processing() {
+    fn forwards_packets_without_sanitizing() {
         let mut config = SchedulerConfig::new("/unused");
         config.allocator_size = 64 * 1024 * 1024;
         let logon = config.client_logon();
         let (mut agave_session, files) = Server::setup_session(logon).unwrap();
         let mut client_session = client::setup_session(&logon, files).unwrap();
         let allocator = &client_session.allocators[0];
-        let payer = Keypair::new();
-        let transaction = allocate_transaction(allocator, &transaction_bytes(&payer, 1));
+        let transaction = allocate_transaction(allocator, &[0]);
         agave_session
             .tpu_to_pack
             .producer
@@ -420,56 +334,22 @@ mod tests {
             allocator,
             &state,
             1,
-            |_, meta| meta.priority == 0,
         );
 
-        assert!(
-            agave_session.check_workers[0]
-                .pack_to_check_worker
-                .try_read()
-                .is_none()
-        );
+        let message = agave_session.check_workers[0]
+            .pack_to_check_worker
+            .try_read()
+            .unwrap();
+        let batch = unsafe {
+            CheckBatch::from_sharable_transaction_batch_region(&message.batch, allocator)
+        };
+        assert_eq!(batch.transaction_region(0), transaction);
+        // SAFETY: this test owns the batch after reading it from the check-worker queue.
+        unsafe { batch.free() };
         client_session.tpu_to_pack.sync();
         assert!(client_session.tpu_to_pack.try_read().is_none());
         client_session.tpu_to_pack.finalize();
-    }
-
-    #[test]
-    fn calculates_higher_priority_for_higher_compute_unit_price() {
-        let mut config = SchedulerConfig::new("/unused");
-        config.allocator_size = 64 * 1024 * 1024;
-        let (agave_session, _) = Server::setup_session(config.client_logon()).unwrap();
-        let allocator = &agave_session.tpu_to_pack.allocator;
-        let state = SchedulerState::new();
-        let payer = Keypair::new();
-
-        let low_priority = allocate_transaction(allocator, &transaction_bytes(&payer, 1));
-        let high_priority = allocate_transaction(allocator, &transaction_bytes(&payer, 1_000_000));
-        // SAFETY: both regions point to transaction allocations owned by this test.
-        let low_transaction =
-            unsafe { TransactionPtr::from_sharable_transaction_region(&low_priority, allocator) };
-        let low_transaction = SanitizedTransactionView::try_new_sanitized(
-            low_transaction,
-            &sanitize_config(state.feature_set().snapshot().limit_instruction_accounts),
-        )
-        .unwrap();
-        // SAFETY: both regions point to transaction allocations owned by this test.
-        let high_transaction =
-            unsafe { TransactionPtr::from_sharable_transaction_region(&high_priority, allocator) };
-        let high_transaction = SanitizedTransactionView::try_new_sanitized(
-            high_transaction,
-            &sanitize_config(state.feature_set().snapshot().limit_instruction_accounts),
-        )
-        .unwrap();
-        let (low, _) = calculate_priority_and_cost(&state, &low_transaction, 0);
-        let (high, _) = calculate_priority_and_cost(&state, &high_transaction, 0);
-
-        assert!(high > low, "higher CU price should produce higher priority");
-
-        // SAFETY: the test has not sent either transaction to a worker.
-        unsafe {
-            allocator.free_offset(low_priority.offset);
-            allocator.free_offset(high_priority.offset);
-        }
+        // SAFETY: this test retains ownership of the raw transaction allocation.
+        unsafe { allocator.free_offset(transaction.offset) };
     }
 }

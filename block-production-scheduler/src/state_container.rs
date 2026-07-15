@@ -29,6 +29,7 @@ impl CheckedTransaction {
 /// Owns checked transactions for their entire scheduler lifetime and orders queued ones by
 /// priority.
 pub(crate) struct StateContainer {
+    capacity: usize,
     transactions: Slab<CheckedTransaction>,
     queue: TransactionPriorityQueue,
 }
@@ -37,9 +38,20 @@ impl StateContainer {
     pub(crate) fn new(capacity: usize) -> Self {
         assert!(capacity > 0, "transaction state capacity must be non-zero");
         Self {
+            capacity,
             transactions: Slab::with_capacity(capacity.saturating_add(1)),
             queue: TransactionPriorityQueue::with_capacity(capacity),
         }
+    }
+
+    /// Returns whether a new transaction can be retained without evicting in-flight or held
+    /// state. A priority tied with the lowest queued transaction is not admitted.
+    pub(crate) fn can_admit_priority(&self, priority: u64) -> bool {
+        self.transactions.len() < self.capacity
+            || self
+                .queue
+                .min_priority()
+                .is_some_and(|minimum_priority| priority > minimum_priority)
     }
 
     /// Inserts a checked transaction and returns any transaction evicted for capacity.
@@ -352,9 +364,21 @@ mod tests {
 
         let queued = *container.descending_from(None).next().unwrap();
         container.dequeue(queued.id);
-        let dropped = container.push(checked_transaction(&allocator, 1)).unwrap();
-        assert_eq!(dropped.meta.priority, 1);
+        assert!(!container.can_admit_priority(1));
         assert_eq!(container.buffer_len(), 2);
+    }
+
+    #[test]
+    fn admits_only_strictly_higher_priorities_when_full() {
+        let session = session();
+        let allocator = &session.tpu_to_pack.allocator;
+        let mut container = StateContainer::new(2);
+        container.push(checked_transaction(allocator, 10));
+        container.push(checked_transaction(allocator, 5));
+
+        assert!(!container.can_admit_priority(5));
+        assert!(!container.can_admit_priority(4));
+        assert!(container.can_admit_priority(6));
     }
 
     #[test]

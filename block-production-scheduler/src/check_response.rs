@@ -9,7 +9,7 @@ use {
         CheckWorkerToPackMessage, SharablePubkeys, processed_codes,
         worker_message_types::{
             CHECK_RESPONSE, CheckResponse, fee_payer_balance_flags, parsing_and_sanitization_flags,
-            resolve_flags, status_check_flags,
+            resolve_flags, scheduling_details_flags, status_check_flags,
         },
     },
     agave_scheduling_utils::responses_region::CheckResponsesPtr,
@@ -17,6 +17,9 @@ use {
     solana_pubkey::Pubkey,
     std::collections::HashSet,
 };
+
+const BURN_PERCENT: u64 = 50;
+const PRIORITY_MULTIPLIER: u64 = 1_000_000;
 
 #[derive(Default)]
 pub(crate) struct CheckResponseStats {
@@ -122,43 +125,53 @@ fn handle_check_response(
 
 fn handle_tpu_check_response(
     transaction: agave_scheduling_utils::transaction_ptr::TransactionPtr,
-    meta: TpuTransactionMeta,
+    mut meta: TpuTransactionMeta,
     check_response: &CheckResponse,
     allocator: &Allocator,
     sanitize_config: &SanitizeConfig,
     reserved_account_keys: &HashSet<Pubkey>,
     state: &mut StateContainer,
 ) -> bool {
-    if initial_response_is_valid(check_response) {
-        // SAFETY: successful checks transfer ownership of the transaction and resolved pubkey
-        // allocations to this scheduler.
-        match unsafe {
-            ResolvedTransaction::try_new(
-                transaction,
-                check_response.resolved_pubkeys,
-                allocator,
-                sanitize_config,
-                reserved_account_keys,
-            )
-        } {
-            Ok(transaction) => {
-                if let Some(dropped) = state.push(CheckedTransaction::new(transaction, meta)) {
-                    free_checked_transaction(dropped, allocator);
-                }
-                true
-            }
-            Err(transaction) => {
-                // SAFETY: this scheduler retains ownership after the external-view parse fails,
-                // and must release both shared allocations.
-                unsafe { transaction.free(allocator) };
-                false
-            }
-        }
-    } else {
+    if !initial_response_is_valid(check_response) {
         // SAFETY: rejected transactions are still owned by this scheduler.
         unsafe { transaction.free(allocator) };
         free_resolved_pubkeys(check_response.resolved_pubkeys, allocator);
-        false
+        return false;
+    }
+
+    let priority = calculate_priority(check_response);
+    if !state.can_admit_priority(priority) {
+        // SAFETY: a transaction below the priority floor is still owned by this scheduler.
+        unsafe { transaction.free(allocator) };
+        free_resolved_pubkeys(check_response.resolved_pubkeys, allocator);
+        return false;
+    }
+
+    meta.priority = priority;
+    meta.cost = check_response.estimated_cost_units;
+    // SAFETY: successful checks transfer ownership of the transaction and resolved pubkey
+    // allocations to this scheduler.
+    match unsafe {
+        ResolvedTransaction::try_new(
+            transaction,
+            check_response.resolved_pubkeys,
+            allocator,
+            sanitize_config,
+            reserved_account_keys,
+        )
+    } {
+        Ok(transaction) => {
+            if let Some(dropped) = state.push(CheckedTransaction::new(transaction, meta)) {
+                free_checked_transaction(dropped, allocator);
+            }
+            true
+        }
+        Err(transaction) => {
+            // SAFETY: this scheduler retains ownership after the external-view parse fails,
+            // and must release both shared allocations.
+            unsafe { transaction.free(allocator) };
+            false
+        }
     }
 }
 
@@ -180,6 +193,24 @@ fn initial_response_is_valid(response: &CheckResponse) -> bool {
         && response.fee_payer_balance_flags & fee_payer_balance_flags::PERFORMED != 0
         && response.resolve_flags & resolve_flags::PERFORMED != 0
         && response.resolve_flags & resolve_flags::FAILED == 0
+        && response.scheduling_details_flags & scheduling_details_flags::PERFORMED != 0
+        && response.scheduling_details_flags & scheduling_details_flags::FAILED == 0
+}
+
+fn calculate_priority(response: &CheckResponse) -> u64 {
+    let reward = response.prioritization_fee.saturating_add(
+        response.transaction_fee.saturating_sub(
+            response
+                .transaction_fee
+                .saturating_mul(BURN_PERCENT)
+                .wrapping_div(100),
+        ),
+    );
+
+    #[allow(clippy::arithmetic_side_effects)]
+    reward
+        .saturating_mul(PRIORITY_MULTIPLIER)
+        .wrapping_div(response.estimated_cost_units.saturating_add(1))
 }
 
 fn recheck_response_is_valid(response: &CheckResponse) -> bool {
@@ -344,7 +375,8 @@ mod tests {
             fee_payer_balance_flags: fee_payer_balance_flags::REQUESTED
                 | fee_payer_balance_flags::PERFORMED,
             resolve_flags: resolve_flags::REQUESTED | resolve_flags::PERFORMED,
-            scheduling_details_flags: 0,
+            scheduling_details_flags: scheduling_details_flags::REQUESTED
+                | scheduling_details_flags::PERFORMED,
             included_slot: 0,
             transaction_fee: 0,
             prioritization_fee: 0,
@@ -366,6 +398,13 @@ mod tests {
 
         assert!(initial_response_is_valid(&response));
         assert!(!recheck_response_is_valid(&response));
+    }
+
+    fn response_with_priority_fee(prioritization_fee: u64) -> CheckResponse {
+        CheckResponse {
+            prioritization_fee,
+            ..valid_response()
+        }
     }
 
     #[test]
@@ -391,9 +430,9 @@ mod tests {
                 .unwrap();
         };
 
-        queue_response(make_batch(allocator, 1), valid_response());
-        queue_response(make_batch(allocator, 2), valid_response());
-        let mut invalid_response = valid_response();
+        queue_response(make_batch(allocator, 0), response_with_priority_fee(1));
+        queue_response(make_batch(allocator, 0), response_with_priority_fee(2));
+        let mut invalid_response = response_with_priority_fee(3);
         invalid_response.parsing_and_sanitization_flags = parsing_and_sanitization_flags::FAILED;
         queue_response(make_batch(allocator, 3), invalid_response);
 
@@ -423,10 +462,78 @@ mod tests {
         assert_eq!(stats.checked_transactions, 1);
         assert_eq!(stats.accepted_transactions, 0);
         let first = state.pop().unwrap();
-        assert_eq!(first.meta.priority, 2);
+        assert_eq!(first.meta.priority, 2_000_000);
         assert!(state.pop().is_none());
 
         free_checked_transaction(first, allocator);
+    }
+
+    #[test]
+    fn unresolvable_transaction_does_not_evict_the_priority_floor() {
+        let mut config = SchedulerConfig::new("/unused");
+        config.allocator_size = 64 * 1024 * 1024;
+        config.check_worker_count = 1;
+        let logon = config.client_logon();
+        let (agave_session, files) = Server::setup_session(logon).unwrap();
+        let client_session = client::setup_session(&logon, files).unwrap();
+        let allocator = &client_session.allocators[0];
+
+        let queue_response = |batch, check_response: CheckResponse| {
+            let responses =
+                resolve_responses_from_iter(allocator, std::iter::once(check_response)).unwrap();
+            agave_session.check_workers[0]
+                .check_worker_to_pack
+                .try_write(CheckWorkerToPackMessage {
+                    batch,
+                    processed_code: processed_codes::PROCESSED,
+                    responses,
+                })
+                .unwrap();
+        };
+
+        queue_response(make_batch(allocator, 0), response_with_priority_fee(1));
+        let malformed_batch = make_batch(allocator, 0);
+        // SAFETY: this test owns the malformed batch and its transaction allocation until the
+        // response handler frees them.
+        unsafe {
+            let transaction = allocator
+                .ptr_from_offset(malformed_batch.transactions_offset)
+                .cast::<SharableTransactionRegion>()
+                .read();
+            core::ptr::write_bytes(
+                allocator.ptr_from_offset(transaction.offset).as_ptr(),
+                0,
+                transaction.length as usize,
+            );
+        }
+        queue_response(malformed_batch, response_with_priority_fee(2));
+
+        let mut state = StateContainer::new(1);
+        let sanitize_config = sanitize_config(false);
+        let reserved_account_keys = HashSet::new();
+        drain_check_responses(
+            &client_session.check_worker_to_pack,
+            allocator,
+            &sanitize_config,
+            &reserved_account_keys,
+            &mut state,
+            1,
+        );
+        let stats = drain_check_responses(
+            &client_session.check_worker_to_pack,
+            allocator,
+            &sanitize_config,
+            &reserved_account_keys,
+            &mut state,
+            1,
+        );
+
+        assert_eq!(stats.checked_transactions, 1);
+        assert_eq!(stats.accepted_transactions, 0);
+        let retained = state.pop().unwrap();
+        assert_eq!(retained.meta.priority, 1_000_000);
+        // SAFETY: the retained transaction was removed from scheduler state by the test.
+        unsafe { retained.transaction.free(allocator) };
     }
 
     #[test]

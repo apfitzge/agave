@@ -52,6 +52,10 @@ impl TransactionPriorityQueue {
         self.queued.remove(id)
     }
 
+    pub fn min_priority(&self) -> Option<u64> {
+        self.queued.first().map(|id| id.priority)
+    }
+
     pub fn min_max_priority(&self) -> Option<(u64, u64)> {
         Some((self.queued.first()?.priority, self.queued.last()?.priority))
     }

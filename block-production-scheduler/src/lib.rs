@@ -306,7 +306,6 @@ impl Scheduler {
             &self.session.allocators[0],
             &self.state,
             MAX_TPU_PACKETS_PER_ITERATION,
-            |_, _| true,
         );
     }
 
@@ -341,7 +340,7 @@ mod tests {
             SharablePubkeys, TpuToPackMessage, processed_codes,
             worker_message_types::{
                 CheckResponse, ExecutionResponse, fee_payer_balance_flags, resolve_flags,
-                status_check_flags,
+                scheduling_details_flags, status_check_flags,
             },
         },
         agave_scheduling_utils::{
@@ -410,7 +409,8 @@ mod tests {
             fee_payer_balance_flags: fee_payer_balance_flags::REQUESTED
                 | fee_payer_balance_flags::PERFORMED,
             resolve_flags: resolve_flags::REQUESTED | resolve_flags::PERFORMED,
-            scheduling_details_flags: 0,
+            scheduling_details_flags: scheduling_details_flags::REQUESTED
+                | scheduling_details_flags::PERFORMED,
             included_slot: 0,
             transaction_fee: 0,
             prioritization_fee: 0,
