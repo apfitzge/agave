@@ -20,6 +20,8 @@ use {
     thiserror::Error,
 };
 
+const EXECUTION_WORKER_COUNT: usize = 8;
+
 #[cfg(not(any(target_env = "msvc", target_os = "freebsd")))]
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
@@ -86,10 +88,12 @@ fn run(exit_signal: Arc<AtomicBool>) -> Result<(), RunnerError> {
     let socket_directory = TempDir::new().map_err(RunnerError::TemporarySocket)?;
     let socket = socket_directory.path().join("scheduler-bindings.ipc");
     let mut server = Server::new(&socket).map_err(RunnerError::SchedulerSocket)?;
+    let mut scheduler_config = SchedulerConfig::new(socket);
+    scheduler_config.execution_worker_count = EXECUTION_WORKER_COUNT;
     let scheduler_exit = Arc::clone(&exit_signal);
     let scheduler = thread::Builder::new()
         .name("solLoadScheduler".to_string())
-        .spawn(move || run_scheduler(SchedulerConfig::new(socket), scheduler_exit))
+        .spawn(move || run_scheduler(scheduler_config, scheduler_exit))
         .map_err(RunnerError::LaunchSchedulerThread)?;
     let session = server.accept()?;
 
