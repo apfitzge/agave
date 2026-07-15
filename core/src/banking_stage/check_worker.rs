@@ -46,6 +46,7 @@ use {
             Arc,
             atomic::{AtomicBool, Ordering},
         },
+        thread,
         time::Duration,
     },
     thiserror::Error,
@@ -56,8 +57,6 @@ type TxView = SanitizedTransactionView<TransactionPtr>;
 
 #[derive(Debug, Error)]
 pub enum ExternalCheckWorkerError {
-    #[error("Sender disconnected")]
-    SenderDisconnected,
     #[error("Allocation failed")]
     AllocationFailure,
 }
@@ -215,13 +214,15 @@ impl ExternalCheckWorker {
             );
         }
 
-        self.sender
-            .try_write(CheckWorkerToPackMessage {
+        send_response(
+            &self.sender,
+            &self.exit,
+            CheckWorkerToPackMessage {
                 batch: message.batch,
                 processed_code: processed_codes::PROCESSED,
                 responses,
-            })
-            .map_err(|_| ExternalCheckWorkerError::SenderDisconnected)?;
+            },
+        );
 
         Ok(())
     }
@@ -311,8 +312,10 @@ impl ExternalCheckWorker {
     ) -> Result<(), ExternalCheckWorkerError> {
         assert_ne!(processed_code, processed_codes::PROCESSED);
 
-        self.sender
-            .try_write(CheckWorkerToPackMessage {
+        send_response(
+            &self.sender,
+            &self.exit,
+            CheckWorkerToPackMessage {
                 batch: message.batch,
                 processed_code,
                 responses: TransactionResponseRegion {
@@ -320,8 +323,8 @@ impl ExternalCheckWorker {
                     num_transaction_responses: 0,
                     transaction_responses_offset: 0,
                 },
-            })
-            .map_err(|_| ExternalCheckWorkerError::SenderDisconnected)?;
+            },
+        );
 
         Ok(())
     }
@@ -669,6 +672,26 @@ impl ExternalCheckWorker {
     }
 }
 
+fn send_response(
+    sender: &shaq::mpmc::Producer<CheckWorkerToPackMessage>,
+    exit: &AtomicBool,
+    response: CheckWorkerToPackMessage,
+) {
+    let mut response = response;
+    loop {
+        match sender.try_write(response) {
+            Ok(()) => return,
+            Err(unpublished_response) => {
+                if exit.load(Ordering::Relaxed) {
+                    return;
+                }
+                response = unpublished_response;
+                thread::yield_now();
+            }
+        }
+    }
+}
+
 /// Returns an active leader state if available, otherwise None.
 fn active_leader_state(
     shared_leader_state: &SharedLeaderState,
@@ -711,6 +734,7 @@ mod tests {
         solana_transaction::Transaction,
         std::{
             sync::{Arc, RwLock},
+            thread,
             time::Duration,
         },
     };
@@ -901,6 +925,42 @@ mod tests {
     fn test_idle_timeout() {
         let mut test_frame = setup_check_worker_test_frame();
         test_frame.iterate_idle().unwrap();
+    }
+
+    #[test]
+    fn waits_for_check_response_queue_capacity() {
+        let (sender, receiver) = shaq::mpmc::pair(1).unwrap();
+        let exit = Arc::new(AtomicBool::new(false));
+        let first_response = CheckWorkerToPackMessage {
+            batch: SharableTransactionBatchRegion {
+                num_transactions: 0,
+                transactions_offset: 1,
+            },
+            processed_code: processed_codes::PROCESSED,
+            responses: TransactionResponseRegion {
+                tag: 0,
+                num_transaction_responses: 0,
+                transaction_responses_offset: 0,
+            },
+        };
+        let second_response = CheckWorkerToPackMessage {
+            batch: SharableTransactionBatchRegion {
+                num_transactions: 0,
+                transactions_offset: 2,
+            },
+            ..first_response
+        };
+        sender.try_write(first_response).unwrap();
+
+        let waiting_sender = sender.clone();
+        let waiting_exit = Arc::clone(&exit);
+        let sender_thread = thread::spawn(move || {
+            send_response(&waiting_sender, &waiting_exit, second_response);
+        });
+
+        assert_eq!(receiver.try_read(), Some(first_response));
+        sender_thread.join().unwrap();
+        assert_eq!(receiver.try_read(), Some(second_response));
     }
 
     #[test]

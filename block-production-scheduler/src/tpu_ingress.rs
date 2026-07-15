@@ -15,13 +15,19 @@ const CHECK_FLAGS: u16 = check_message_flags::LOAD_FEE_PAYER_BALANCE
     | check_message_flags::LOAD_ADDRESS_LOOKUP_TABLES
     | check_message_flags::CALCULATE_SCHEDULING_DETAILS;
 
+#[derive(Default)]
+pub(crate) struct TpuIngressStats {
+    pub(crate) dropped_not_accepting_packets: u64,
+    pub(crate) dropped_check_worker_queue_full_packets: u64,
+}
+
 pub(crate) fn drain_tpu(
     tpu_to_scheduler: &mut shaq::spsc::Consumer<TpuToPackMessage>,
     scheduler_to_check_worker: &shaq::mpmc::Producer<PackToCheckWorkerMessage>,
     allocator: &Allocator,
     state: &SchedulerState,
     max_packets: usize,
-) {
+) -> TpuIngressStats {
     // sleep only while not in the near-leader holding window where packets
     // should be buffered eagerly. The futex wait first checks the queue, so
     // it returns immediately if a producer has already published packets.
@@ -32,10 +38,17 @@ pub(crate) fn drain_tpu(
     }
 
     if !state.should_accept_packets() {
-        drop_tpu_packets(tpu_to_scheduler, allocator, max_packets);
-        return;
+        return TpuIngressStats {
+            dropped_not_accepting_packets: drop_tpu_packets(
+                tpu_to_scheduler,
+                allocator,
+                max_packets,
+            ),
+            ..TpuIngressStats::default()
+        };
     }
 
+    let mut stats = TpuIngressStats::default();
     let mut remaining_packets = tpu_to_scheduler.len().min(max_packets);
     while remaining_packets > 0 {
         let num_packets = remaining_packets.min(MAX_PACKETS_PER_CHECK_BATCH);
@@ -76,6 +89,9 @@ pub(crate) fn drain_tpu(
                 })
                 .is_err()
             {
+                stats.dropped_check_worker_queue_full_packets = stats
+                    .dropped_check_worker_queue_full_packets
+                    .wrapping_add(batch.len() as u64);
                 // SAFETY: this scheduler owns the batch and all transaction allocations until
                 // the batch is accepted by the queue.
                 unsafe {
@@ -88,14 +104,16 @@ pub(crate) fn drain_tpu(
         remaining_packets = remaining_packets.wrapping_sub(num_packets);
     }
     tpu_to_scheduler.finalize();
+    stats
 }
 
 fn drop_tpu_packets(
     tpu_to_scheduler: &mut shaq::spsc::Consumer<TpuToPackMessage>,
     allocator: &Allocator,
     max_packets: usize,
-) {
-    for _ in 0..tpu_to_scheduler.len().min(max_packets) {
+) -> u64 {
+    let num_packets = tpu_to_scheduler.len().min(max_packets);
+    for _ in 0..num_packets {
         let message = tpu_to_scheduler
             .try_read()
             .expect("queue length checked before read");
@@ -104,6 +122,7 @@ fn drop_tpu_packets(
         unsafe { allocator.free_offset(message.transaction.offset) };
     }
     tpu_to_scheduler.finalize();
+    num_packets as u64
 }
 
 #[cfg(test)]
@@ -197,13 +216,15 @@ mod tests {
 
         let mut state = SchedulerState::new();
         state.update(&leader_ready_progress());
-        drain_tpu(
+        let stats = drain_tpu(
             &mut client_session.tpu_to_pack,
             &client_session.pack_to_check_worker,
             allocator,
             &state,
             max_packets,
         );
+        assert_eq!(stats.dropped_not_accepting_packets, 0);
+        assert_eq!(stats.dropped_check_worker_queue_full_packets, 0);
 
         for batch_index in 0..2 {
             let message = agave_session.check_workers[0]
@@ -293,14 +314,52 @@ mod tests {
 
         let mut state = SchedulerState::new();
         state.update(&leader_ready_progress());
-        drain_tpu(
+        let stats = drain_tpu(
             &mut client_session.tpu_to_pack,
             &client_session.pack_to_check_worker,
             allocator,
             &state,
             MAX_PACKETS_PER_CHECK_BATCH,
         );
+        assert_eq!(stats.dropped_not_accepting_packets, 0);
+        assert_eq!(stats.dropped_check_worker_queue_full_packets, 1);
 
+        client_session.tpu_to_pack.sync();
+        assert!(client_session.tpu_to_pack.try_read().is_none());
+        client_session.tpu_to_pack.finalize();
+    }
+
+    #[test]
+    fn drops_packets_when_not_accepting() {
+        let mut config = SchedulerConfig::new("/unused");
+        config.allocator_size = 64 * 1024 * 1024;
+        let logon = config.client_logon();
+        let (mut agave_session, files) = Server::setup_session(logon).unwrap();
+        let mut client_session = client::setup_session(&logon, files).unwrap();
+        let allocator = &client_session.allocators[0];
+        let payer = Keypair::new();
+        let transaction = allocate_transaction(allocator, &transaction_bytes(&payer));
+        agave_session
+            .tpu_to_pack
+            .producer
+            .try_write(TpuToPackMessage {
+                transaction,
+                flags: 0,
+                src_addr: [0; 16],
+            })
+            .unwrap();
+        agave_session.tpu_to_pack.producer.commit();
+
+        let stats = drain_tpu(
+            &mut client_session.tpu_to_pack,
+            &client_session.pack_to_check_worker,
+            allocator,
+            &SchedulerState::new(),
+            1,
+        );
+
+        assert_eq!(stats.dropped_not_accepting_packets, 1);
+        assert_eq!(stats.dropped_check_worker_queue_full_packets, 0);
         client_session.tpu_to_pack.sync();
         assert!(client_session.tpu_to_pack.try_read().is_none());
         client_session.tpu_to_pack.finalize();
@@ -328,13 +387,15 @@ mod tests {
 
         let mut state = SchedulerState::new();
         state.update(&leader_ready_progress());
-        drain_tpu(
+        let stats = drain_tpu(
             &mut client_session.tpu_to_pack,
             &client_session.pack_to_check_worker,
             allocator,
             &state,
             1,
         );
+        assert_eq!(stats.dropped_not_accepting_packets, 0);
+        assert_eq!(stats.dropped_check_worker_queue_full_packets, 0);
 
         let message = agave_session.check_workers[0]
             .pack_to_check_worker

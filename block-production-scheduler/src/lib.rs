@@ -15,7 +15,6 @@ use {
             Arc,
             atomic::{AtomicBool, Ordering},
         },
-        thread,
         time::Instant,
     },
 };
@@ -46,6 +45,8 @@ struct SchedulerStats {
 
 #[derive(Default)]
 struct SlotStats {
+    dropped_not_accepting_packets: u64,
+    dropped_check_worker_queue_full_packets: u64,
     checked_transactions: u64,
     accepted_transactions: u64,
     scheduled_transactions: u64,
@@ -71,6 +72,16 @@ impl SchedulerStats {
         stats_for_slot.accepted_transactions = stats_for_slot
             .accepted_transactions
             .wrapping_add(stats.accepted_transactions);
+    }
+
+    fn record_tpu_ingress(&mut self, slot: u64, stats: tpu_ingress::TpuIngressStats) {
+        let stats_for_slot = self.slot_mut(slot);
+        stats_for_slot.dropped_not_accepting_packets = stats_for_slot
+            .dropped_not_accepting_packets
+            .wrapping_add(stats.dropped_not_accepting_packets);
+        stats_for_slot.dropped_check_worker_queue_full_packets = stats_for_slot
+            .dropped_check_worker_queue_full_packets
+            .wrapping_add(stats.dropped_check_worker_queue_full_packets);
     }
 
     fn record_scheduled_transactions(&mut self, slot: u64, scheduled_transactions: usize) {
@@ -122,11 +133,15 @@ impl SchedulerStats {
                 .pop_first()
                 .expect("first key was present immediately before removal");
             info!(
-                "scheduler_slot={slot} check_transactions={} check_accepted_transactions={} \
-                 check_rejected_transactions={} scheduled_transactions={} \
-                 execution_completed_transactions={} execution_recorded_transactions={} \
-                 execution_not_recorded_transactions={} execution_retries={} \
-                 execution_cost_limit_retries={} execution_slot_boundary_retries={}",
+                "scheduler_slot={slot} tpu_dropped_not_accepting_packets={} \
+                 tpu_dropped_check_worker_queue_full_packets={} check_transactions={} \
+                 check_accepted_transactions={} check_rejected_transactions={} \
+                 scheduled_transactions={} execution_completed_transactions={} \
+                 execution_recorded_transactions={} execution_not_recorded_transactions={} \
+                 execution_retries={} execution_cost_limit_retries={} \
+                 execution_slot_boundary_retries={}",
+                stats.dropped_not_accepting_packets,
+                stats.dropped_check_worker_queue_full_packets,
                 stats.checked_transactions,
                 stats.accepted_transactions,
                 stats
@@ -299,13 +314,15 @@ impl Scheduler {
     }
 
     fn ingest_tpu(&mut self) {
-        tpu_ingress::drain_tpu(
+        let stats = tpu_ingress::drain_tpu(
             &mut self.session.tpu_to_pack,
             &self.session.pack_to_check_worker,
             &self.session.allocators[0],
             &self.state,
             MAX_TPU_PACKETS_PER_ITERATION,
         );
+        self.stats
+            .record_tpu_ingress(self.state.current_slot(), stats);
     }
 
     fn recheck_transactions(&mut self) {
