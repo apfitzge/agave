@@ -172,7 +172,6 @@ fn run_session(config: SchedulerConfig, session: ClientSession, exit: Arc<Atomic
 
     while !exit.load(Ordering::Relaxed) {
         scheduler.run_iteration(Instant::now());
-        thread::yield_now();
     }
 }
 
