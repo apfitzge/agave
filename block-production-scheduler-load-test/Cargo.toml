@@ -29,6 +29,7 @@ shaq = { workspace = true }
 signal-hook = { workspace = true }
 solana-account = { workspace = true }
 solana-core = { workspace = true }
+solana-clock = { workspace = true }
 solana-epoch-schedule = { workspace = true }
 solana-hash = { workspace = true }
 solana-message = { workspace = true }

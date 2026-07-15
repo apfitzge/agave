@@ -3,6 +3,7 @@ use {
     agave_scheduling_utils::handshake::{AgaveSession, AgaveTpuToPackSession},
     agave_votor_messages::migration::MigrationStatus,
     crossbeam_channel::{Receiver, bounded},
+    solana_clock::DEFAULT_HASHES_PER_TICK,
     solana_core::banking_stage::{
         check_worker::ExternalCheckWorker,
         committer::Committer,
@@ -16,7 +17,7 @@ use {
     solana_poh::{
         poh_controller::PohController,
         poh_recorder::{PohRecorder, WorkingBankEntryOrMarker},
-        poh_service::{DEFAULT_HASHES_PER_BATCH, PohService},
+        poh_service::{DEFAULT_HASHES_PER_BATCH, DEFAULT_PINNED_CPU_CORE, PohService},
         record_channels::record_channels,
         transaction_recorder::TransactionRecorder,
     },
@@ -50,12 +51,15 @@ const ROTATION_RECEIVE_TIMEOUT: Duration = Duration::from_millis(10);
 pub struct HarnessConfig {
     /// The target duration of each leader slot.
     pub slot_duration: Duration,
+    /// The normal PoH producer's hash count per tick.
+    pub hashes_per_tick: u64,
 }
 
 impl Default for HarnessConfig {
     fn default() -> Self {
         Self {
             slot_duration: DEFAULT_SLOT_DURATION,
+            hashes_per_tick: DEFAULT_HASHES_PER_TICK,
         }
     }
 }
@@ -187,7 +191,7 @@ impl Harness {
         let ticks_per_slot = genesis_config_info.genesis_config.ticks_per_slot;
         let target_tick_duration = target_tick_duration(config.slot_duration, ticks_per_slot)?;
         genesis_config_info.genesis_config.poh_config = PohConfig {
-            hashes_per_tick: None,
+            hashes_per_tick: Some(config.hashes_per_tick),
             target_tick_duration,
             target_tick_count: None,
         };
@@ -233,7 +237,7 @@ impl Harness {
             &genesis_config_info.genesis_config.poh_config,
             exit.clone(),
             ticks_per_slot,
-            None,
+            DEFAULT_PINNED_CPU_CORE,
             DEFAULT_HASHES_PER_BATCH,
             record_receiver,
             poh_service_receiver,
@@ -587,6 +591,7 @@ mod tests {
             agave_session,
             HarnessConfig {
                 slot_duration: Duration::from_millis(20),
+                hashes_per_tick: 2,
             },
             Arc::new(AtomicBool::new(false)),
             |_| {},

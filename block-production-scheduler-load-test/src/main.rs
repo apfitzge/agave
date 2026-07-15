@@ -96,7 +96,10 @@ fn run(exit_signal: Arc<AtomicBool>) -> Result<(), RunnerError> {
     let mut scenario = TransferScenario::new();
     let mut harness = Harness::start(
         session,
-        HarnessConfig { slot_duration },
+        HarnessConfig {
+            slot_duration,
+            ..HarnessConfig::default()
+        },
         exit_signal,
         |bank| scenario.setup(bank),
     )?;
