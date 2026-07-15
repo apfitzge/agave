@@ -389,7 +389,11 @@ where
     ) -> Result<(), ScheduleError> {
         let batch = Self::collect_batch(&self.allocator, &mut self.state, batch)?;
 
-        let message = PackToCheckWorkerMessage { flags, batch };
+        let message = PackToCheckWorkerMessage {
+            flags,
+            minimum_priority: 0,
+            batch,
+        };
         if let Err(message) = self.pack_to_check_worker.try_write(message) {
             Self::release_batch(&self.allocator, &mut self.state, message.batch);
             return Err(ScheduleError::Queue);

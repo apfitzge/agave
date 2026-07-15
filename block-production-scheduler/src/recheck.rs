@@ -99,6 +99,7 @@ pub(crate) fn send_rechecks(
         if scheduler_to_check_worker
             .try_write(PackToCheckWorkerMessage {
                 flags: RECHECK_FLAGS,
+                minimum_priority: 0,
                 batch: batch.to_sharable_transaction_batch_region(),
             })
             .is_err()

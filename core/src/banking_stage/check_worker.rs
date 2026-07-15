@@ -25,7 +25,6 @@ use {
     arrayvec::ArrayVec,
     solana_account::ReadableAccount,
     solana_clock::Slot,
-    solana_cost_model::cost_model::CostModel,
     solana_fee::FeeFeatures,
     solana_message::v0::LoadedAddresses,
     solana_poh::poh_recorder::{LeaderState, SharedLeaderState},
@@ -171,24 +170,28 @@ impl ExternalCheckWorker {
             )
         };
 
-        if message.flags & check_message_flags::LOAD_FEE_PAYER_BALANCE != 0 {
-            Self::check_load_fee_payer_balance(
-                &parsing_results,
-                &parsed_transactions,
-                response_slice,
-                &working_bank,
-            );
-        }
+        let calculate_scheduling_details =
+            message.flags & check_message_flags::CALCULATE_SCHEDULING_DETAILS != 0;
 
         // Do resolving next since we (currently) need resolved transactions for status checks.
         let (parsing_and_resolve_results, txs, max_ages) =
             Self::translate_transaction_batch(&batch, &root_bank);
 
-        if message.flags & check_message_flags::CALCULATE_SCHEDULING_DETAILS != 0 {
+        if calculate_scheduling_details {
             Self::check_scheduling_details(
                 &parsing_results,
                 &parsing_and_resolve_results,
                 &txs,
+                response_slice,
+                &working_bank,
+                message.minimum_priority,
+            );
+        }
+
+        if message.flags & check_message_flags::LOAD_FEE_PAYER_BALANCE != 0 {
+            Self::check_load_fee_payer_balance(
+                &parsing_results,
+                &parsed_transactions,
                 response_slice,
                 &working_bank,
             );
@@ -208,7 +211,7 @@ impl ExternalCheckWorker {
         if message.flags & check_message_flags::STATUS_CHECKS != 0 {
             Self::check_status_checks(
                 &parsing_and_resolve_results,
-                &txs,
+                txs,
                 response_slice,
                 &working_bank,
             );
@@ -251,11 +254,8 @@ impl ExternalCheckWorker {
             }
 
             let response = &mut responses[transaction_index];
-            if response.scheduling_details_flags & scheduling_details_flags::FAILED != 0 {
-                continue;
-            }
-            response.resolve_flags |= resolve_flags::PERFORMED;
             if parsing_and_resolve_results.is_err() {
+                response.resolve_flags |= resolve_flags::PERFORMED;
                 response.resolve_flags |= resolve_flags::FAILED;
                 continue;
             }
@@ -267,6 +267,13 @@ impl ExternalCheckWorker {
             let max_age = max_age_iter.next().expect(
                 "max_age_iter iterator must contain element for each sent parsed transaction",
             );
+
+            if Self::should_skip_remaining_checks(response)
+                || response.scheduling_details_flags & scheduling_details_flags::FAILED != 0
+            {
+                continue;
+            }
+            response.resolve_flags |= resolve_flags::PERFORMED;
 
             let (sharable_keys, alt_invalidation_slot) = match transaction.loaded_addresses() {
                 Some(loaded_addresses) if !loaded_addresses.is_empty() => {
@@ -442,16 +449,23 @@ impl ExternalCheckWorker {
     fn validate_message(message: &PackToCheckWorkerMessage) -> bool {
         message.batch.num_transactions > 0
             && usize::from(message.batch.num_transactions) <= MAX_TRANSACTIONS_PER_MESSAGE
-            && Self::validate_message_flags(message.flags)
+            && Self::validate_message_flags(message.flags, message.minimum_priority)
     }
 
-    fn validate_message_flags(flags: u16) -> bool {
+    fn validate_message_flags(flags: u16, minimum_priority: u64) -> bool {
         const ALLOWED_CHECK_FLAGS: u16 = check_message_flags::STATUS_CHECKS
             | check_message_flags::LOAD_FEE_PAYER_BALANCE
             | check_message_flags::LOAD_ADDRESS_LOOKUP_TABLES
             | check_message_flags::CALCULATE_SCHEDULING_DETAILS;
 
-        flags != 0 && flags & !ALLOWED_CHECK_FLAGS == 0
+        flags != 0
+            && flags & !ALLOWED_CHECK_FLAGS == 0
+            && (minimum_priority == 0
+                || flags & check_message_flags::CALCULATE_SCHEDULING_DETAILS != 0)
+    }
+
+    fn should_skip_remaining_checks(response: &CheckResponse) -> bool {
+        response.scheduling_details_flags & scheduling_details_flags::BELOW_MINIMUM_PRIORITY != 0
     }
 
     fn check_load_fee_payer_balance<D: TransactionData>(
@@ -473,6 +487,11 @@ impl ExternalCheckWorker {
                  transaction",
             );
 
+            let response = &mut responses[transaction_index];
+            if Self::should_skip_remaining_checks(response) {
+                continue;
+            }
+
             let fee_payer_balance = working_bank
                 .rc
                 .accounts
@@ -483,7 +502,6 @@ impl ExternalCheckWorker {
                 .map(|(account, _slot)| account.lamports())
                 .unwrap_or(0);
 
-            let response = &mut responses[transaction_index];
             response.fee_payer_balance_flags |= fee_payer_balance_flags::PERFORMED;
             response.fee_payer_balance = fee_payer_balance;
             response.balance_slot = working_bank.slot();
@@ -496,6 +514,7 @@ impl ExternalCheckWorker {
         txs: &[Tx],
         responses: &mut [CheckResponse],
         working_bank: &Bank,
+        minimum_priority: u64,
     ) {
         assert_eq!(parsing_results.len(), parsing_and_resolve_results.len());
         assert_eq!(parsing_results.len(), responses.len());
@@ -536,28 +555,57 @@ impl ExternalCheckWorker {
             );
             response.transaction_fee = fee_details.transaction_fee();
             response.prioritization_fee = fee_details.prioritization_fee();
-            response.estimated_cost_units = CostModel::calculate_cost_for_executed_transaction(
+            let (priority, cost) = crate::transaction_priority::calculate_priority_and_cost(
+                working_bank,
                 transaction,
-                u64::from(configuration.compute_unit_limit),
-                configuration.loaded_accounts_data_size_limit,
-                &working_bank.feature_set,
-            )
-            .sum();
+                &configuration,
+            );
+            response.estimated_cost_units = cost;
+            if priority < minimum_priority {
+                response.scheduling_details_flags |=
+                    scheduling_details_flags::BELOW_MINIMUM_PRIORITY;
+            }
         }
     }
 
-    fn check_status_checks<D: TransactionData>(
+    fn check_status_checks(
         parsing_and_resolve_results: &[Result<(), PacketHandlingError>],
-        txs: &[RuntimeTransaction<ResolvedTransactionView<D>>],
+        txs: ArrayVec<Tx, MAX_TRANSACTIONS_PER_MESSAGE>,
         responses: &mut [CheckResponse],
         working_bank: &Bank,
     ) {
         assert_eq!(parsing_and_resolve_results.len(), responses.len());
 
+        let mut resolved_transaction_iter = txs.into_iter();
+        let mut checked_transactions = ArrayVec::<Tx, MAX_TRANSACTIONS_PER_MESSAGE>::new();
+        let mut checked_transaction_indices =
+            ArrayVec::<usize, MAX_TRANSACTIONS_PER_MESSAGE>::new();
+        for (transaction_index, parsing_and_resolve_result) in
+            parsing_and_resolve_results.iter().enumerate()
+        {
+            if parsing_and_resolve_result.is_err() {
+                continue;
+            }
+
+            let transaction = resolved_transaction_iter.next().expect(
+                "resolved_transaction_iter must contain an element for each successfully \
+                 translated transaction",
+            );
+            if Self::should_skip_remaining_checks(&responses[transaction_index]) {
+                continue;
+            }
+            checked_transactions.push(transaction);
+            checked_transaction_indices.push(transaction_index);
+        }
+
+        if checked_transactions.is_empty() {
+            return;
+        }
+
         let mut error_counters = TransactionErrorMetrics::default();
         let (status_check_results, included_slots) = working_bank
             .check_transactions_with_processed_slots(
-                txs,
+                &checked_transactions,
                 &[const { Ok(()) }; MAX_TRANSACTIONS_PER_MESSAGE],
                 working_bank.max_processing_age(),
                 true,
@@ -567,15 +615,10 @@ impl ExternalCheckWorker {
         let included_slots = included_slots.expect("requested to collect processed slots");
 
         let mut status_check_results_iter = status_check_results.iter().zip(included_slots.iter());
-        for (transaction_index, parsing_and_resolve_result) in
-            parsing_and_resolve_results.iter().enumerate()
-        {
-            if parsing_and_resolve_result.is_err() {
-                continue;
-            }
+        for transaction_index in checked_transaction_indices {
             let (status_check_result, included_slot) = status_check_results_iter
                 .next()
-                .expect("status check results must have element for each sent transaction");
+                .expect("status check results must have element for each checked transaction");
 
             let check_response = &mut responses[transaction_index];
             check_response.status_check_flags |= status_check_flags::PERFORMED;
@@ -969,6 +1012,7 @@ mod tests {
 
         test_frame.send_message(PackToCheckWorkerMessage {
             flags: check_message_flags::STATUS_CHECKS,
+            minimum_priority: 0,
             batch: SharableTransactionBatchRegion {
                 num_transactions: 0,
                 transactions_offset: 0,
@@ -985,6 +1029,7 @@ mod tests {
         )]);
         test_frame.send_message(PackToCheckWorkerMessage {
             flags: u16::MAX,
+            minimum_priority: 0,
             batch: batch.region,
         });
         test_frame.iterate().unwrap();
@@ -995,6 +1040,18 @@ mod tests {
 
         test_frame.send_message(PackToCheckWorkerMessage {
             flags: 0,
+            minimum_priority: 0,
+            batch: batch.region,
+        });
+        test_frame.iterate().unwrap();
+        let response = test_frame.recv_response();
+        assert_eq!(response.processed_code, processed_codes::INVALID);
+        assert_eq!(response.responses.num_transaction_responses, 0);
+        assert_eq!(response.responses.transaction_responses_offset, 0);
+
+        test_frame.send_message(PackToCheckWorkerMessage {
+            flags: check_message_flags::LOAD_FEE_PAYER_BALANCE,
+            minimum_priority: 1,
             batch: batch.region,
         });
         test_frame.iterate().unwrap();
@@ -1025,6 +1082,7 @@ mod tests {
         .unwrap()]);
         test_frame.send_message(PackToCheckWorkerMessage {
             flags: check_message_flags::STATUS_CHECKS | check_message_flags::LOAD_FEE_PAYER_BALANCE,
+            minimum_priority: 0,
             batch: batch.region,
         });
         test_frame.iterate().unwrap();
@@ -1070,6 +1128,7 @@ mod tests {
 
         test_frame.send_message(PackToCheckWorkerMessage {
             flags: check_message_flags::CALCULATE_SCHEDULING_DETAILS,
+            minimum_priority: 0,
             batch: batch.region,
         });
         test_frame.iterate().unwrap();
@@ -1092,6 +1151,50 @@ mod tests {
     }
 
     #[test]
+    fn test_minimum_priority_skips_remaining_checks() {
+        let mut test_frame = setup_check_worker_test_frame();
+        let fee_payer = Keypair::new();
+        let transaction = transfer(
+            &fee_payer,
+            &Pubkey::new_unique(),
+            1,
+            test_frame.bank.confirmed_last_blockhash(),
+        );
+        let batch = test_frame.allocate_batch(&[wincode::serialize(&transaction).unwrap()]);
+
+        test_frame.send_message(PackToCheckWorkerMessage {
+            flags: check_message_flags::STATUS_CHECKS
+                | check_message_flags::LOAD_FEE_PAYER_BALANCE
+                | check_message_flags::LOAD_ADDRESS_LOOKUP_TABLES
+                | check_message_flags::CALCULATE_SCHEDULING_DETAILS,
+            minimum_priority: u64::MAX,
+            batch: batch.region,
+        });
+        test_frame.iterate().unwrap();
+        let response = test_frame.recv_response();
+        let responses = test_frame.check_responses(&response.responses);
+
+        assert_eq!(responses.len(), 1);
+        assert_eq!(
+            responses[0].scheduling_details_flags,
+            scheduling_details_flags::REQUESTED
+                | scheduling_details_flags::PERFORMED
+                | scheduling_details_flags::BELOW_MINIMUM_PRIORITY
+        );
+        assert_eq!(
+            responses[0].status_check_flags,
+            status_check_flags::REQUESTED
+        );
+        assert_eq!(
+            responses[0].fee_payer_balance_flags,
+            fee_payer_balance_flags::REQUESTED
+        );
+        assert_eq!(responses[0].resolve_flags, resolve_flags::REQUESTED);
+
+        test_frame.free_batch(batch);
+    }
+
+    #[test]
     fn test_scheduling_details_failure_skips_pubkey_resolution() {
         let mut test_frame = setup_check_worker_test_frame();
         let fee_payer = Keypair::new();
@@ -1108,6 +1211,7 @@ mod tests {
         test_frame.send_message(PackToCheckWorkerMessage {
             flags: check_message_flags::CALCULATE_SCHEDULING_DETAILS
                 | check_message_flags::LOAD_ADDRESS_LOOKUP_TABLES,
+            minimum_priority: 0,
             batch: batch.region,
         });
         test_frame.iterate().unwrap();
@@ -1136,6 +1240,7 @@ mod tests {
 
         test_frame.send_message(PackToCheckWorkerMessage {
             flags: check_message_flags::LOAD_ADDRESS_LOOKUP_TABLES,
+            minimum_priority: 0,
             batch: batch.region,
         });
         test_frame.iterate().unwrap();

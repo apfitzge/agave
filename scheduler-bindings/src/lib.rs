@@ -284,6 +284,13 @@ pub struct PackToCheckWorkerMessage {
     /// Flags on how to handle this message.
     /// See [`check_message_flags`] for details.
     pub flags: u16,
+    /// Transactions whose scheduling priority is below this value are not subjected to the
+    /// remaining requested checks.
+    ///
+    /// The priority is the check worker's standard reward divided by estimated cost plus one
+    /// calculation. A value of zero disables this filter. A nonzero value requires
+    /// [`check_message_flags::CALCULATE_SCHEDULING_DETAILS`].
+    pub minimum_priority: u64,
     /// Offset and number of transactions in the batch.
     /// See [`SharableTransactionBatchRegion`] for details.
     /// Agave will return this batch in the response message, it is
@@ -555,6 +562,10 @@ pub mod worker_message_types {
         pub const PERFORMED: u8 = 1 << 1;
         /// Flag set if scheduling detail calculation failed.
         pub const FAILED: u8 = 1 << 2;
+        /// Flag set if the calculated priority is below the message's minimum priority.
+        ///
+        /// The transaction is not subjected to subsequent requested checks.
+        pub const BELOW_MINIMUM_PRIORITY: u8 = 1 << 3;
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]

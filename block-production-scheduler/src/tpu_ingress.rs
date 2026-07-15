@@ -85,6 +85,7 @@ pub(crate) fn drain_tpu(
             if scheduler_to_check_worker
                 .try_write(PackToCheckWorkerMessage {
                     flags: CHECK_FLAGS,
+                    minimum_priority: 0,
                     batch: batch.to_sharable_transaction_batch_region(),
                 })
                 .is_err()
@@ -291,6 +292,7 @@ mod tests {
 
         let occupied_message = PackToCheckWorkerMessage {
             flags: CHECK_FLAGS,
+            minimum_priority: 0,
             batch: SharableTransactionBatchRegion {
                 num_transactions: 0,
                 transactions_offset: 0,

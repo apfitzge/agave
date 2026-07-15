@@ -61,6 +61,7 @@ fn message_passing_on_all_queues() {
     };
     let pack_to_check_worker = PackToCheckWorkerMessage {
         flags: 7,
+        minimum_priority: 0,
         batch: SharableTransactionBatchRegion {
             num_transactions: 3,
             transactions_offset: 200,
