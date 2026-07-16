@@ -149,6 +149,7 @@ impl Batches {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn schedule(
     workers: &mut [ClientWorkerSession],
     allocator: &Allocator,
@@ -159,6 +160,7 @@ pub(crate) fn schedule(
     current_slot: u64,
     remaining_cost_units: u64,
     target_scheduled_cus: u64,
+    max_scheduled_transactions: usize,
 ) -> usize {
     let is_new_slot = in_flight.scheduling_slot() != Some(current_slot);
     if !in_flight.enter_slot(current_slot) {
@@ -203,9 +205,13 @@ pub(crate) fn schedule(
         return 0;
     }
 
+    let mut num_scheduled_transactions = 0;
     {
         let mut priority_ids = transactions.descending_from(None);
-        while budget > 0 && !allowed_workers.is_empty() {
+        while budget > 0
+            && num_scheduled_transactions < max_scheduled_transactions
+            && !allowed_workers.is_empty()
+        {
             let Some(priority_id) = priority_ids.next() else {
                 break;
             };
@@ -269,6 +275,7 @@ pub(crate) fn schedule(
                 transaction_bytes,
                 allocator,
             );
+            num_scheduled_transactions = num_scheduled_transactions.wrapping_add(1);
             budget = budget.saturating_sub(transaction_cost);
 
             if batches.should_flush(worker_id)
@@ -307,6 +314,7 @@ pub(crate) fn schedule(
         }
     }
 
+    debug_assert_eq!(num_scheduled_transactions, removal_ids.len());
     let scheduled_transactions = removal_ids.len();
     for transaction_id in removal_ids.drain(..) {
         transactions.dequeue(transaction_id);
@@ -503,6 +511,7 @@ mod tests {
             42,
             100,
             100,
+            num_transactions,
         );
 
         assert_eq!(transactions.len(), 0);
@@ -557,6 +566,7 @@ mod tests {
             42,
             100,
             100,
+            1,
         );
 
         agave_session.workers[0].pack_to_worker.sync();
@@ -573,6 +583,67 @@ mod tests {
 
         let transaction = transactions.remove(transaction_id);
         // SAFETY: the test has removed the transaction from scheduler state.
+        unsafe { transaction.transaction.free(allocator) };
+    }
+
+    #[test]
+    fn limits_scheduled_transactions_per_pass() {
+        let mut config = SchedulerConfig::new("/unused");
+        config.allocator_size = 64 * 1024 * 1024;
+        config.execution_worker_count = 1;
+        let logon = config.client_logon();
+        let (mut agave_session, files) = Server::setup_session(logon).unwrap();
+        let mut client_session = client::setup_session(&logon, files).unwrap();
+        let allocator = &client_session.allocators[0];
+        let mut transactions = StateContainer::new(2);
+        assert!(
+            transactions
+                .push(checked_transaction(allocator, 2, 1))
+                .is_none()
+        );
+        assert!(
+            transactions
+                .push(checked_transaction(allocator, 1, 1))
+                .is_none()
+        );
+        let mut account_locks = ThreadAwareAccountLocks::new(1);
+        let mut in_flight = InFlightTracker::new(1, config.pack_to_worker_capacity);
+        let mut scratch = SchedulingScratch::new(2, config.execution_worker_count);
+
+        assert_eq!(
+            schedule(
+                &mut client_session.workers,
+                allocator,
+                &mut transactions,
+                &mut account_locks,
+                &mut in_flight,
+                &mut scratch,
+                42,
+                100,
+                100,
+                1,
+            ),
+            1
+        );
+        assert_eq!(transactions.len(), 1);
+        assert_eq!(transactions.buffer_len(), 2);
+
+        agave_session.workers[0].pack_to_worker.sync();
+        let message = *agave_session.workers[0].pack_to_worker.try_read().unwrap();
+        let batch = unsafe {
+            ExecutionBatch::from_sharable_transaction_batch_region(&message.batch, allocator)
+        };
+        assert_eq!(batch.len(), 1);
+        let transaction_id = batch.iter().next().unwrap().1.transaction_id;
+        // SAFETY: this test received the batch and no worker holds references to it.
+        unsafe { batch.free() };
+        agave_session.workers[0].pack_to_worker.finalize();
+
+        let transaction = transactions.remove(transaction_id);
+        // SAFETY: the test now exclusively owns this transaction's shared allocations.
+        unsafe { transaction.transaction.free(allocator) };
+        let transaction = transactions.pop().unwrap();
+        // SAFETY: the test now exclusively owns this transaction's shared allocations.
         unsafe { transaction.transaction.free(allocator) };
     }
 }

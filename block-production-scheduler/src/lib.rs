@@ -33,11 +33,13 @@ mod transaction;
 
 pub use config::{ConfigError, SchedulerConfig};
 
-const MAX_TPU_PACKETS_PER_ITERATION: usize = 1024;
+const MAX_TPU_PACKETS_PER_ITERATION: usize = 256;
+const MAX_CHECK_RESPONSE_PACKETS_PER_ITERATION: usize = 512;
+const MAX_SCHEDULED_TRANSACTIONS_PER_ITERATION: usize = 1024;
 const MAX_CHECK_RESPONSE_BATCHES_PER_ITERATION: usize =
-    MAX_TPU_PACKETS_PER_ITERATION / transaction::MAX_PACKETS_PER_CHECK_BATCH;
+    MAX_CHECK_RESPONSE_PACKETS_PER_ITERATION / transaction::MAX_PACKETS_PER_CHECK_BATCH;
 const MAX_EXECUTION_RESPONSE_BATCHES_PER_ITERATION: usize =
-    MAX_TPU_PACKETS_PER_ITERATION / transaction::MAX_PACKETS_PER_EXEC_BATCH;
+    MAX_SCHEDULED_TRANSACTIONS_PER_ITERATION / transaction::MAX_PACKETS_PER_EXEC_BATCH;
 
 struct SchedulerStats {
     slots: BTreeMap<u64, SlotStats>,
@@ -305,6 +307,7 @@ impl Scheduler {
                 // Temporarily bypass the cost-based scheduling budget for load testing.
                 u64::MAX,
                 self.state.target_scheduled_cus(),
+                MAX_SCHEDULED_TRANSACTIONS_PER_ITERATION,
             );
             self.stats
                 .record_scheduled_transactions(current_slot, scheduled_transactions);
