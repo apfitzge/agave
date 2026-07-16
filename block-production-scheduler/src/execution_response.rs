@@ -16,6 +16,7 @@ use {
 };
 
 #[derive(Default)]
+#[allow(dead_code)]
 pub(crate) struct ExecutionResponseStats {
     pub(crate) execution_slot: Option<u64>,
     pub(crate) completed_transactions: u64,

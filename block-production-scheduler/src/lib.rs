@@ -47,16 +47,16 @@ struct SchedulerStats {
 
 #[derive(Default)]
 struct SlotStats {
-    dropped_not_accepting_packets: u64,
-    dropped_check_worker_queue_full_packets: u64,
-    checked_transactions: u64,
-    accepted_transactions: u64,
-    scheduled_transactions: u64,
-    completed_transactions: u64,
-    recorded_transactions: u64,
-    retrying_transactions: u64,
-    cost_limit_retries: u64,
-    slot_boundary_retries: u64,
+    tpu_popped: u64,
+    check_sent: u64,
+    check_received: u64,
+    enqueued: u64,
+    priority_evictions: u64,
+    scheduled: u64,
+    completed: u64,
+    recorded: u64,
+    cost_retries: u64,
+    bank_retries: u64,
 }
 
 impl SchedulerStats {
@@ -68,28 +68,23 @@ impl SchedulerStats {
 
     fn record_check_responses(&mut self, slot: u64, stats: check_response::CheckResponseStats) {
         let stats_for_slot = self.slot_mut(slot);
-        stats_for_slot.checked_transactions = stats_for_slot
-            .checked_transactions
-            .wrapping_add(stats.checked_transactions);
-        stats_for_slot.accepted_transactions = stats_for_slot
-            .accepted_transactions
-            .wrapping_add(stats.accepted_transactions);
+        stats_for_slot.check_received = stats_for_slot.check_received.wrapping_add(stats.received);
+        stats_for_slot.enqueued = stats_for_slot.enqueued.wrapping_add(stats.enqueued);
+        stats_for_slot.priority_evictions = stats_for_slot
+            .priority_evictions
+            .wrapping_add(stats.priority_evictions);
     }
 
     fn record_tpu_ingress(&mut self, slot: u64, stats: tpu_ingress::TpuIngressStats) {
         let stats_for_slot = self.slot_mut(slot);
-        stats_for_slot.dropped_not_accepting_packets = stats_for_slot
-            .dropped_not_accepting_packets
-            .wrapping_add(stats.dropped_not_accepting_packets);
-        stats_for_slot.dropped_check_worker_queue_full_packets = stats_for_slot
-            .dropped_check_worker_queue_full_packets
-            .wrapping_add(stats.dropped_check_worker_queue_full_packets);
+        stats_for_slot.tpu_popped = stats_for_slot.tpu_popped.wrapping_add(stats.popped);
+        stats_for_slot.check_sent = stats_for_slot.check_sent.wrapping_add(stats.check_sent);
     }
 
     fn record_scheduled_transactions(&mut self, slot: u64, scheduled_transactions: usize) {
         let stats_for_slot = self.slot_mut(slot);
-        stats_for_slot.scheduled_transactions = stats_for_slot
-            .scheduled_transactions
+        stats_for_slot.scheduled = stats_for_slot
+            .scheduled
             .wrapping_add(scheduled_transactions as u64);
     }
 
@@ -99,20 +94,17 @@ impl SchedulerStats {
         stats: execution_response::ExecutionResponseStats,
     ) {
         let stats_for_slot = self.slot_mut(slot);
-        stats_for_slot.completed_transactions = stats_for_slot
-            .completed_transactions
+        stats_for_slot.completed = stats_for_slot
+            .completed
             .wrapping_add(stats.completed_transactions);
-        stats_for_slot.recorded_transactions = stats_for_slot
-            .recorded_transactions
+        stats_for_slot.recorded = stats_for_slot
+            .recorded
             .wrapping_add(stats.recorded_transactions);
-        stats_for_slot.retrying_transactions = stats_for_slot
-            .retrying_transactions
-            .wrapping_add(stats.retrying_transactions);
-        stats_for_slot.cost_limit_retries = stats_for_slot
-            .cost_limit_retries
+        stats_for_slot.cost_retries = stats_for_slot
+            .cost_retries
             .wrapping_add(stats.cost_limit_retries);
-        stats_for_slot.slot_boundary_retries = stats_for_slot
-            .slot_boundary_retries
+        stats_for_slot.bank_retries = stats_for_slot
+            .bank_retries
             .wrapping_add(stats.slot_boundary_retries);
     }
 
@@ -135,29 +127,19 @@ impl SchedulerStats {
                 .pop_first()
                 .expect("first key was present immediately before removal");
             info!(
-                "scheduler_slot={slot} tpu_dropped_not_accepting_packets={} \
-                 tpu_dropped_check_worker_queue_full_packets={} check_transactions={} \
-                 check_accepted_transactions={} check_rejected_transactions={} \
-                 scheduled_transactions={} execution_completed_transactions={} \
-                 execution_recorded_transactions={} execution_not_recorded_transactions={} \
-                 execution_retries={} execution_cost_limit_retries={} \
-                 execution_slot_boundary_retries={}",
-                stats.dropped_not_accepting_packets,
-                stats.dropped_check_worker_queue_full_packets,
-                stats.checked_transactions,
-                stats.accepted_transactions,
-                stats
-                    .checked_transactions
-                    .saturating_sub(stats.accepted_transactions),
-                stats.scheduled_transactions,
-                stats.completed_transactions,
-                stats.recorded_transactions,
-                stats
-                    .completed_transactions
-                    .saturating_sub(stats.recorded_transactions),
-                stats.retrying_transactions,
-                stats.cost_limit_retries,
-                stats.slot_boundary_retries,
+                "scheduler_slot={slot} tpu_popped={} check_sent={} check_received={} enqueued={} \
+                 priority_evictions={} scheduled={} completed={} recorded={} cost_retries={} \
+                 bank_retries={}",
+                stats.tpu_popped,
+                stats.check_sent,
+                stats.check_received,
+                stats.enqueued,
+                stats.priority_evictions,
+                stats.scheduled,
+                stats.completed,
+                stats.recorded,
+                stats.cost_retries,
+                stats.bank_retries,
             );
         }
     }

@@ -23,8 +23,9 @@ const PRIORITY_MULTIPLIER: u64 = 1_000_000;
 
 #[derive(Default)]
 pub(crate) struct CheckResponseStats {
-    pub(crate) checked_transactions: u64,
-    pub(crate) accepted_transactions: u64,
+    pub(crate) received: u64,
+    pub(crate) enqueued: u64,
+    pub(crate) priority_evictions: u64,
 }
 
 /// Drain check-worker responses, dropping rejected transactions and queuing accepted ones.
@@ -48,12 +49,11 @@ pub(crate) fn drain_check_responses(
             reserved_account_keys,
             state,
         );
-        stats.checked_transactions = stats
-            .checked_transactions
-            .wrapping_add(response_stats.checked_transactions);
-        stats.accepted_transactions = stats
-            .accepted_transactions
-            .wrapping_add(response_stats.accepted_transactions);
+        stats.received = stats.received.wrapping_add(response_stats.received);
+        stats.enqueued = stats.enqueued.wrapping_add(response_stats.enqueued);
+        stats.priority_evictions = stats
+            .priority_evictions
+            .wrapping_add(response_stats.priority_evictions);
     }
     stats
 }
@@ -74,13 +74,13 @@ fn handle_check_response(
         && response.responses.tag == CHECK_RESPONSE
         && response.responses.num_transaction_responses == response.batch.num_transactions;
     if !response_is_valid {
-        let checked_transactions = discard_unprocessed_batch(batch, allocator, state);
+        let received = discard_unprocessed_batch(batch, allocator, state);
         if response.processed_code == processed_codes::PROCESSED {
             free_check_response_region_if_present(&response, allocator);
         }
         return CheckResponseStats {
-            checked_transactions,
-            accepted_transactions: 0,
+            received,
+            ..CheckResponseStats::default()
         };
     }
 
@@ -94,8 +94,8 @@ fn handle_check_response(
     for ((transaction, meta), check_response) in batch.iter().zip(responses.iter()) {
         match meta {
             CheckTransactionMeta::Tpu(meta) => {
-                stats.checked_transactions = stats.checked_transactions.wrapping_add(1);
-                if handle_tpu_check_response(
+                stats.received = stats.received.wrapping_add(1);
+                let outcome = handle_tpu_check_response(
                     transaction,
                     meta,
                     check_response,
@@ -103,9 +103,11 @@ fn handle_check_response(
                     sanitize_config,
                     reserved_account_keys,
                     state,
-                ) {
-                    stats.accepted_transactions = stats.accepted_transactions.wrapping_add(1);
-                }
+                );
+                stats.enqueued = stats.enqueued.wrapping_add(u64::from(outcome.enqueued));
+                stats.priority_evictions = stats
+                    .priority_evictions
+                    .wrapping_add(outcome.priority_evictions);
             }
             CheckTransactionMeta::Recheck { transaction_id } => {
                 handle_recheck_response(transaction_id, check_response, allocator, state);
@@ -123,6 +125,12 @@ fn handle_check_response(
     stats
 }
 
+#[derive(Default)]
+struct TpuCheckResponseOutcome {
+    enqueued: bool,
+    priority_evictions: u64,
+}
+
 fn handle_tpu_check_response(
     transaction: agave_scheduling_utils::transaction_ptr::TransactionPtr,
     mut meta: TpuTransactionMeta,
@@ -131,12 +139,12 @@ fn handle_tpu_check_response(
     sanitize_config: &SanitizeConfig,
     reserved_account_keys: &HashSet<Pubkey>,
     state: &mut StateContainer,
-) -> bool {
+) -> TpuCheckResponseOutcome {
     if !initial_response_is_valid(check_response) {
         // SAFETY: rejected transactions are still owned by this scheduler.
         unsafe { transaction.free(allocator) };
         free_resolved_pubkeys(check_response.resolved_pubkeys, allocator);
-        return false;
+        return TpuCheckResponseOutcome::default();
     }
 
     let priority = calculate_priority(check_response);
@@ -144,7 +152,7 @@ fn handle_tpu_check_response(
         // SAFETY: a transaction below the priority floor is still owned by this scheduler.
         unsafe { transaction.free(allocator) };
         free_resolved_pubkeys(check_response.resolved_pubkeys, allocator);
-        return false;
+        return TpuCheckResponseOutcome::default();
     }
 
     meta.priority = priority;
@@ -161,16 +169,23 @@ fn handle_tpu_check_response(
         )
     } {
         Ok(transaction) => {
-            if let Some(dropped) = state.push(CheckedTransaction::new(transaction, meta)) {
-                free_checked_transaction(dropped, allocator);
+            let priority_evictions =
+                if let Some(dropped) = state.push(CheckedTransaction::new(transaction, meta)) {
+                    free_checked_transaction(dropped, allocator);
+                    1
+                } else {
+                    0
+                };
+            TpuCheckResponseOutcome {
+                enqueued: true,
+                priority_evictions,
             }
-            true
         }
         Err(transaction) => {
             // SAFETY: this scheduler retains ownership after the external-view parse fails,
             // and must release both shared allocations.
             unsafe { transaction.free(allocator) };
-            false
+            TpuCheckResponseOutcome::default()
         }
     }
 }
@@ -447,8 +462,9 @@ mod tests {
             &mut state,
             2,
         );
-        assert_eq!(stats.checked_transactions, 2);
-        assert_eq!(stats.accepted_transactions, 2);
+        assert_eq!(stats.received, 2);
+        assert_eq!(stats.enqueued, 2);
+        assert_eq!(stats.priority_evictions, 1);
 
         assert_eq!(state.len(), 1);
         let stats = drain_check_responses(
@@ -459,8 +475,9 @@ mod tests {
             &mut state,
             1,
         );
-        assert_eq!(stats.checked_transactions, 1);
-        assert_eq!(stats.accepted_transactions, 0);
+        assert_eq!(stats.received, 1);
+        assert_eq!(stats.enqueued, 0);
+        assert_eq!(stats.priority_evictions, 0);
         let first = state.pop().unwrap();
         assert_eq!(first.meta.priority, 2_000_000);
         assert!(state.pop().is_none());
@@ -528,8 +545,9 @@ mod tests {
             1,
         );
 
-        assert_eq!(stats.checked_transactions, 1);
-        assert_eq!(stats.accepted_transactions, 0);
+        assert_eq!(stats.received, 1);
+        assert_eq!(stats.enqueued, 0);
+        assert_eq!(stats.priority_evictions, 0);
         let retained = state.pop().unwrap();
         assert_eq!(retained.meta.priority, 1_000_000);
         // SAFETY: the retained transaction was removed from scheduler state by the test.
@@ -570,8 +588,9 @@ mod tests {
             usize::MAX,
         );
 
-        assert_eq!(stats.checked_transactions, 1);
-        assert_eq!(stats.accepted_transactions, 0);
+        assert_eq!(stats.received, 1);
+        assert_eq!(stats.enqueued, 0);
+        assert_eq!(stats.priority_evictions, 0);
         assert!(state.pop().is_none());
     }
 }

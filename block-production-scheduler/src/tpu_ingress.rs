@@ -17,8 +17,8 @@ const CHECK_FLAGS: u16 = check_message_flags::LOAD_FEE_PAYER_BALANCE
 
 #[derive(Default)]
 pub(crate) struct TpuIngressStats {
-    pub(crate) dropped_not_accepting_packets: u64,
-    pub(crate) dropped_check_worker_queue_full_packets: u64,
+    pub(crate) popped: u64,
+    pub(crate) check_sent: u64,
 }
 
 pub(crate) fn drain_tpu(
@@ -40,11 +40,7 @@ pub(crate) fn drain_tpu(
 
     if !state.should_accept_packets() {
         return TpuIngressStats {
-            dropped_not_accepting_packets: drop_tpu_packets(
-                tpu_to_scheduler,
-                allocator,
-                max_packets,
-            ),
+            popped: drop_tpu_packets(tpu_to_scheduler, allocator, max_packets),
             ..TpuIngressStats::default()
         };
     }
@@ -57,6 +53,7 @@ pub(crate) fn drain_tpu(
         let Some(mut batch) = CheckBatch::allocate(allocator) else {
             break;
         };
+        stats.popped = stats.popped.wrapping_add(num_packets as u64);
 
         for _ in 0..num_packets {
             let Some(message) = tpu_to_scheduler.try_read() else {
@@ -83,6 +80,7 @@ pub(crate) fn drain_tpu(
             // SAFETY: this batch was allocated locally and was not sent to a worker.
             unsafe { batch.free() };
         } else {
+            let batch_len = batch.len() as u64;
             if scheduler_to_check_worker
                 .try_write(PackToCheckWorkerMessage {
                     flags: CHECK_FLAGS,
@@ -91,9 +89,6 @@ pub(crate) fn drain_tpu(
                 })
                 .is_err()
             {
-                stats.dropped_check_worker_queue_full_packets = stats
-                    .dropped_check_worker_queue_full_packets
-                    .wrapping_add(batch.len() as u64);
                 // SAFETY: this scheduler owns the batch and all transaction allocations until
                 // the batch is accepted by the queue.
                 unsafe {
@@ -102,6 +97,7 @@ pub(crate) fn drain_tpu(
                 }
                 break;
             }
+            stats.check_sent = stats.check_sent.wrapping_add(batch_len);
         }
         remaining_packets = remaining_packets.wrapping_sub(num_packets);
     }
@@ -227,8 +223,8 @@ mod tests {
             max_packets,
             minimum_priority,
         );
-        assert_eq!(stats.dropped_not_accepting_packets, 0);
-        assert_eq!(stats.dropped_check_worker_queue_full_packets, 0);
+        assert_eq!(stats.popped, max_packets as u64);
+        assert_eq!(stats.check_sent, max_packets as u64);
 
         for batch_index in 0..2 {
             let message = agave_session.check_workers[0]
@@ -328,8 +324,8 @@ mod tests {
             MAX_PACKETS_PER_CHECK_BATCH,
             0,
         );
-        assert_eq!(stats.dropped_not_accepting_packets, 0);
-        assert_eq!(stats.dropped_check_worker_queue_full_packets, 1);
+        assert_eq!(stats.popped, 1);
+        assert_eq!(stats.check_sent, 0);
 
         client_session.tpu_to_pack.sync();
         assert!(client_session.tpu_to_pack.try_read().is_none());
@@ -366,8 +362,8 @@ mod tests {
             0,
         );
 
-        assert_eq!(stats.dropped_not_accepting_packets, 1);
-        assert_eq!(stats.dropped_check_worker_queue_full_packets, 0);
+        assert_eq!(stats.popped, 1);
+        assert_eq!(stats.check_sent, 0);
         client_session.tpu_to_pack.sync();
         assert!(client_session.tpu_to_pack.try_read().is_none());
         client_session.tpu_to_pack.finalize();
@@ -403,8 +399,8 @@ mod tests {
             1,
             0,
         );
-        assert_eq!(stats.dropped_not_accepting_packets, 0);
-        assert_eq!(stats.dropped_check_worker_queue_full_packets, 0);
+        assert_eq!(stats.popped, 1);
+        assert_eq!(stats.check_sent, 1);
 
         let message = agave_session.check_workers[0]
             .pack_to_check_worker
