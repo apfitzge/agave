@@ -15,7 +15,7 @@ use {
             Arc,
             atomic::{AtomicBool, Ordering},
         },
-        time::Instant,
+        time::{Duration, Instant},
     },
 };
 
@@ -40,6 +40,7 @@ const MAX_CHECK_RESPONSE_BATCHES_PER_ITERATION: usize =
     MAX_CHECK_RESPONSE_PACKETS_PER_ITERATION / transaction::MAX_PACKETS_PER_CHECK_BATCH;
 const MAX_EXECUTION_RESPONSE_BATCHES_PER_ITERATION: usize =
     MAX_SCHEDULED_TRANSACTIONS_PER_ITERATION / transaction::MAX_PACKETS_PER_EXEC_BATCH;
+const PACING_NON_FILL_TIME: Duration = Duration::from_millis(50);
 
 struct SchedulerStats {
     slots: BTreeMap<u64, SlotStats>,
@@ -57,6 +58,9 @@ struct SlotStats {
     recorded: u64,
     cost_retries: u64,
     bank_retries: u64,
+    scheduler_total_delta_ns: u64,
+    scheduler_max_delta_ns: u64,
+    scheduler_delta_count: u64,
 }
 
 impl SchedulerStats {
@@ -108,6 +112,16 @@ impl SchedulerStats {
             .wrapping_add(stats.slot_boundary_retries);
     }
 
+    fn record_scheduler_delta(&mut self, slot: u64, delta: Duration) {
+        let stats_for_slot = self.slot_mut(slot);
+        let delta_ns = u64::try_from(delta.as_nanos()).unwrap_or(u64::MAX);
+        stats_for_slot.scheduler_total_delta_ns = stats_for_slot
+            .scheduler_total_delta_ns
+            .wrapping_add(delta_ns);
+        stats_for_slot.scheduler_max_delta_ns = stats_for_slot.scheduler_max_delta_ns.max(delta_ns);
+        stats_for_slot.scheduler_delta_count = stats_for_slot.scheduler_delta_count.wrapping_add(1);
+    }
+
     fn report_completed_slots(
         &mut self,
         current_slot: u64,
@@ -129,7 +143,7 @@ impl SchedulerStats {
             info!(
                 "scheduler_slot={slot} tpu_popped={} check_sent={} check_received={} enqueued={} \
                  priority_evictions={} scheduled={} completed={} recorded={} cost_retries={} \
-                 bank_retries={}",
+                 bank_retries={} scheduler_avg_delta_ns={} scheduler_max_delta_ns={}",
                 stats.tpu_popped,
                 stats.check_sent,
                 stats.check_received,
@@ -140,12 +154,27 @@ impl SchedulerStats {
                 stats.recorded,
                 stats.cost_retries,
                 stats.bank_retries,
+                stats.scheduler_avg_delta_ns(),
+                stats.scheduler_max_delta_ns,
             );
         }
     }
 
     fn slot_mut(&mut self, slot: u64) -> &mut SlotStats {
         self.slots.entry(slot).or_default()
+    }
+}
+
+impl SlotStats {
+    fn scheduler_avg_delta_ns(&self) -> u64 {
+        if self.scheduler_delta_count == 0 {
+            return 0;
+        }
+
+        #[allow(clippy::arithmetic_side_effects)]
+        {
+            self.scheduler_total_delta_ns / self.scheduler_delta_count
+        }
     }
 }
 
@@ -184,6 +213,7 @@ struct Scheduler {
     recheck_scratch: recheck::RecheckScratch,
     cost_pacer: Option<(u64, CostPacer)>,
     stats: SchedulerStats,
+    previous_iteration_time: Instant,
 }
 
 impl Scheduler {
@@ -206,11 +236,16 @@ impl Scheduler {
             recheck_scratch: recheck::RecheckScratch::new(),
             cost_pacer: None,
             stats: SchedulerStats::new(),
+            previous_iteration_time: Instant::now(),
         }
     }
 
     fn run_iteration(&mut self, now: Instant) {
-        self.drain_progress();
+        let iteration_time = now.saturating_duration_since(self.previous_iteration_time);
+        self.previous_iteration_time = now;
+        self.drain_progress(now);
+        self.stats
+            .record_scheduler_delta(self.state.current_slot(), iteration_time);
         self.drain_check_responses();
         self.drain_execution_responses();
         self.stats
@@ -220,8 +255,12 @@ impl Scheduler {
         self.ingest_tpu();
     }
 
-    fn drain_progress(&mut self) {
-        progress_tracker::drain_progress(&mut self.session.progress_tracker, &mut self.state);
+    fn drain_progress(&mut self, now: Instant) {
+        if !progress_tracker::drain_progress(&mut self.session.progress_tracker, &mut self.state) {
+            return;
+        }
+
+        self.update_cost_pacer(now);
     }
 
     fn drain_check_responses(&mut self) {
@@ -268,16 +307,13 @@ impl Scheduler {
     fn schedule(&mut self, now: Instant) {
         if self.state.can_process_transactions() {
             let current_slot = self.state.current_slot();
-            let needs_new_cost_pacer = match self.cost_pacer.as_ref() {
-                Some((slot, _)) => *slot != current_slot,
-                None => true,
-            };
-            if needs_new_cost_pacer {
-                self.cost_pacer = Some((
-                    current_slot,
-                    CostPacer::new(self.state.initial_remaining_cost_units(), now, None),
-                ));
-            }
+            let consumed_cost_units = self
+                .state
+                .initial_remaining_cost_units()
+                .saturating_sub(self.state.remaining_cost_units());
+            let pacing_budget = self.cost_pacer.as_ref().map_or(0, |(_, cost_pacer)| {
+                cost_pacer.scheduling_budget(&now, consumed_cost_units)
+            });
             let scheduled_transactions = scheduling::schedule(
                 &mut self.session.workers,
                 &self.session.allocators[0],
@@ -286,15 +322,42 @@ impl Scheduler {
                 &mut self.in_flight,
                 &mut self.scheduling_scratch,
                 current_slot,
-                // Temporarily bypass the cost-based scheduling budget for load testing.
-                u64::MAX,
+                pacing_budget,
                 self.state.target_scheduled_cus(),
                 MAX_SCHEDULED_TRANSACTIONS_PER_ITERATION,
             );
             self.stats
                 .record_scheduled_transactions(current_slot, scheduled_transactions);
-        } else {
+        }
+    }
+
+    fn update_cost_pacer(&mut self, now: Instant) {
+        if !self.state.can_process_transactions() {
             self.cost_pacer = None;
+            return;
+        }
+
+        let current_slot = self.state.current_slot();
+        let needs_new_cost_pacer = match self.cost_pacer.as_ref() {
+            Some((slot, _)) => *slot != current_slot,
+            None => true,
+        };
+        if needs_new_cost_pacer {
+            let fill_time = (self.state.target_bank_time_ms() != 0).then(|| {
+                Duration::from_millis(u64::from(self.state.target_bank_time_ms()))
+                    .saturating_sub(PACING_NON_FILL_TIME)
+            });
+            let detection_time = now
+                .checked_sub(self.state.initial_bank_elapsed_time())
+                .unwrap_or(now);
+            self.cost_pacer = Some((
+                current_slot,
+                CostPacer::new(
+                    self.state.initial_remaining_cost_units(),
+                    detection_time,
+                    fill_time,
+                ),
+            ));
         }
     }
 

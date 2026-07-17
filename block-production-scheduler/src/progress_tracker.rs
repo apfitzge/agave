@@ -9,7 +9,7 @@ use {
     },
     solana_clock::FORWARD_TRANSACTIONS_TO_LEADER_AT_SLOT_OFFSET,
     solana_pubkey::Pubkey,
-    std::collections::HashSet,
+    std::{collections::HashSet, time::Duration},
 };
 
 /// Scheduler state derived from the latest progress message.
@@ -21,6 +21,7 @@ pub(crate) struct SchedulerState {
     initial_remaining_cost_units: u64,
     target_scheduled_cus: u64,
     target_bank_time_ms: u16,
+    initial_bank_progress: u8,
     feature_set: FeatureSet,
     reserved_account_keys: ReservedAccountKeys,
 }
@@ -35,6 +36,7 @@ impl SchedulerState {
             initial_remaining_cost_units: 0,
             target_scheduled_cus: 0,
             target_bank_time_ms: 0,
+            initial_bank_progress: 0,
             feature_set: FeatureSet::default(),
             reserved_account_keys: ReservedAccountKeys::default(),
         }
@@ -51,6 +53,7 @@ impl SchedulerState {
             self.initial_remaining_cost_units = progress.remaining_cost_units;
             self.target_scheduled_cus = progress.remaining_cost_units / 4;
             self.target_bank_time_ms = progress.target_bank_time_ms;
+            self.initial_bank_progress = progress.current_slot_progress;
         }
         self.feature_set = feature_set_from_scheduler_features(progress.scheduler_features);
         self.reserved_account_keys = ReservedAccountKeys::default();
@@ -96,7 +99,6 @@ impl SchedulerState {
         self.current_slot
     }
 
-    #[allow(dead_code)]
     pub(crate) fn remaining_cost_units(&self) -> u64 {
         self.remaining_cost_units
     }
@@ -109,21 +111,29 @@ impl SchedulerState {
         self.target_scheduled_cus
     }
 
-    #[allow(dead_code)]
     pub(crate) fn target_bank_time_ms(&self) -> u16 {
         self.target_bank_time_ms
+    }
+
+    /// The bank time that elapsed before the scheduler first observed this leader bank.
+    pub(crate) fn initial_bank_elapsed_time(&self) -> Duration {
+        Duration::from_millis(
+            u64::from(self.target_bank_time_ms)
+                .saturating_mul(u64::from(self.initial_bank_progress))
+                .saturating_div(100),
+        )
     }
 }
 
 pub(crate) fn drain_progress(
     progress_messages: &mut shaq::spsc::Consumer<ProgressMessage>,
     state: &mut SchedulerState,
-) {
+) -> bool {
     progress_messages.sync();
 
     let num_progress_messages = progress_messages.len();
     if num_progress_messages == 0 {
-        return;
+        return false;
     }
     for _ in 0..num_progress_messages.wrapping_sub(1) {
         // Quick ptr access, no copying of bytes since we immediately discard.
@@ -136,6 +146,7 @@ pub(crate) fn drain_progress(
     }
 
     progress_messages.finalize();
+    true
 }
 
 fn feature_set_from_scheduler_features(scheduler_features: u64) -> FeatureSet {
@@ -231,6 +242,10 @@ mod tests {
         assert_eq!(state.initial_remaining_cost_units(), 40);
         assert_eq!(state.target_scheduled_cus, 10);
         assert_eq!(state.target_bank_time_ms(), 400);
+        assert_eq!(
+            state.initial_bank_elapsed_time(),
+            Duration::from_millis(200)
+        );
 
         let mut later = progress_message(LEADER_READY, 100, 60, 104);
         later.remaining_cost_units = 4;
@@ -239,6 +254,10 @@ mod tests {
         assert_eq!(state.initial_remaining_cost_units(), 40);
         assert_eq!(state.target_scheduled_cus, 10);
         assert_eq!(state.target_bank_time_ms(), 400);
+        assert_eq!(
+            state.initial_bank_elapsed_time(),
+            Duration::from_millis(200)
+        );
 
         let mut next_bank = progress_message(LEADER_STARTING, 101, 0, 105);
         next_bank.remaining_cost_units = 0;
@@ -252,6 +271,7 @@ mod tests {
         assert_eq!(state.initial_remaining_cost_units(), 80);
         assert_eq!(state.target_scheduled_cus, 20);
         assert_eq!(state.target_bank_time_ms(), 500);
+        assert_eq!(state.initial_bank_elapsed_time(), Duration::from_millis(5));
     }
 
     #[test]
