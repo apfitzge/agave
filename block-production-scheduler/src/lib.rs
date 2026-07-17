@@ -41,6 +41,7 @@ const MAX_CHECK_RESPONSE_BATCHES_PER_ITERATION: usize =
 const MAX_EXECUTION_RESPONSE_BATCHES_PER_ITERATION: usize =
     MAX_SCHEDULED_TRANSACTIONS_PER_ITERATION / transaction::MAX_PACKETS_PER_EXEC_BATCH;
 const PACING_NON_FILL_TIME: Duration = Duration::from_millis(50);
+const PACING_FILL_TIME_PERCENT: u64 = 90;
 
 struct SchedulerStats {
     slots: BTreeMap<u64, SlotStats>,
@@ -344,8 +345,16 @@ impl Scheduler {
         };
         if needs_new_cost_pacer {
             let fill_time = (self.state.target_bank_time_ms() != 0).then(|| {
-                Duration::from_millis(u64::from(self.state.target_bank_time_ms()))
-                    .saturating_sub(PACING_NON_FILL_TIME)
+                let buffered_bank_time =
+                    Duration::from_millis(u64::from(self.state.target_bank_time_ms()))
+                        .saturating_sub(PACING_NON_FILL_TIME);
+                let buffered_bank_time_millis =
+                    u64::try_from(buffered_bank_time.as_millis()).unwrap_or(u64::MAX);
+                Duration::from_millis(
+                    buffered_bank_time_millis
+                        .saturating_mul(PACING_FILL_TIME_PERCENT)
+                        .saturating_div(100),
+                )
             });
             let detection_time = now
                 .checked_sub(self.state.initial_bank_elapsed_time())
