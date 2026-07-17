@@ -122,6 +122,7 @@ dependencies = [
  "solana-clock",
  "solana-core",
  "solana-epoch-schedule",
+ "solana-fee-calculator",
  "solana-hash 4.5.0",
  "solana-leader-schedule",
  "solana-ledger",

@@ -31,6 +31,7 @@ solana-account = { workspace = true }
 solana-core = { workspace = true }
 solana-clock = { workspace = true }
 solana-epoch-schedule = { workspace = true }
+solana-fee-calculator = { workspace = true }
 solana-hash = { workspace = true }
 solana-message = { workspace = true }
 solana-ledger = { workspace = true }

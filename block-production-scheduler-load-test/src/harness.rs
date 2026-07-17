@@ -12,6 +12,7 @@ use {
         progress_tracker,
     },
     solana_epoch_schedule::EpochSchedule,
+    solana_fee_calculator::FeeRateGovernor,
     solana_leader_schedule::SlotLeader,
     solana_ledger::{blockstore::Blockstore, leader_schedule_cache::LeaderScheduleCache},
     solana_poh::{
@@ -45,6 +46,7 @@ use {
 
 const DEFAULT_SLOT_DURATION: Duration = Duration::from_millis(400);
 const ROTATION_RECEIVE_TIMEOUT: Duration = Duration::from_millis(10);
+const LAMPORTS_PER_SIGNATURE: u64 = 5_000;
 
 /// Configuration for a [`Harness`].
 #[derive(Debug, Clone, Copy)]
@@ -187,6 +189,8 @@ impl Harness {
             &validator_pubkey,
             bootstrap_validator_stake_lamports(),
         );
+        genesis_config_info.genesis_config.fee_rate_governor =
+            FeeRateGovernor::new(LAMPORTS_PER_SIGNATURE, 0);
         genesis_config_info.genesis_config.epoch_schedule = EpochSchedule::without_warmup();
         let ticks_per_slot = genesis_config_info.genesis_config.ticks_per_slot;
         let target_tick_duration = target_tick_duration(config.slot_duration, ticks_per_slot)?;
