@@ -201,6 +201,7 @@ pub mod external {
         },
         arrayvec::ArrayVec,
         solana_cost_model::cost_model::CostModel,
+        solana_poh::poh_recorder::PohRecorderError,
         solana_runtime::bank::Bank,
         solana_runtime_transaction::{
             runtime_transaction::RuntimeTransaction, sanitize_config::sanitize_config,
@@ -229,6 +230,15 @@ pub mod external {
     enum IterationResult {
         ProcessedMessage,
         Idle,
+    }
+
+    fn drain_reason_for_recording_error(error: &PohRecorderError) -> u8 {
+        match error {
+            PohRecorderError::EntryBytesLimitExceeded => {
+                not_included_reasons::WOULD_EXCEED_MAX_ENTRY_BYTES_LIMIT
+            }
+            _ => not_included_reasons::BANK_NOT_AVAILABLE,
+        }
     }
 
     impl ExternalWorker {
@@ -260,14 +270,10 @@ pub mod external {
             mut self,
             mut receiver: shaq::spsc::Consumer<PackToExecutionWorkerMessage>,
         ) -> Result<(), ExternalConsumeWorkerError> {
-            let mut should_drain_executes = false;
+            let mut drain_reason = None;
 
             while !self.exit.load(Ordering::Relaxed) {
-                self.iterate(
-                    &mut receiver,
-                    &mut should_drain_executes,
-                    Self::RECEIVE_TIMEOUT,
-                )?;
+                self.iterate(&mut receiver, &mut drain_reason, Self::RECEIVE_TIMEOUT)?;
             }
 
             Ok(())
@@ -276,24 +282,22 @@ pub mod external {
         fn iterate(
             &mut self,
             receiver: &mut shaq::spsc::Consumer<PackToExecutionWorkerMessage>,
-            should_drain_executes: &mut bool,
+            drain_reason: &mut Option<u8>,
             timeout: Duration,
         ) -> Result<IterationResult, ExternalConsumeWorkerError> {
             self.allocator.clean_remote_frees();
 
             if receiver.is_empty() {
-                *should_drain_executes = false;
+                *drain_reason = None;
             }
 
             match receiver.read_timeout(timeout) {
                 Ok(message) => {
                     self.sender.sync();
 
-                    // Process message, if bank is unavailable enable draining for the
-                    // remainder of the current batch (i.e. what `read_timeout()`
-                    // fetched).
-                    *should_drain_executes |=
-                        self.process_message(message, *should_drain_executes)?;
+                    // Once recording is unavailable, drain the rest of the current queue with
+                    // the same reason so the external scheduler can handle it correctly.
+                    *drain_reason = self.process_message(message, *drain_reason)?;
 
                     // Publish our send & read offsets.
                     self.sender.commit();
@@ -305,19 +309,18 @@ pub mod external {
             }
         }
 
-        /// Return true if fetching a bank for execution timed out.
         fn process_message(
             &mut self,
             message: &PackToExecutionWorkerMessage,
-            should_drain_executes: bool,
-        ) -> Result<bool, ExternalConsumeWorkerError> {
+            drain_reason: Option<u8>,
+        ) -> Result<Option<u8>, ExternalConsumeWorkerError> {
             if !Self::validate_message(message) {
                 return self
                     .return_unprocessed_message(
                         message,
                         agave_scheduler_bindings::processed_codes::INVALID,
                     )
-                    .map(|()| false);
+                    .map(|()| drain_reason);
             }
 
             self.metrics
@@ -325,23 +328,18 @@ pub mod external {
                 .num_messages_processed
                 .fetch_add(1, Ordering::Relaxed);
 
-            self.execute_batch(message, should_drain_executes)
+            self.execute_batch(message, drain_reason)
         }
 
-        /// Return true if fetching a bank for execution timed out.
         fn execute_batch(
             &mut self,
             message: &PackToExecutionWorkerMessage,
-            should_drain_executes: bool,
-        ) -> Result<bool, ExternalConsumeWorkerError> {
-            if should_drain_executes {
+            drain_reason: Option<u8>,
+        ) -> Result<Option<u8>, ExternalConsumeWorkerError> {
+            if let Some(reason) = drain_reason {
                 return self
-                    .return_not_included_with_reason(
-                        message,
-                        not_included_reasons::BANK_NOT_AVAILABLE,
-                        0,
-                    )
-                    .map(|()| true);
+                    .return_not_included_with_reason(message, reason, 0)
+                    .map(|()| Some(reason));
             }
 
             let Some(leader_state) = active_leader_state(&self.shared_leader_state) else {
@@ -351,7 +349,7 @@ pub mod external {
                         not_included_reasons::BANK_NOT_AVAILABLE,
                         0,
                     )
-                    .map(|()| true);
+                    .map(|()| Some(not_included_reasons::BANK_NOT_AVAILABLE));
             };
 
             let bank = leader_state
@@ -363,7 +361,7 @@ pub mod external {
                         message,
                         agave_scheduler_bindings::processed_codes::MAX_WORKING_SLOT_EXCEEDED,
                     )
-                    .map(|()| false);
+                    .map(|()| None);
             }
 
             // SAFETY: Assumption that external scheduler does not pass messages with batch regions
@@ -388,7 +386,7 @@ pub mod external {
                     Self::all_or_nothing_translate_iterator(&translation_results, bank.slot()),
                 )?;
 
-                return Ok(false);
+                return Ok(None);
             }
 
             let output = self.consumer.process_and_record_aged_transactions(
@@ -401,19 +399,17 @@ pub mod external {
             self.metrics.update_for_consume(&output);
             self.metrics.has_data.store(true, Ordering::Relaxed);
 
-            let Ok(commit_results) = output
+            let commit_results = match output
                 .execute_and_commit_transactions_output
                 .commit_transactions_result
-            else {
-                // Recording failed (slot ended during processing).
-                // Return as bank not available so the scheduler can retry.
-                return self
-                    .return_not_included_with_reason(
-                        message,
-                        not_included_reasons::BANK_NOT_AVAILABLE,
-                        bank.slot(),
-                    )
-                    .map(|()| true);
+            {
+                Ok(commit_results) => commit_results,
+                Err(error) => {
+                    let reason = drain_reason_for_recording_error(&error);
+                    return self
+                        .return_not_included_with_reason(message, reason, bank.slot())
+                        .map(|()| Some(reason));
+                }
             };
 
             self.send_execution_response(
@@ -426,7 +422,7 @@ pub mod external {
                 ),
             )?;
 
-            Ok(false)
+            Ok(None)
         }
 
         fn send_execution_response(
@@ -720,7 +716,7 @@ pub mod external {
             shared_leader_state: SharedLeaderState,
             worker: ExternalWorker,
             receiver: shaq::spsc::Consumer<PackToExecutionWorkerMessage>,
-            should_drain_executes: bool,
+            drain_reason: Option<u8>,
         }
 
         impl ExternalTestFrame {
@@ -746,7 +742,7 @@ pub mod external {
             fn iterate(&mut self) -> Result<(), ExternalConsumeWorkerError> {
                 let result = self.worker.iterate(
                     &mut self.receiver,
-                    &mut self.should_drain_executes,
+                    &mut self.drain_reason,
                     Duration::ZERO,
                 )?;
                 assert!(matches!(result, IterationResult::ProcessedMessage));
@@ -756,7 +752,7 @@ pub mod external {
             fn iterate_idle(&mut self) -> Result<(), ExternalConsumeWorkerError> {
                 let result = self.worker.iterate(
                     &mut self.receiver,
-                    &mut self.should_drain_executes,
+                    &mut self.drain_reason,
                     Duration::ZERO,
                 )?;
                 assert!(matches!(result, IterationResult::Idle));
@@ -923,7 +919,7 @@ pub mod external {
                 shared_leader_state,
                 worker,
                 receiver: agave_worker.pack_to_worker,
-                should_drain_executes: false,
+                drain_reason: None,
             }
         }
 
@@ -970,13 +966,21 @@ pub mod external {
         }
 
         #[test]
-        fn test_iterate_idle_timeout_clears_drain_state() {
+        fn entry_bytes_limit_uses_a_distinct_drain_reason() {
+            assert_eq!(
+                drain_reason_for_recording_error(&PohRecorderError::EntryBytesLimitExceeded),
+                not_included_reasons::WOULD_EXCEED_MAX_ENTRY_BYTES_LIMIT
+            );
+        }
+
+        #[test]
+        fn test_iterate_idle_timeout_clears_drain_reason() {
             let mut test_frame = setup_external_test_frame();
-            test_frame.should_drain_executes = true;
+            test_frame.drain_reason = Some(not_included_reasons::BANK_NOT_AVAILABLE);
 
             test_frame.iterate_idle().unwrap();
 
-            assert!(!test_frame.should_drain_executes);
+            assert!(test_frame.drain_reason.is_none());
         }
 
         #[test]
@@ -1299,7 +1303,10 @@ pub mod external {
             });
 
             test_frame.iterate().unwrap();
-            assert!(test_frame.should_drain_executes);
+            assert_eq!(
+                test_frame.drain_reason,
+                Some(not_included_reasons::BANK_NOT_AVAILABLE)
+            );
             let first = test_frame.recv_response();
             let first_responses = test_frame.execution_responses(&first.responses);
             assert_eq!(first_responses.len(), 1);
@@ -1310,7 +1317,10 @@ pub mod external {
 
             test_frame.enable_execution();
             test_frame.iterate().unwrap();
-            assert!(test_frame.should_drain_executes);
+            assert_eq!(
+                test_frame.drain_reason,
+                Some(not_included_reasons::BANK_NOT_AVAILABLE)
+            );
 
             let response = test_frame.recv_response();
             assert_eq!(response.processed_code, processed_codes::PROCESSED);

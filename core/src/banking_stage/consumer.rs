@@ -374,7 +374,9 @@ impl Consumer {
             bank.entry_bytes_budget()
                 .reserve(entry_bytes)
                 .map_err(|err| match err {
-                    EntryBytesReserveError::ExceedsSlotLimit => PohRecorderError::MaxHeightReached,
+                    EntryBytesReserveError::ExceedsSlotLimit => {
+                        PohRecorderError::EntryBytesLimitExceeded
+                    }
                 });
         let (record_transactions_summary, record_us) = measure_us!(reserved_bytes.map(|_| {
             self.transaction_recorder

@@ -23,6 +23,7 @@ pub(crate) struct ExecutionResponseStats {
     pub(crate) recorded_transactions: u64,
     pub(crate) retrying_transactions: u64,
     pub(crate) cost_limit_retries: u64,
+    pub(crate) entry_bytes_limit_retries: u64,
     pub(crate) slot_boundary_retries: u64,
 }
 
@@ -108,6 +109,7 @@ fn handle_execution_response(
         recorded_transactions: 0,
         retrying_transactions: 0,
         cost_limit_retries: 0,
+        entry_bytes_limit_retries: 0,
         slot_boundary_retries: 0,
     };
     if response_is_valid {
@@ -118,8 +120,11 @@ fn handle_execution_response(
         };
         for ((_, meta), execution_response) in batch.iter().zip(responses.iter()) {
             if execution_response.execution_slot != 0
-                || execution_response.not_included_reason
-                    != not_included_reasons::BANK_NOT_AVAILABLE
+                || !matches!(
+                    execution_response.not_included_reason,
+                    not_included_reasons::BANK_NOT_AVAILABLE
+                        | not_included_reasons::WOULD_EXCEED_MAX_ENTRY_BYTES_LIMIT
+                )
             {
                 stats.record_execution_slot(execution_response.execution_slot);
             }
@@ -130,7 +135,14 @@ fn handle_execution_response(
             if let Some(immediately_retryable) = retryability {
                 stats.retrying_transactions = stats.retrying_transactions.wrapping_add(1);
                 if !immediately_retryable {
-                    stats.cost_limit_retries = stats.cost_limit_retries.wrapping_add(1);
+                    if execution_response.not_included_reason
+                        == not_included_reasons::WOULD_EXCEED_MAX_ENTRY_BYTES_LIMIT
+                    {
+                        stats.entry_bytes_limit_retries =
+                            stats.entry_bytes_limit_retries.wrapping_add(1);
+                    } else {
+                        stats.cost_limit_retries = stats.cost_limit_retries.wrapping_add(1);
+                    }
                 } else if execution_response.not_included_reason
                     == not_included_reasons::BANK_NOT_AVAILABLE
                 {
@@ -213,7 +225,8 @@ fn retryability(response: &ExecutionResponse) -> Option<bool> {
         not_included_reasons::WOULD_EXCEED_MAX_BLOCK_COST_LIMIT
         | not_included_reasons::WOULD_EXCEED_MAX_VOTE_COST_LIMIT
         | not_included_reasons::WOULD_EXCEED_MAX_ACCOUNT_COST_LIMIT
-        | not_included_reasons::WOULD_EXCEED_ACCOUNT_DATA_BLOCK_LIMIT => Some(false),
+        | not_included_reasons::WOULD_EXCEED_ACCOUNT_DATA_BLOCK_LIMIT
+        | not_included_reasons::WOULD_EXCEED_MAX_ENTRY_BYTES_LIMIT => Some(false),
         _ => None,
     }
 }
@@ -373,6 +386,13 @@ mod tests {
             cost_units: 0,
             fee_payer_balance: 0,
         }
+    }
+
+    #[test]
+    fn entry_bytes_limit_retries_after_the_next_slot() {
+        let response = execution_response(not_included_reasons::WOULD_EXCEED_MAX_ENTRY_BYTES_LIMIT);
+
+        assert_eq!(retryability(&response), Some(false));
     }
 
     #[test]

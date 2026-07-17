@@ -58,6 +58,7 @@ struct SlotStats {
     completed: u64,
     recorded: u64,
     cost_retries: u64,
+    entry_bytes_retries: u64,
     bank_retries: u64,
     scheduler_total_delta_ns: u64,
     scheduler_max_delta_ns: u64,
@@ -108,6 +109,9 @@ impl SchedulerStats {
         stats_for_slot.cost_retries = stats_for_slot
             .cost_retries
             .wrapping_add(stats.cost_limit_retries);
+        stats_for_slot.entry_bytes_retries = stats_for_slot
+            .entry_bytes_retries
+            .wrapping_add(stats.entry_bytes_limit_retries);
         stats_for_slot.bank_retries = stats_for_slot
             .bank_retries
             .wrapping_add(stats.slot_boundary_retries);
@@ -144,7 +148,8 @@ impl SchedulerStats {
             info!(
                 "scheduler_slot={slot} tpu_popped={} check_sent={} check_received={} enqueued={} \
                  priority_evictions={} scheduled={} completed={} recorded={} cost_retries={} \
-                 bank_retries={} scheduler_avg_delta_ns={} scheduler_max_delta_ns={}",
+                 entry_bytes_retries={} bank_retries={} scheduler_avg_delta_ns={} \
+                 scheduler_max_delta_ns={}",
                 stats.tpu_popped,
                 stats.check_sent,
                 stats.check_received,
@@ -154,6 +159,7 @@ impl SchedulerStats {
                 stats.completed,
                 stats.recorded,
                 stats.cost_retries,
+                stats.entry_bytes_retries,
                 stats.bank_retries,
                 stats.scheduler_avg_delta_ns(),
                 stats.scheduler_max_delta_ns,

@@ -30,6 +30,7 @@ signal-hook = { workspace = true }
 solana-account = { workspace = true }
 solana-core = { workspace = true }
 solana-clock = { workspace = true }
+solana-compute-budget-interface = { workspace = true }
 solana-epoch-schedule = { workspace = true }
 solana-fee-calculator = { workspace = true }
 solana-hash = { workspace = true }

@@ -12,10 +12,16 @@ use {
     std::{collections::HashSet, time::Duration},
 };
 
+/// Maximum cost units that may be scheduled but not yet completed.
+const MAX_SCHEDULED_COST_UNITS: u64 = 25_000_000;
+/// Stop scheduling just before PoH stops accepting records for the leader bank.
+const SCHEDULING_CUTOFF_PROGRESS: u8 = 98;
+
 /// Scheduler state derived from the latest progress message.
 pub(crate) struct SchedulerState {
     leader_state: u8,
     current_slot: u64,
+    current_slot_progress: u8,
     next_leader_slot: u64,
     remaining_cost_units: u64,
     initial_remaining_cost_units: u64,
@@ -31,6 +37,7 @@ impl SchedulerState {
         Self {
             leader_state: NOT_LEADER,
             current_slot: 0,
+            current_slot_progress: SCHEDULING_CUTOFF_PROGRESS,
             next_leader_slot: u64::MAX,
             remaining_cost_units: 0,
             initial_remaining_cost_units: 0,
@@ -47,11 +54,13 @@ impl SchedulerState {
             && (self.leader_state != LEADER_READY || self.current_slot != progress.current_slot);
         self.leader_state = progress.leader_state;
         self.current_slot = progress.current_slot;
+        self.current_slot_progress = progress.current_slot_progress;
         self.next_leader_slot = progress.next_leader_slot;
         self.remaining_cost_units = progress.remaining_cost_units;
         if is_first_ready_progress {
             self.initial_remaining_cost_units = progress.remaining_cost_units;
-            self.target_scheduled_cus = progress.remaining_cost_units / 4;
+            self.target_scheduled_cus =
+                (progress.remaining_cost_units / 4).min(MAX_SCHEDULED_COST_UNITS);
             self.target_bank_time_ms = progress.target_bank_time_ms;
             self.initial_bank_progress = progress.current_slot_progress;
         }
@@ -70,7 +79,7 @@ impl SchedulerState {
     }
 
     pub(crate) fn can_process_transactions(&self) -> bool {
-        self.leader_state == LEADER_READY
+        self.leader_state == LEADER_READY && self.current_slot_progress < SCHEDULING_CUTOFF_PROGRESS
     }
 
     pub(crate) fn should_accept_packets(&self) -> bool {
@@ -205,6 +214,16 @@ mod tests {
         assert!(state.can_process_transactions());
         assert!(state.should_accept_packets());
 
+        state.update(&progress_message(
+            LEADER_READY,
+            101,
+            SCHEDULING_CUTOFF_PROGRESS,
+            110,
+        ));
+        assert!(state.is_leader());
+        assert!(!state.can_process_transactions());
+        assert!(state.should_accept_packets());
+
         state.update(&progress_message(NOT_LEADER, 100, 0, 101));
         assert!(!state.is_leader());
         assert!(!state.can_process_transactions());
@@ -272,6 +291,17 @@ mod tests {
         assert_eq!(state.target_scheduled_cus, 20);
         assert_eq!(state.target_bank_time_ms(), 500);
         assert_eq!(state.initial_bank_elapsed_time(), Duration::from_millis(5));
+    }
+
+    #[test]
+    fn limits_scheduled_cost_units() {
+        let mut state = SchedulerState::new();
+        let mut progress = progress_message(LEADER_READY, 100, 1, 104);
+        progress.remaining_cost_units = u64::MAX;
+
+        state.update(&progress);
+
+        assert_eq!(state.target_scheduled_cus(), MAX_SCHEDULED_COST_UNITS);
     }
 
     #[test]

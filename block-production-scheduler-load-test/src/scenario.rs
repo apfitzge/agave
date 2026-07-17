@@ -2,6 +2,7 @@ use {
     crate::{Harness, TpuInjectorError},
     agave_scheduler_bindings::tpu_message_flags,
     solana_account::AccountSharedData,
+    solana_compute_budget_interface::ComputeBudgetInstruction,
     solana_hash::Hash,
     solana_message::Message,
     solana_pubkey::Pubkey,
@@ -21,13 +22,20 @@ const ACCOUNT_PAIRS_U64: u64 = ACCOUNT_PAIRS as u64;
 const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
 const ACCOUNT_BALANCE: u64 = 100 * LAMPORTS_PER_SOL;
 const UNIQUE_TRANSFER_AMOUNTS_PER_PAIR: u64 = 100;
+const UNIQUE_COMPUTE_UNIT_PRICES: u64 = 100;
+const COMPUTE_UNIT_PRICE_STEP_MICRO_LAMPORTS: u64 = 1_000;
+const TRANSFER_COMPUTE_UNIT_LIMIT: u32 = 200;
+const LOADED_ACCOUNTS_DATA_SIZE_LIMIT: u32 = 32 * 1024;
+const BLOCKHASH_PERCENT_DENOMINATOR: u64 = 100;
 const REPORT_INTERVAL: Duration = Duration::from_secs(1);
 
 const SIGNATURE_MARKER: [u8; 64] = [0x41; 64];
 const SOURCE_MARKER: [u8; 32] = [0x42; 32];
 const DESTINATION_MARKER: [u8; 32] = [0x43; 32];
 const BLOCKHASH_MARKER: [u8; 32] = [0x44; 32];
+const EXPIRED_BLOCKHASH_MARKER: [u8; 32] = [0x45; 32];
 const LAMPORTS_MARKER: u64 = 0xf0e1_d2c3_b4a5_9687;
+const COMPUTE_UNIT_PRICE_MARKER: u64 = 0x8796_a5b4_c3d2_e1f0;
 
 /// A source of serialized transactions for [`run_scenario`].
 pub trait LoadTestScenario {
@@ -95,22 +103,31 @@ pub struct TransferScenario {
     destination_offset: usize,
     blockhash_offset: usize,
     lamports_offset: usize,
+    compute_unit_price_offset: usize,
     accounts: Box<[Pubkey]>,
     transaction_index: u64,
+    expired_blockhash_percent: u8,
 }
 
 impl TransferScenario {
     /// Construct the one serialized transfer template used by the hot path.
-    pub fn new() -> Self {
+    pub fn new(expired_blockhash_percent: u8) -> Self {
+        assert!(
+            expired_blockhash_percent <= 100,
+            "expired blockhash percentage must not exceed 100"
+        );
         let source_marker = Pubkey::new_from_array(SOURCE_MARKER);
         let destination_marker = Pubkey::new_from_array(DESTINATION_MARKER);
         let blockhash_marker = Hash::new_from_array(BLOCKHASH_MARKER);
         let mut transaction = Transaction::new_unsigned(Message::new_with_blockhash(
-            &[system_instruction::transfer(
-                &source_marker,
-                &destination_marker,
-                LAMPORTS_MARKER,
-            )],
+            &[
+                ComputeBudgetInstruction::set_compute_unit_limit(TRANSFER_COMPUTE_UNIT_LIMIT),
+                ComputeBudgetInstruction::set_compute_unit_price(COMPUTE_UNIT_PRICE_MARKER),
+                ComputeBudgetInstruction::set_loaded_accounts_data_size_limit(
+                    LOADED_ACCOUNTS_DATA_SIZE_LIMIT,
+                ),
+                system_instruction::transfer(&source_marker, &destination_marker, LAMPORTS_MARKER),
+            ],
             Some(&source_marker),
             &blockhash_marker,
         ));
@@ -125,11 +142,16 @@ impl TransferScenario {
             destination_offset: find_unique_offset(&template, &DESTINATION_MARKER),
             blockhash_offset: find_unique_offset(&template, &BLOCKHASH_MARKER),
             lamports_offset: find_unique_offset(&template, &LAMPORTS_MARKER.to_le_bytes()),
+            compute_unit_price_offset: find_unique_offset(
+                &template,
+                &COMPUTE_UNIT_PRICE_MARKER.to_le_bytes(),
+            ),
             template,
             accounts: (0..ACCOUNT_PAIRS.saturating_mul(2))
                 .map(|_| Pubkey::new_unique())
                 .collect(),
             transaction_index: 0,
+            expired_blockhash_percent,
         }
     }
 }
@@ -167,6 +189,11 @@ impl LoadTestScenario for TransferScenario {
                 )
             };
         let lamports = transfer_lamports(transactions_for_pair).to_le_bytes();
+        let compute_unit_price = compute_unit_price(transaction_index).to_le_bytes();
+        let blockhash = self
+            .use_expired_blockhash(transaction_index)
+            .then(|| expired_blockhash(transaction_index))
+            .unwrap_or(*recent_blockhash);
 
         let mut transaction = self.template.to_vec();
         let signature = invalid_signature(transaction_index);
@@ -179,12 +206,23 @@ impl LoadTestScenario for TransferScenario {
                 .destination_offset
                 .wrapping_add(destination.as_ref().len())]
             .copy_from_slice(destination.as_ref());
-        transaction
-            [self.blockhash_offset..self.blockhash_offset.wrapping_add(recent_blockhash.len())]
-            .copy_from_slice(recent_blockhash);
+        transaction[self.blockhash_offset..self.blockhash_offset.wrapping_add(blockhash.len())]
+            .copy_from_slice(&blockhash);
         transaction[self.lamports_offset..self.lamports_offset.wrapping_add(lamports.len())]
             .copy_from_slice(&lamports);
+        transaction[self.compute_unit_price_offset
+            ..self
+                .compute_unit_price_offset
+                .wrapping_add(compute_unit_price.len())]
+            .copy_from_slice(&compute_unit_price);
         transaction
+    }
+}
+
+impl TransferScenario {
+    fn use_expired_blockhash(&self, transaction_index: u64) -> bool {
+        transaction_index.wrapping_rem(BLOCKHASH_PERCENT_DENOMINATOR)
+            < u64::from(self.expired_blockhash_percent)
     }
 }
 
@@ -216,13 +254,26 @@ fn transfer_lamports(transactions_for_pair: u64) -> u64 {
         .wrapping_add(1)
 }
 
+fn compute_unit_price(transaction_index: u64) -> u64 {
+    transaction_index
+        .wrapping_rem(UNIQUE_COMPUTE_UNIT_PRICES)
+        .wrapping_add(1)
+        .saturating_mul(COMPUTE_UNIT_PRICE_STEP_MICRO_LAMPORTS)
+}
+
+fn expired_blockhash(transaction_index: u64) -> [u8; 32] {
+    let mut blockhash = EXPIRED_BLOCKHASH_MARKER;
+    blockhash[..8].copy_from_slice(&transaction_index.to_le_bytes());
+    blockhash
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn transfer_generation_only_patches_the_wire_template() {
-        let mut scenario = TransferScenario::new();
+        let mut scenario = TransferScenario::new(0);
         let first = scenario.next_transaction(&[1; 32]);
         scenario.transaction_index = ACCOUNT_PAIRS_U64;
         let second = scenario.next_transaction(&[2; 32]);
@@ -256,6 +307,22 @@ mod tests {
             ),
             2,
         );
+        assert_eq!(
+            u64::from_le_bytes(
+                first[scenario.compute_unit_price_offset..scenario.compute_unit_price_offset + 8]
+                    .try_into()
+                    .unwrap(),
+            ),
+            compute_unit_price(0),
+        );
+        assert_eq!(
+            u64::from_le_bytes(
+                second[scenario.compute_unit_price_offset..scenario.compute_unit_price_offset + 8]
+                    .try_into()
+                    .unwrap(),
+            ),
+            compute_unit_price(ACCOUNT_PAIRS_U64),
+        );
     }
 
     #[test]
@@ -267,5 +334,29 @@ mod tests {
             );
         }
         assert_eq!(transfer_lamports(UNIQUE_TRANSFER_AMOUNTS_PER_PAIR), 1,);
+    }
+
+    #[test]
+    fn compute_unit_prices_cycle() {
+        for transaction_index in 0..UNIQUE_COMPUTE_UNIT_PRICES {
+            assert_eq!(
+                compute_unit_price(transaction_index),
+                transaction_index
+                    .wrapping_add(1)
+                    .saturating_mul(COMPUTE_UNIT_PRICE_STEP_MICRO_LAMPORTS),
+            );
+        }
+        assert_eq!(compute_unit_price(UNIQUE_COMPUTE_UNIT_PRICES), 1_000,);
+    }
+
+    #[test]
+    fn expired_blockhashes_follow_the_configured_percentage() {
+        let scenario = TransferScenario::new(67);
+        assert!(scenario.use_expired_blockhash(0));
+        assert!(scenario.use_expired_blockhash(66));
+        assert!(!scenario.use_expired_blockhash(67));
+        assert!(scenario.use_expired_blockhash(100));
+        assert_ne!(expired_blockhash(1), [1; 32]);
+        assert_ne!(expired_blockhash(1), expired_blockhash(2));
     }
 }

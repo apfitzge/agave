@@ -61,6 +61,9 @@ pub enum PohRecorderError {
     #[error("max height reached")]
     MaxHeightReached,
 
+    #[error("entry bytes limit exceeded")]
+    EntryBytesLimitExceeded,
+
     #[error("min height not reached")]
     MinHeightNotReached,
 

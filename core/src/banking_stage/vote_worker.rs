@@ -373,7 +373,7 @@ impl VoteWorker {
 
         let reached_max_poh_height = matches!(
             commit_transactions_result,
-            Err(PohRecorderError::MaxHeightReached)
+            Err(PohRecorderError::MaxHeightReached | PohRecorderError::EntryBytesLimitExceeded)
         );
 
         if reached_max_poh_height {

@@ -7,7 +7,7 @@ use {
     agave_block_production_scheduler_load_test::{
         Harness, HarnessConfig, LoadTestScenario, TransferScenario, run_scenario,
     },
-    agave_scheduling_utils::handshake::server::Server,
+    agave_scheduling_utils::handshake::{MAX_WORKERS, server::Server},
     clap::{App, Arg},
     log::info,
     std::{
@@ -20,8 +20,6 @@ use {
     thiserror::Error,
 };
 
-const EXECUTION_WORKER_COUNT: usize = 8;
-
 #[cfg(not(any(target_env = "msvc", target_os = "freebsd")))]
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
@@ -30,6 +28,10 @@ static GLOBAL: Jemalloc = Jemalloc;
 enum RunnerError {
     #[error("slot duration must be a non-zero number of milliseconds")]
     InvalidSlotDuration,
+    #[error("expired blockhash percentage must be an integer from 0 to 100")]
+    InvalidExpiredBlockhashPercent,
+    #[error("worker count must be an integer in 1..={MAX_WORKERS}")]
+    InvalidWorkerCount,
     #[error("failed to create a temporary scheduler socket: {0}")]
     TemporarySocket(#[source] std::io::Error),
     #[error("failed to create the scheduler socket: {0}")]
@@ -74,6 +76,35 @@ fn run(exit_signal: Arc<AtomicBool>) -> Result<(), RunnerError> {
                 .takes_value(true)
                 .default_value("400"),
         )
+        .arg(
+            Arg::with_name("expired-blockhash-percent")
+                .long("expired-blockhash-percent")
+                .value_name("PERCENT")
+                .help("Percentage of generated transactions with a non-recent blockhash")
+                .takes_value(true)
+                .default_value("0"),
+        )
+        .arg(
+            Arg::with_name("execution-worker-count")
+                .long("execution-worker-count")
+                .value_name("COUNT")
+                .help("Number of execution workers")
+                .takes_value(true)
+                .default_value("8"),
+        )
+        .arg(
+            Arg::with_name("check-worker-count")
+                .long("check-worker-count")
+                .value_name("COUNT")
+                .help("Number of check workers")
+                .takes_value(true)
+                .default_value("8"),
+        )
+        .arg(
+            Arg::with_name("unlimited-cost-limits")
+                .long("unlimited-cost-limits")
+                .help("Set all bank cost limits to u64::MAX"),
+        )
         .get_matches();
 
     let slot_duration = matches
@@ -84,12 +115,30 @@ fn run(exit_signal: Arc<AtomicBool>) -> Result<(), RunnerError> {
         .filter(|milliseconds| *milliseconds != 0)
         .map(Duration::from_millis)
         .ok_or(RunnerError::InvalidSlotDuration)?;
+    let expired_blockhash_percent = matches
+        .value_of("expired-blockhash-percent")
+        .expect("clap supplies --expired-blockhash-percent")
+        .parse::<u8>()
+        .ok()
+        .filter(|percent| *percent <= 100)
+        .ok_or(RunnerError::InvalidExpiredBlockhashPercent)?;
+    let execution_worker_count = parse_worker_count(
+        matches
+            .value_of("execution-worker-count")
+            .expect("clap supplies --execution-worker-count"),
+    )?;
+    let check_worker_count = parse_worker_count(
+        matches
+            .value_of("check-worker-count")
+            .expect("clap supplies --check-worker-count"),
+    )?;
 
     let socket_directory = TempDir::new().map_err(RunnerError::TemporarySocket)?;
     let socket = socket_directory.path().join("scheduler-bindings.ipc");
     let mut server = Server::new(&socket).map_err(RunnerError::SchedulerSocket)?;
     let mut scheduler_config = SchedulerConfig::new(socket);
-    scheduler_config.execution_worker_count = EXECUTION_WORKER_COUNT;
+    scheduler_config.execution_worker_count = execution_worker_count;
+    scheduler_config.check_worker_count = check_worker_count;
     let scheduler_exit = Arc::clone(&exit_signal);
     let scheduler = thread::Builder::new()
         .name("solLoadScheduler".to_string())
@@ -97,11 +146,12 @@ fn run(exit_signal: Arc<AtomicBool>) -> Result<(), RunnerError> {
         .map_err(RunnerError::LaunchSchedulerThread)?;
     let session = server.accept()?;
 
-    let mut scenario = TransferScenario::new();
+    let mut scenario = TransferScenario::new(expired_blockhash_percent);
     let mut harness = Harness::start(
         session,
         HarnessConfig {
             slot_duration,
+            unlimited_cost_limits: matches.is_present("unlimited-cost-limits"),
             ..HarnessConfig::default()
         },
         exit_signal,
@@ -117,4 +167,12 @@ fn run(exit_signal: Arc<AtomicBool>) -> Result<(), RunnerError> {
     result?;
     scheduler_result?;
     Ok(())
+}
+
+fn parse_worker_count(value: &str) -> Result<usize, RunnerError> {
+    value
+        .parse()
+        .ok()
+        .filter(|count| (1..=MAX_WORKERS).contains(count))
+        .ok_or(RunnerError::InvalidWorkerCount)
 }

@@ -55,6 +55,8 @@ pub struct HarnessConfig {
     pub slot_duration: Duration,
     /// The normal PoH producer's hash count per tick.
     pub hashes_per_tick: u64,
+    /// Whether every bank's cost tracker limits should be set to `u64::MAX`.
+    pub unlimited_cost_limits: bool,
 }
 
 impl Default for HarnessConfig {
@@ -62,6 +64,7 @@ impl Default for HarnessConfig {
         Self {
             slot_duration: DEFAULT_SLOT_DURATION,
             hashes_per_tick: DEFAULT_HASHES_PER_TICK,
+            unlimited_cost_limits: false,
         }
     }
 }
@@ -211,6 +214,9 @@ impl Harness {
             bank_forks.write().unwrap().insert(child)
         };
         let initial_bank = initial_bank.clone_without_scheduler();
+        if config.unlimited_cost_limits {
+            initial_bank.write_cost_tracker().unwrap().set_limits_max();
+        }
         setup(&initial_bank);
 
         let ledger = TempDir::new().map_err(HarnessError::TemporaryLedger)?;
@@ -296,6 +302,7 @@ impl Harness {
             bank_forks.clone(),
             poh_controller,
             leader,
+            config.unlimited_cost_limits,
         );
 
         Ok(Self {
@@ -474,6 +481,7 @@ fn spawn_bank_rotation(
     bank_forks: Arc<RwLock<BankForks>>,
     mut poh_controller: PohController,
     leader: SlotLeader,
+    unlimited_cost_limits: bool,
 ) -> JoinHandle<()> {
     thread::Builder::new()
         .name("solLoadBankRot".to_string())
@@ -494,6 +502,9 @@ fn spawn_bank_rotation(
                 report_cost_tracker_stats(&parent);
                 let child =
                     Bank::new_from_parent(parent.clone(), leader, parent.slot().saturating_add(1));
+                if unlimited_cost_limits {
+                    child.write_cost_tracker().unwrap().set_limits_max();
+                }
                 let child = {
                     let mut bank_forks = bank_forks.write().unwrap();
                     let child = bank_forks.insert(child);
@@ -596,6 +607,7 @@ mod tests {
             HarnessConfig {
                 slot_duration: Duration::from_millis(20),
                 hashes_per_tick: 2,
+                unlimited_cost_limits: false,
             },
             Arc::new(AtomicBool::new(false)),
             |_| {},

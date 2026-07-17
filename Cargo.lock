@@ -120,6 +120,7 @@ dependencies = [
  "signal-hook",
  "solana-account 4.3.1",
  "solana-clock",
+ "solana-compute-budget-interface",
  "solana-core",
  "solana-epoch-schedule",
  "solana-fee-calculator",

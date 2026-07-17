@@ -417,6 +417,8 @@ pub mod worker_message_types {
         /// The transaction could not attempt processing because the
         /// working bank was unavailable.
         pub const BANK_NOT_AVAILABLE: u8 = 1;
+        /// Recording this transaction would exceed the leader bank's entry-bytes limit.
+        pub const WOULD_EXCEED_MAX_ENTRY_BYTES_LIMIT: u8 = 2;
 
         /// Transaction dropped because the batch was marked as
         /// all_or_nothing and a different transacation failed.
