@@ -32,6 +32,7 @@ impl CheckedTransaction {
 /// priority.
 pub(crate) struct StateContainer {
     capacity: usize,
+    #[allow(dead_code)]
     minimum_priority_filter_threshold: usize,
     transactions: Slab<CheckedTransaction>,
     queue: TransactionPriorityQueue,
@@ -65,6 +66,7 @@ impl StateContainer {
     /// Only enable filtering once retained scheduler state is strictly more than 70% occupied.
     /// In-flight and held transactions consume state capacity but have no queue priority, so a
     /// queue without a retained minimum leaves the filter disabled.
+    #[allow(dead_code)]
     pub(crate) fn check_worker_minimum_priority(&self) -> u64 {
         if self.transactions.len() > self.minimum_priority_filter_threshold {
             self.queue.min_priority().unwrap_or_default()

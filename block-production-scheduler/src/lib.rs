@@ -268,6 +268,18 @@ impl Scheduler {
         }
 
         self.update_cost_pacer(now);
+        let released_budget = self
+            .cost_pacer
+            .as_ref()
+            .map_or(0, |(_, cost_pacer)| cost_pacer.scheduling_budget(&now, 0));
+        info!(
+            "scheduler_progress slot={} slot_progress={} remaining_cost_units={} \
+             released_budget={}",
+            self.state.current_slot(),
+            self.state.current_slot_progress(),
+            self.state.remaining_cost_units(),
+            released_budget,
+        );
     }
 
     fn drain_check_responses(&mut self) {
@@ -377,14 +389,14 @@ impl Scheduler {
     }
 
     fn ingest_tpu(&mut self) {
-        let minimum_priority = self.transaction_state.check_worker_minimum_priority();
         let stats = tpu_ingress::drain_tpu(
             &mut self.session.tpu_to_pack,
             &self.session.pack_to_check_worker,
             &self.session.allocators[0],
             &self.state,
             MAX_TPU_PACKETS_PER_ITERATION,
-            minimum_priority,
+            // Zero disables the check-worker priority floor.
+            0,
         );
         self.stats
             .record_tpu_ingress(self.state.current_slot(), stats);

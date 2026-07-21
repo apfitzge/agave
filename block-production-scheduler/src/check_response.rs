@@ -6,7 +6,7 @@ use {
     },
     agave_external_transaction_view::sanitize::SanitizeConfig,
     agave_scheduler_bindings::{
-        CheckWorkerToPackMessage, SharablePubkeys, processed_codes,
+        CheckWorkerToPackMessage, SharablePubkeys, processed_codes, tpu_message_flags,
         worker_message_types::{
             CHECK_RESPONSE, CheckResponse, fee_payer_balance_flags, parsing_and_sanitization_flags,
             resolve_flags, scheduling_details_flags, status_check_flags,
@@ -20,6 +20,7 @@ use {
 
 const BURN_PERCENT: u64 = 50;
 const PRIORITY_MULTIPLIER: u64 = 1_000_000;
+const SIMPLE_VOTE_PRIORITY: u64 = u64::MAX;
 
 #[derive(Default)]
 pub(crate) struct CheckResponseStats {
@@ -147,7 +148,7 @@ fn handle_tpu_check_response(
         return TpuCheckResponseOutcome::default();
     }
 
-    let priority = calculate_priority(check_response);
+    let priority = calculate_priority(check_response, meta.flags);
     if !state.can_admit_priority(priority) {
         // SAFETY: a transaction below the priority floor is still owned by this scheduler.
         unsafe { transaction.free(allocator) };
@@ -212,7 +213,11 @@ fn initial_response_is_valid(response: &CheckResponse) -> bool {
         && response.scheduling_details_flags & scheduling_details_flags::FAILED == 0
 }
 
-fn calculate_priority(response: &CheckResponse) -> u64 {
+fn calculate_priority(response: &CheckResponse, tpu_flags: u8) -> u64 {
+    if tpu_flags & tpu_message_flags::IS_SIMPLE_VOTE != 0 {
+        return SIMPLE_VOTE_PRIORITY;
+    }
+
     let reward = response.prioritization_fee.saturating_add(
         response.transaction_fee.saturating_sub(
             response
@@ -420,6 +425,14 @@ mod tests {
             prioritization_fee,
             ..valid_response()
         }
+    }
+
+    #[test]
+    fn simple_votes_have_maximum_scheduling_priority() {
+        assert_eq!(
+            calculate_priority(&valid_response(), tpu_message_flags::IS_SIMPLE_VOTE),
+            SIMPLE_VOTE_PRIORITY,
+        );
     }
 
     #[test]

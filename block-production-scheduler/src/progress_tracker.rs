@@ -108,6 +108,10 @@ impl SchedulerState {
         self.current_slot
     }
 
+    pub(crate) fn current_slot_progress(&self) -> u8 {
+        self.current_slot_progress
+    }
+
     pub(crate) fn remaining_cost_units(&self) -> u64 {
         self.remaining_cost_units
     }

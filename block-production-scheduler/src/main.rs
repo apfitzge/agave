@@ -23,6 +23,8 @@ fn main() {
             exit(1);
         });
 
+    agave_logger::setup_with_default_filter();
+
     let matches = App::new("agave-block-production-scheduler")
         .about("Run the external Agave block-production scheduler")
         .arg(
