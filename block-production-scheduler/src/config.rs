@@ -1,5 +1,6 @@
 use {
     agave_scheduling_utils::handshake::{ClientLogon, MAX_WORKERS},
+    solana_clock::DEFAULT_TICKS_PER_SLOT,
     std::{path::PathBuf, time::Duration},
     thiserror::Error,
 };
@@ -8,7 +9,7 @@ const DEFAULT_EXECUTION_WORKER_COUNT: usize = 4;
 const DEFAULT_CHECK_WORKER_COUNT: usize = 8;
 const DEFAULT_ALLOCATOR_SIZE: usize = 8 * 1024 * 1024 * 1024;
 const DEFAULT_TPU_TO_PACK_CAPACITY: usize = 1 << 17;
-const DEFAULT_PROGRESS_TRACKER_CAPACITY: usize = 128;
+const DEFAULT_PROGRESS_TRACKER_CAPACITY: usize = 8 * DEFAULT_TICKS_PER_SLOT as usize;
 const DEFAULT_PACK_TO_WORKER_CAPACITY: usize = 256;
 const DEFAULT_WORKER_TO_PACK_CAPACITY: usize = 256;
 const DEFAULT_PACK_TO_CHECK_WORKER_CAPACITY: usize = 1 << 13;
@@ -183,6 +184,10 @@ mod tests {
         assert_eq!(logon.worker_count, DEFAULT_EXECUTION_WORKER_COUNT);
         assert_eq!(logon.check_worker_count, DEFAULT_CHECK_WORKER_COUNT);
         assert_eq!(logon.allocator_handles, 1);
+        assert_eq!(
+            logon.progress_tracker_capacity,
+            DEFAULT_PROGRESS_TRACKER_CAPACITY
+        );
         assert_eq!(
             logon.pack_to_check_worker_capacity,
             DEFAULT_PACK_TO_CHECK_WORKER_CAPACITY

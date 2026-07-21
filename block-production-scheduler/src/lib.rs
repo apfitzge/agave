@@ -38,8 +38,13 @@ const MAX_CHECK_RESPONSE_PACKETS_PER_ITERATION: usize = 512;
 const MAX_SCHEDULED_TRANSACTIONS_PER_ITERATION: usize = 1024;
 const MAX_CHECK_RESPONSE_BATCHES_PER_ITERATION: usize =
     MAX_CHECK_RESPONSE_PACKETS_PER_ITERATION / transaction::MAX_PACKETS_PER_CHECK_BATCH;
-const MAX_EXECUTION_RESPONSE_BATCHES_PER_ITERATION: usize =
-    MAX_SCHEDULED_TRANSACTIONS_PER_ITERATION / transaction::MAX_PACKETS_PER_EXEC_BATCH;
+// Keep execution-response handling ahead of scheduling so completed work does not accumulate in
+// worker response queues and artificially consume the in-flight budget.
+const MAX_EXECUTION_RESPONSE_TRANSACTIONS_PER_ITERATION: usize =
+    MAX_SCHEDULED_TRANSACTIONS_PER_ITERATION * 2;
+// Temporary coalescing experiment: continue draining all queues each iteration, but let ready
+// work and execution headroom accumulate briefly before constructing execution batches.
+const SCHEDULING_INTERVAL: Duration = Duration::from_micros(100);
 const PACING_NON_FILL_TIME: Duration = Duration::from_millis(50);
 const PACING_FILL_TIME_PERCENT: u64 = 90;
 
@@ -60,9 +65,6 @@ struct SlotStats {
     cost_retries: u64,
     entry_bytes_retries: u64,
     bank_retries: u64,
-    scheduler_total_delta_ns: u64,
-    scheduler_max_delta_ns: u64,
-    scheduler_delta_count: u64,
 }
 
 impl SchedulerStats {
@@ -117,16 +119,6 @@ impl SchedulerStats {
             .wrapping_add(stats.slot_boundary_retries);
     }
 
-    fn record_scheduler_delta(&mut self, slot: u64, delta: Duration) {
-        let stats_for_slot = self.slot_mut(slot);
-        let delta_ns = u64::try_from(delta.as_nanos()).unwrap_or(u64::MAX);
-        stats_for_slot.scheduler_total_delta_ns = stats_for_slot
-            .scheduler_total_delta_ns
-            .wrapping_add(delta_ns);
-        stats_for_slot.scheduler_max_delta_ns = stats_for_slot.scheduler_max_delta_ns.max(delta_ns);
-        stats_for_slot.scheduler_delta_count = stats_for_slot.scheduler_delta_count.wrapping_add(1);
-    }
-
     fn report_completed_slots(
         &mut self,
         current_slot: u64,
@@ -148,8 +140,7 @@ impl SchedulerStats {
             info!(
                 "scheduler_slot={slot} tpu_popped={} check_sent={} check_received={} enqueued={} \
                  priority_evictions={} scheduled={} completed={} recorded={} cost_retries={} \
-                 entry_bytes_retries={} bank_retries={} scheduler_avg_delta_ns={} \
-                 scheduler_max_delta_ns={}",
+                 entry_bytes_retries={} bank_retries={}",
                 stats.tpu_popped,
                 stats.check_sent,
                 stats.check_received,
@@ -161,27 +152,12 @@ impl SchedulerStats {
                 stats.cost_retries,
                 stats.entry_bytes_retries,
                 stats.bank_retries,
-                stats.scheduler_avg_delta_ns(),
-                stats.scheduler_max_delta_ns,
             );
         }
     }
 
     fn slot_mut(&mut self, slot: u64) -> &mut SlotStats {
         self.slots.entry(slot).or_default()
-    }
-}
-
-impl SlotStats {
-    fn scheduler_avg_delta_ns(&self) -> u64 {
-        if self.scheduler_delta_count == 0 {
-            return 0;
-        }
-
-        #[allow(clippy::arithmetic_side_effects)]
-        {
-            self.scheduler_total_delta_ns / self.scheduler_delta_count
-        }
     }
 }
 
@@ -220,11 +196,12 @@ struct Scheduler {
     recheck_scratch: recheck::RecheckScratch,
     cost_pacer: Option<(u64, CostPacer)>,
     stats: SchedulerStats,
-    previous_iteration_time: Instant,
+    last_schedule_time: Instant,
 }
 
 impl Scheduler {
     fn new(config: SchedulerConfig, session: ClientSession) -> Self {
+        let now = Instant::now();
         Self {
             session,
             state: SchedulerState::new(),
@@ -243,16 +220,12 @@ impl Scheduler {
             recheck_scratch: recheck::RecheckScratch::new(),
             cost_pacer: None,
             stats: SchedulerStats::new(),
-            previous_iteration_time: Instant::now(),
+            last_schedule_time: now,
         }
     }
 
     fn run_iteration(&mut self, now: Instant) {
-        let iteration_time = now.saturating_duration_since(self.previous_iteration_time);
-        self.previous_iteration_time = now;
         self.drain_progress(now);
-        self.stats
-            .record_scheduler_delta(self.state.current_slot(), iteration_time);
         self.drain_check_responses();
         self.drain_execution_responses();
         self.stats
@@ -268,18 +241,6 @@ impl Scheduler {
         }
 
         self.update_cost_pacer(now);
-        let released_budget = self
-            .cost_pacer
-            .as_ref()
-            .map_or(0, |(_, cost_pacer)| cost_pacer.scheduling_budget(&now, 0));
-        info!(
-            "scheduler_progress slot={} slot_progress={} remaining_cost_units={} \
-             released_budget={}",
-            self.state.current_slot(),
-            self.state.current_slot_progress(),
-            self.state.remaining_cost_units(),
-            released_budget,
-        );
     }
 
     fn drain_check_responses(&mut self) {
@@ -313,7 +274,7 @@ impl Scheduler {
             &mut self.transaction_state,
             &mut self.account_locks,
             &mut self.in_flight,
-            MAX_EXECUTION_RESPONSE_BATCHES_PER_ITERATION,
+            MAX_EXECUTION_RESPONSE_TRANSACTIONS_PER_ITERATION,
             |execution_slot, stats_for_response| {
                 stats.record_execution_responses(
                     execution_slot.unwrap_or(fallback_slot),
@@ -324,15 +285,14 @@ impl Scheduler {
     }
 
     fn schedule(&mut self, now: Instant) {
+        if now.saturating_duration_since(self.last_schedule_time) < SCHEDULING_INTERVAL {
+            return;
+        }
+        self.last_schedule_time = now;
+
         if self.state.can_process_transactions() {
             let current_slot = self.state.current_slot();
-            let consumed_cost_units = self
-                .state
-                .initial_remaining_cost_units()
-                .saturating_sub(self.state.remaining_cost_units());
-            let pacing_budget = self.cost_pacer.as_ref().map_or(0, |(_, cost_pacer)| {
-                cost_pacer.scheduling_budget(&now, consumed_cost_units)
-            });
+            let pacing_budget = self.pacing_budget(now);
             let scheduled_transactions = scheduling::schedule(
                 &mut self.session.workers,
                 &self.session.allocators[0],
@@ -348,6 +308,16 @@ impl Scheduler {
             self.stats
                 .record_scheduled_transactions(current_slot, scheduled_transactions);
         }
+    }
+
+    fn pacing_budget(&self, now: Instant) -> u64 {
+        let consumed_cost_units = self
+            .state
+            .initial_remaining_cost_units()
+            .saturating_sub(self.state.remaining_cost_units());
+        self.cost_pacer.as_ref().map_or(0, |(_, cost_pacer)| {
+            cost_pacer.scheduling_budget(&now, consumed_cost_units)
+        })
     }
 
     fn update_cost_pacer(&mut self, now: Instant) {

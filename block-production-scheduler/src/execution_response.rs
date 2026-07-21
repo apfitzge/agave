@@ -38,30 +38,34 @@ impl ExecutionResponseStats {
     }
 }
 
-/// Drain up to `max_batches` execution responses, round-robin across workers.
+/// Drain up to `max_transactions` execution responses, round-robin across workers.
+///
+/// Individual response batches cannot be split, so the final batch may exceed the requested
+/// transaction limit.
 pub(crate) fn drain_execution_responses(
     workers: &mut [ClientWorkerSession],
     allocator: &Allocator,
     state: &mut StateContainer,
     account_locks: &mut ThreadAwareAccountLocks,
     in_flight: &mut InFlightTracker,
-    max_batches: usize,
+    max_transactions: usize,
     mut record_stats: impl FnMut(Option<u64>, ExecutionResponseStats),
 ) {
     for worker in workers.iter_mut() {
         worker.worker_to_pack.sync();
     }
 
-    let mut remaining_batches = max_batches;
-    while remaining_batches > 0 {
+    let mut remaining_transactions = max_transactions;
+    while remaining_transactions > 0 {
         let mut handled_response = false;
         for (worker_id, worker) in workers.iter_mut().enumerate() {
-            if remaining_batches == 0 {
+            if remaining_transactions == 0 {
                 break;
             }
             let Some(response) = worker.worker_to_pack.try_read() else {
                 continue;
             };
+            let num_transactions = usize::from(response.batch.num_transactions);
             let response_stats = handle_execution_response(
                 worker_id,
                 *response,
@@ -71,7 +75,7 @@ pub(crate) fn drain_execution_responses(
                 in_flight,
             );
             record_stats(response_stats.execution_slot, response_stats);
-            remaining_batches = remaining_batches.saturating_sub(1);
+            remaining_transactions = remaining_transactions.saturating_sub(num_transactions);
             handled_response = true;
         }
         if !handled_response {
