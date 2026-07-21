@@ -107,6 +107,7 @@ dependencies = [
 name = "agave-block-production-scheduler-load-test"
 version = "4.3.0-alpha.0"
 dependencies = [
+ "agave-banking-stage-ingress-types",
  "agave-block-production-scheduler",
  "agave-logger",
  "agave-scheduler-bindings",
@@ -128,6 +129,7 @@ dependencies = [
  "solana-leader-schedule",
  "solana-ledger",
  "solana-message",
+ "solana-perf",
  "solana-poh",
  "solana-poh-config",
  "solana-pubkey 4.2.0",
@@ -140,6 +142,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tikv-jemallocator",
+ "tokio",
  "wincode",
 ]
 

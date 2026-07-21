@@ -1,6 +1,5 @@
 use {
-    crate::{Harness, TpuInjectorError},
-    agave_scheduler_bindings::tpu_message_flags,
+    crate::{LoadTestHarness, TransactionInjector},
     solana_account::AccountSharedData,
     solana_compute_budget_interface::ComputeBudgetInstruction,
     solana_hash::Hash,
@@ -27,6 +26,7 @@ const COMPUTE_UNIT_PRICE_STEP_MICRO_LAMPORTS: u64 = 1_000;
 const TRANSFER_COMPUTE_UNIT_LIMIT: u32 = 200;
 const LOADED_ACCOUNTS_DATA_SIZE_LIMIT: u32 = 32 * 1024;
 const BLOCKHASH_PERCENT_DENOMINATOR: u64 = 100;
+const BLOCKHASH_REFRESH_INTERVAL: usize = 1_024;
 const REPORT_INTERVAL: Duration = Duration::from_secs(1);
 
 const SIGNATURE_MARKER: [u8; 64] = [0x41; 64];
@@ -50,33 +50,41 @@ pub trait LoadTestScenario {
 ///
 /// The callback is invoked roughly once per second with the number of transactions sent per
 /// second during that preceding interval.
-pub fn run_scenario<S>(
-    harness: &mut Harness,
+pub fn run_scenario<H, S>(
+    harness: &mut H,
     scenario: &mut S,
     mut report: impl FnMut(u64),
-) -> Result<(), TpuInjectorError>
+) -> Result<(), <H::Injector as TransactionInjector>::Error>
 where
+    H: LoadTestHarness,
     S: LoadTestScenario,
 {
     let exit = harness.exit_signal();
     let mut sent_since_report = 0u64;
     let mut last_report = Instant::now();
+    let mut transactions_since_blockhash_refresh = 0usize;
 
     while !exit.load(Ordering::Relaxed) {
-        let recent_blockhash = harness.working_bank().last_blockhash().to_bytes();
-        let injector = harness.injector();
-        injector.sync();
+        let mut recent_blockhash = harness.working_bank().last_blockhash().to_bytes();
+        harness.injector().sync();
 
         while !exit.load(Ordering::Relaxed) {
+            if transactions_since_blockhash_refresh >= BLOCKHASH_REFRESH_INTERVAL {
+                recent_blockhash = harness.working_bank().last_blockhash().to_bytes();
+                transactions_since_blockhash_refresh = 0;
+            }
             let transaction = scenario.next_transaction(&recent_blockhash);
 
-            match injector.try_push(&transaction, tpu_message_flags::NONE, [0; 16]) {
-                Ok(()) => sent_since_report = sent_since_report.wrapping_add(1),
-                Err(TpuInjectorError::QueueFull | TpuInjectorError::AllocatorFull) => break,
-                Err(error) => return Err(error),
+            match harness.injector().try_push_transaction(&transaction)? {
+                true => {
+                    sent_since_report = sent_since_report.wrapping_add(1);
+                    transactions_since_blockhash_refresh =
+                        transactions_since_blockhash_refresh.wrapping_add(1);
+                }
+                false => break,
             }
         }
-        injector.commit();
+        harness.injector().commit()?;
 
         let elapsed = last_report.elapsed();
         if elapsed >= REPORT_INTERVAL {

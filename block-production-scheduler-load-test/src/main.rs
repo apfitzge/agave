@@ -5,12 +5,14 @@ use jemallocator::Jemalloc;
 use {
     agave_block_production_scheduler::{SchedulerConfig, run as run_scheduler},
     agave_block_production_scheduler_load_test::{
-        Harness, HarnessConfig, LoadTestScenario, TransferScenario, run_scenario,
+        GreedyHarness, GreedyTpuInjectorError, Harness, HarnessConfig, LoadTestScenario,
+        TransferScenario, run_scenario,
     },
     agave_scheduling_utils::handshake::{MAX_WORKERS, server::Server},
     clap::{App, Arg},
     log::info,
     std::{
+        num::NonZeroUsize,
         process::exit,
         sync::{Arc, atomic::AtomicBool},
         thread,
@@ -48,6 +50,8 @@ enum RunnerError {
     Harness(#[from] agave_block_production_scheduler_load_test::HarnessError),
     #[error("failed to inject a generated transaction: {0}")]
     Injection(#[from] agave_block_production_scheduler_load_test::TpuInjectorError),
+    #[error("failed to inject a generated transaction into the greedy scheduler: {0}")]
+    GreedyInjection(#[from] GreedyTpuInjectorError),
 }
 
 fn main() {
@@ -67,7 +71,16 @@ fn main() {
 
 fn run(exit_signal: Arc<AtomicBool>) -> Result<(), RunnerError> {
     let matches = App::new("agave-block-production-scheduler-load-test")
-        .about("Continuously load test an external Agave block-production scheduler")
+        .about("Continuously load test Agave block-production schedulers")
+        .arg(
+            Arg::with_name("scheduler")
+                .long("scheduler")
+                .value_name("SCHEDULER")
+                .help("Scheduler to run: external or in-process greedy")
+                .takes_value(true)
+                .possible_values(&["external", "greedy"])
+                .default_value("external"),
+        )
         .arg(
             Arg::with_name("slot-ms")
                 .long("slot-ms")
@@ -96,7 +109,7 @@ fn run(exit_signal: Arc<AtomicBool>) -> Result<(), RunnerError> {
             Arg::with_name("check-worker-count")
                 .long("check-worker-count")
                 .value_name("COUNT")
-                .help("Number of check workers")
+                .help("Number of check workers for the external scheduler")
                 .takes_value(true)
                 .default_value("8"),
         )
@@ -127,12 +140,48 @@ fn run(exit_signal: Arc<AtomicBool>) -> Result<(), RunnerError> {
             .value_of("execution-worker-count")
             .expect("clap supplies --execution-worker-count"),
     )?;
-    let check_worker_count = parse_worker_count(
-        matches
-            .value_of("check-worker-count")
-            .expect("clap supplies --check-worker-count"),
-    )?;
+    let mut scenario = TransferScenario::new(expired_blockhash_percent);
+    let harness_config = HarnessConfig {
+        slot_duration,
+        unlimited_cost_limits: matches.is_present("unlimited-cost-limits"),
+        ..HarnessConfig::default()
+    };
+    match matches
+        .value_of("scheduler")
+        .expect("clap supplies --scheduler")
+    {
+        "external" => {
+            let check_worker_count = parse_worker_count(
+                matches
+                    .value_of("check-worker-count")
+                    .expect("clap supplies --check-worker-count"),
+            )?;
+            run_external(
+                exit_signal,
+                harness_config,
+                execution_worker_count,
+                check_worker_count,
+                &mut scenario,
+            )
+        }
+        "greedy" => run_greedy(
+            exit_signal,
+            harness_config,
+            NonZeroUsize::new(execution_worker_count)
+                .expect("worker count validation rejects zero"),
+            &mut scenario,
+        ),
+        _ => unreachable!("clap restricts --scheduler to known values"),
+    }
+}
 
+fn run_external(
+    exit_signal: Arc<AtomicBool>,
+    harness_config: HarnessConfig,
+    execution_worker_count: usize,
+    check_worker_count: usize,
+    scenario: &mut TransferScenario,
+) -> Result<(), RunnerError> {
     let socket_directory = TempDir::new().map_err(RunnerError::TemporarySocket)?;
     let socket = socket_directory.path().join("scheduler-bindings.ipc");
     let mut server = Server::new(&socket).map_err(RunnerError::SchedulerSocket)?;
@@ -145,21 +194,10 @@ fn run(exit_signal: Arc<AtomicBool>) -> Result<(), RunnerError> {
         .spawn(move || run_scheduler(scheduler_config, scheduler_exit))
         .map_err(RunnerError::LaunchSchedulerThread)?;
     let session = server.accept()?;
-
-    let mut scenario = TransferScenario::new(expired_blockhash_percent);
-    let mut harness = Harness::start(
-        session,
-        HarnessConfig {
-            slot_duration,
-            unlimited_cost_limits: matches.is_present("unlimited-cost-limits"),
-            ..HarnessConfig::default()
-        },
-        exit_signal,
-        |bank| scenario.setup(bank),
-    )?;
-    let result = run_scenario(&mut harness, &mut scenario, |transactions_sent| {
-        info!("transactions_sent_per_second={transactions_sent}");
-    });
+    let mut harness = Harness::start(session, harness_config, exit_signal, |bank| {
+        scenario.setup(bank)
+    })?;
+    let result = run_scenario(&mut harness, scenario, report_transactions_sent);
     harness.shutdown();
     let scheduler_result = scheduler
         .join()
@@ -167,6 +205,28 @@ fn run(exit_signal: Arc<AtomicBool>) -> Result<(), RunnerError> {
     result?;
     scheduler_result?;
     Ok(())
+}
+
+fn run_greedy(
+    exit_signal: Arc<AtomicBool>,
+    harness_config: HarnessConfig,
+    execution_worker_count: NonZeroUsize,
+    scenario: &mut TransferScenario,
+) -> Result<(), RunnerError> {
+    let mut harness = GreedyHarness::start(
+        harness_config,
+        execution_worker_count,
+        exit_signal,
+        |bank| scenario.setup(bank),
+    )?;
+    let result = run_scenario(&mut harness, scenario, report_transactions_sent);
+    harness.shutdown();
+    result?;
+    Ok(())
+}
+
+fn report_transactions_sent(transactions_sent_per_second: u64) {
+    info!("transactions_sent_per_second={transactions_sent_per_second}");
 }
 
 fn parse_worker_count(value: &str) -> Result<usize, RunnerError> {

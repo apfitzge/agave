@@ -1,20 +1,29 @@
 use {
-    agave_scheduler_bindings::{SharableTransactionRegion, TpuToPackMessage},
+    crate::{LoadTestHarness, TransactionInjector},
+    agave_banking_stage_ingress_types::SchedulerPriorityFloor,
+    agave_scheduler_bindings::{SharableTransactionRegion, TpuToPackMessage, tpu_message_flags},
     agave_scheduling_utils::handshake::{AgaveSession, AgaveTpuToPackSession},
     agave_votor_messages::migration::MigrationStatus,
-    crossbeam_channel::{Receiver, bounded},
+    crossbeam_channel::{Receiver, bounded, never},
     solana_clock::DEFAULT_HASHES_PER_TICK,
-    solana_core::banking_stage::{
-        check_worker::ExternalCheckWorker,
-        committer::Committer,
-        consume_worker::{ConsumeWorkerMetrics, external::ExternalWorker},
-        consumer::Consumer,
-        progress_tracker,
+    solana_core::{
+        banking_stage::{
+            BankingStage, BankingStageHandle,
+            check_worker::ExternalCheckWorker,
+            committer::Committer,
+            consume_worker::{ConsumeWorkerMetrics, external::ExternalWorker},
+            consumer::Consumer,
+            progress_tracker,
+            transaction_scheduler::scheduler_controller::SchedulerConfig as GreedySchedulerConfig,
+        },
+        banking_trace::{BankingPacketSender, BankingTracer},
+        validator::BlockProductionMethod,
     },
     solana_epoch_schedule::EpochSchedule,
     solana_fee_calculator::FeeRateGovernor,
     solana_leader_schedule::SlotLeader,
     solana_ledger::{blockstore::Blockstore, leader_schedule_cache::LeaderScheduleCache},
+    solana_perf::packet::{BytesPacket, Meta, PACKET_DATA_SIZE, PacketBatch, bytes::Bytes},
     solana_poh::{
         poh_controller::PohController,
         poh_recorder::{PohRecorder, WorkingBankEntryOrMarker},
@@ -32,6 +41,7 @@ use {
     },
     solana_signer::Signer,
     std::{
+        num::NonZeroUsize,
         ptr,
         sync::{
             Arc, RwLock,
@@ -157,31 +167,52 @@ impl TpuInjector {
     }
 }
 
-/// A production-worker, PoH-backed environment for an external scheduler.
-pub struct Harness {
+impl TransactionInjector for TpuInjector {
+    type Error = TpuInjectorError;
+
+    fn sync(&mut self) {
+        Self::sync(self);
+    }
+
+    fn try_push_transaction(&mut self, transaction: &[u8]) -> Result<bool, Self::Error> {
+        match Self::try_push(self, transaction, tpu_message_flags::NONE, [0; 16]) {
+            Ok(()) => Ok(true),
+            Err(Self::Error::AllocatorFull | Self::Error::QueueFull) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn commit(&mut self) -> Result<(), Self::Error> {
+        Self::commit(self);
+        Ok(())
+    }
+}
+
+struct PohServices {
     exit: Arc<AtomicBool>,
-    injector: TpuInjector,
     bank_forks: Arc<RwLock<BankForks>>,
-    worker_threads: Vec<JoinHandle<()>>,
-    progress_thread: Option<JoinHandle<()>>,
     rotation_thread: Option<JoinHandle<()>>,
     entry_drainer: Option<JoinHandle<()>>,
     poh_service: Option<PohService>,
     _ledger: TempDir,
-    _replay_vote_receiver: ReplayVoteReceiver,
 }
 
-impl Harness {
-    /// Start the real check/execution workers and PoH services for `session`.
-    ///
-    /// `setup` runs against the first leader bank before the workers or PoH service begin
-    /// processing, so it can install arbitrary account state without affecting measurements.
-    pub fn start(
-        session: AgaveSession,
+struct SchedulerSetup {
+    transaction_recorder: TransactionRecorder,
+    poh_recorder: Arc<RwLock<PohRecorder>>,
+    clear_bank_receiver: Receiver<bool>,
+    poh_controller: PohController,
+    leader: SlotLeader,
+    ticks_per_slot: u64,
+    unlimited_cost_limits: bool,
+}
+
+impl PohServices {
+    fn start(
         config: HarnessConfig,
         exit: Arc<AtomicBool>,
         setup: impl FnOnce(&Arc<Bank>),
-    ) -> Result<Self, HarnessError> {
+    ) -> Result<(Self, SchedulerSetup), HarnessError> {
         if config.slot_duration.is_zero() {
             return Err(HarnessError::ZeroSlotDuration);
         }
@@ -266,93 +297,51 @@ impl Harness {
             .map_err(|_| HarnessError::PohServiceDisconnected)?;
 
         let entry_drainer = spawn_entry_drainer(exit.clone(), entry_receiver);
-        let (shared_leader_state, sharable_banks) = {
-            let poh_recorder = poh_recorder.read().unwrap();
-            (
-                poh_recorder.shared_leader_state(),
-                bank_forks.read().unwrap().sharable_banks(),
-            )
-        };
-        let AgaveSession {
-            flags: _,
-            tpu_to_pack,
-            progress_tracker: progress_producer,
-            check_workers,
-            workers,
-        } = session;
-        let (worker_threads, worker_metrics, replay_vote_receiver) = spawn_workers(
-            exit.clone(),
-            check_workers,
-            workers,
-            transaction_recorder,
-            shared_leader_state.clone(),
-            sharable_banks.clone(),
-        );
-        let progress_thread = progress_tracker::spawn(
-            exit.clone(),
-            progress_producer,
-            shared_leader_state,
-            sharable_banks,
-            worker_metrics,
-            ticks_per_slot,
-        );
-        let rotation_thread = spawn_bank_rotation(
-            exit.clone(),
+        Ok((
+            Self {
+                exit,
+                bank_forks,
+                rotation_thread: None,
+                entry_drainer: Some(entry_drainer),
+                poh_service: Some(poh_service),
+                _ledger: ledger,
+            },
+            SchedulerSetup {
+                transaction_recorder,
+                poh_recorder,
+                clear_bank_receiver,
+                poh_controller,
+                leader,
+                ticks_per_slot,
+                unlimited_cost_limits: config.unlimited_cost_limits,
+            },
+        ))
+    }
+
+    fn start_rotation(
+        &mut self,
+        clear_bank_receiver: Receiver<bool>,
+        poh_controller: PohController,
+        leader: SlotLeader,
+        unlimited_cost_limits: bool,
+    ) {
+        self.rotation_thread = Some(spawn_bank_rotation(
+            self.exit.clone(),
             clear_bank_receiver,
-            bank_forks.clone(),
+            self.bank_forks.clone(),
             poh_controller,
             leader,
-            config.unlimited_cost_limits,
-        );
-
-        Ok(Self {
-            exit,
-            injector: TpuInjector::from(tpu_to_pack),
-            bank_forks,
-            worker_threads,
-            progress_thread: Some(progress_thread),
-            rotation_thread: Some(rotation_thread),
-            entry_drainer: Some(entry_drainer),
-            poh_service: Some(poh_service),
-            _ledger: ledger,
-            _replay_vote_receiver: replay_vote_receiver,
-        })
+            unlimited_cost_limits,
+        ));
     }
 
-    /// Return a producer for direct, post-sigverify TPU injection.
-    pub fn injector(&mut self) -> &mut TpuInjector {
-        &mut self.injector
-    }
-
-    /// Return the current working bank.
-    pub fn working_bank(&self) -> Arc<Bank> {
-        self.bank_forks.read().unwrap().working_bank()
-    }
-
-    /// Return the shared exit signal used by every service in this harness.
-    pub fn exit_signal(&self) -> Arc<AtomicBool> {
-        self.exit.clone()
-    }
-
-    /// Shut down all worker, progress, and PoH threads.
-    pub fn shutdown(mut self) {
-        self.stop();
-    }
-
-    fn stop(&mut self) {
-        self.exit.store(true, Ordering::Relaxed);
-
+    fn stop_rotation(&mut self) {
         if let Some(thread) = self.rotation_thread.take() {
             thread.join().expect("bank rotation thread must not panic");
         }
-        for thread in self.worker_threads.drain(..) {
-            thread.join().expect("worker thread must not panic");
-        }
-        if let Some(thread) = self.progress_thread.take() {
-            thread
-                .join()
-                .expect("progress tracker thread must not panic");
-        }
+    }
+
+    fn stop_poh(&mut self) {
         if let Some(poh_service) = self.poh_service.take() {
             poh_service
                 .join()
@@ -366,7 +355,286 @@ impl Harness {
     }
 }
 
+/// A production-worker, PoH-backed environment for an external scheduler.
+pub struct Harness {
+    services: PohServices,
+    injector: TpuInjector,
+    worker_threads: Vec<JoinHandle<()>>,
+    progress_thread: Option<JoinHandle<()>>,
+    _replay_vote_receiver: ReplayVoteReceiver,
+}
+
+impl Harness {
+    /// Start the real check/execution workers and PoH services for `session`.
+    ///
+    /// `setup` runs against the first leader bank before the workers or PoH service begin
+    /// processing, so it can install arbitrary account state without affecting measurements.
+    pub fn start(
+        session: AgaveSession,
+        config: HarnessConfig,
+        exit: Arc<AtomicBool>,
+        setup: impl FnOnce(&Arc<Bank>),
+    ) -> Result<Self, HarnessError> {
+        let (mut services, scheduler_setup) = PohServices::start(config, exit, setup)?;
+        let SchedulerSetup {
+            transaction_recorder,
+            poh_recorder,
+            ticks_per_slot,
+            ..
+        } = &scheduler_setup;
+        let (shared_leader_state, sharable_banks) = {
+            let poh_recorder = poh_recorder.read().unwrap();
+            (
+                poh_recorder.shared_leader_state(),
+                services.bank_forks.read().unwrap().sharable_banks(),
+            )
+        };
+        let AgaveSession {
+            flags: _,
+            tpu_to_pack,
+            progress_tracker: progress_producer,
+            check_workers,
+            workers,
+        } = session;
+        let (worker_threads, worker_metrics, replay_vote_receiver) = spawn_workers(
+            services.exit.clone(),
+            check_workers,
+            workers,
+            transaction_recorder.clone(),
+            shared_leader_state.clone(),
+            sharable_banks.clone(),
+        );
+        let progress_thread = progress_tracker::spawn(
+            services.exit.clone(),
+            progress_producer,
+            shared_leader_state,
+            sharable_banks,
+            worker_metrics,
+            *ticks_per_slot,
+        );
+        let SchedulerSetup {
+            clear_bank_receiver,
+            poh_controller,
+            leader,
+            unlimited_cost_limits,
+            ..
+        } = scheduler_setup;
+        services.start_rotation(
+            clear_bank_receiver,
+            poh_controller,
+            leader,
+            unlimited_cost_limits,
+        );
+
+        Ok(Self {
+            services,
+            injector: TpuInjector::from(tpu_to_pack),
+            worker_threads,
+            progress_thread: Some(progress_thread),
+            _replay_vote_receiver: replay_vote_receiver,
+        })
+    }
+
+    /// Return a producer for direct, post-sigverify TPU injection.
+    pub fn injector(&mut self) -> &mut TpuInjector {
+        &mut self.injector
+    }
+
+    /// Return the current working bank.
+    pub fn working_bank(&self) -> Arc<Bank> {
+        self.services.bank_forks.read().unwrap().working_bank()
+    }
+
+    /// Return the shared exit signal used by every service in this harness.
+    pub fn exit_signal(&self) -> Arc<AtomicBool> {
+        self.services.exit.clone()
+    }
+
+    /// Shut down all worker, progress, and PoH threads.
+    pub fn shutdown(mut self) {
+        self.stop();
+    }
+
+    fn stop(&mut self) {
+        self.services.exit.store(true, Ordering::Relaxed);
+        self.services.stop_rotation();
+        for thread in self.worker_threads.drain(..) {
+            thread.join().expect("worker thread must not panic");
+        }
+        if let Some(thread) = self.progress_thread.take() {
+            thread
+                .join()
+                .expect("progress tracker thread must not panic");
+        }
+        self.services.stop_poh();
+    }
+}
+
+impl LoadTestHarness for Harness {
+    type Injector = TpuInjector;
+
+    fn injector(&mut self) -> &mut Self::Injector {
+        Self::injector(self)
+    }
+
+    fn working_bank(&self) -> Arc<Bank> {
+        Self::working_bank(self)
+    }
+
+    fn exit_signal(&self) -> Arc<AtomicBool> {
+        Self::exit_signal(self)
+    }
+}
+
 impl Drop for Harness {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Errors returned by [`GreedyTpuInjector`].
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum GreedyTpuInjectorError {
+    #[error("transaction exceeds the maximum packet size")]
+    TransactionTooLarge,
+    #[error("greedy scheduler ingress is disconnected")]
+    Disconnected,
+}
+
+/// Direct producer for the in-process greedy scheduler's post-sigverify ingress channel.
+pub struct GreedyTpuInjector {
+    sender: BankingPacketSender,
+}
+
+impl GreedyTpuInjector {
+    fn new(sender: BankingPacketSender) -> Self {
+        Self { sender }
+    }
+}
+
+impl TransactionInjector for GreedyTpuInjector {
+    type Error = GreedyTpuInjectorError;
+
+    fn sync(&mut self) {}
+
+    fn try_push_transaction(&mut self, transaction: &[u8]) -> Result<bool, Self::Error> {
+        if transaction.len() > PACKET_DATA_SIZE {
+            return Err(GreedyTpuInjectorError::TransactionTooLarge);
+        }
+
+        let mut meta = Meta::default();
+        meta.size = transaction.len();
+        self.sender
+            .send(Arc::new(vec![PacketBatch::Single(BytesPacket::new(
+                Bytes::copy_from_slice(transaction),
+                meta,
+            ))]))
+            .map(|_| ())
+            .map_err(|_| GreedyTpuInjectorError::Disconnected)?;
+        Ok(true)
+    }
+
+    fn commit(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+/// A PoH-backed environment using BankingStage's in-process greedy scheduler.
+pub struct GreedyHarness {
+    services: PohServices,
+    injector: GreedyTpuInjector,
+    banking_stage: Option<BankingStageHandle>,
+    _replay_vote_receiver: ReplayVoteReceiver,
+}
+
+impl GreedyHarness {
+    /// Start BankingStage's greedy scheduler with real consume workers and post-sigverify ingress.
+    pub fn start(
+        config: HarnessConfig,
+        execution_worker_count: NonZeroUsize,
+        exit: Arc<AtomicBool>,
+        setup: impl FnOnce(&Arc<Bank>),
+    ) -> Result<Self, HarnessError> {
+        let (mut services, scheduler_setup) = PohServices::start(config, exit, setup)?;
+        let SchedulerSetup {
+            transaction_recorder,
+            poh_recorder,
+            clear_bank_receiver,
+            poh_controller,
+            leader,
+            unlimited_cost_limits,
+            ..
+        } = scheduler_setup;
+        let (non_vote_sender, non_vote_receiver) =
+            BankingTracer::new_disabled().create_channel_non_vote();
+        let (replay_vote_sender, replay_vote_receiver) = bounded(1024);
+        let banking_stage = BankingStage::new_num_threads(
+            BlockProductionMethod::CentralSchedulerGreedy,
+            poh_recorder,
+            transaction_recorder,
+            non_vote_receiver,
+            never(),
+            never(),
+            tokio::sync::mpsc::channel(1).1,
+            execution_worker_count,
+            GreedySchedulerConfig::default(),
+            None,
+            replay_vote_sender,
+            None,
+            services.bank_forks.clone(),
+            None,
+            Arc::default(),
+            Arc::new(SchedulerPriorityFloor::new()),
+        );
+        services.start_rotation(
+            clear_bank_receiver,
+            poh_controller,
+            leader,
+            unlimited_cost_limits,
+        );
+
+        Ok(Self {
+            services,
+            injector: GreedyTpuInjector::new(non_vote_sender),
+            banking_stage: Some(banking_stage),
+            _replay_vote_receiver: replay_vote_receiver,
+        })
+    }
+
+    /// Shut down BankingStage and the PoH services.
+    pub fn shutdown(mut self) {
+        self.stop();
+    }
+
+    fn stop(&mut self) {
+        self.services.exit.store(true, Ordering::Relaxed);
+        self.services.stop_rotation();
+        if let Some(banking_stage) = self.banking_stage.take() {
+            banking_stage
+                .join()
+                .expect("banking stage thread must not panic");
+        }
+        self.services.stop_poh();
+    }
+}
+
+impl LoadTestHarness for GreedyHarness {
+    type Injector = GreedyTpuInjector;
+
+    fn injector(&mut self) -> &mut Self::Injector {
+        &mut self.injector
+    }
+
+    fn working_bank(&self) -> Arc<Bank> {
+        self.services.bank_forks.read().unwrap().working_bank()
+    }
+
+    fn exit_signal(&self) -> Arc<AtomicBool> {
+        self.services.exit.clone()
+    }
+}
+
+impl Drop for GreedyHarness {
     fn drop(&mut self) {
         self.stop();
     }
@@ -596,6 +864,37 @@ mod tests {
         // SAFETY: this test consumed the queued transaction and now owns the allocation.
         unsafe { scheduler_session.allocators[0].free_offset(message.transaction.offset) };
         scheduler_session.tpu_to_pack.finalize();
+    }
+
+    #[test]
+    fn greedy_injector_enqueues_post_sigverify_packets() {
+        let (sender, receiver) = BankingTracer::new_disabled().create_channel_non_vote();
+        let mut injector = GreedyTpuInjector::new(sender);
+        let transaction = [1, 2, 3, 4];
+
+        injector.sync();
+        assert!(injector.try_push_transaction(&transaction).unwrap());
+        injector.commit().unwrap();
+
+        let batch = receiver.try_recv().unwrap();
+        assert_eq!(batch.len(), 1);
+        assert!(matches!(batch[0], PacketBatch::Single(_)));
+        let packet = batch[0].get(0).unwrap();
+        assert_eq!(packet.data(..).unwrap(), transaction);
+        assert_eq!(packet.meta().size, transaction.len());
+    }
+
+    #[test]
+    fn greedy_harness_starts_and_stops() {
+        let harness = GreedyHarness::start(
+            HarnessConfig::default(),
+            NonZeroUsize::new(1).unwrap(),
+            Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+
+        harness.shutdown();
     }
 
     #[test]
