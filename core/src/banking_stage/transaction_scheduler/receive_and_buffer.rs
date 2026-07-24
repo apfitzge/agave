@@ -60,6 +60,7 @@ impl ReceivingStats {
             IngressCheckError::PacketHandling(err) => self.add_packet_handling_error(err),
             IngressCheckError::Transaction(err) => self.add_transaction_error(err),
             IngressCheckError::FeePayer => self.num_dropped_on_fee_payer += 1,
+            IngressCheckError::BelowPriorityFloor => self.num_dropped_on_capacity += 1,
         }
     }
 

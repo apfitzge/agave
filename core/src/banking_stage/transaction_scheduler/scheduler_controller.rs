@@ -27,7 +27,7 @@ use {
     solana_runtime::bank_forks::SharableBanks,
     solana_svm::transaction_error_metrics::TransactionErrorMetrics,
     std::{
-        num::{NonZeroU64, Saturating},
+        num::{NonZeroU64, NonZeroUsize, Saturating},
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -48,6 +48,7 @@ const DESATURATION_BUFFER_PCT: u8 = 95;
 #[derive(Clone)]
 pub struct SchedulerConfig {
     pub scheduler_pacing: SchedulerPacing,
+    pub num_check_workers: NonZeroUsize,
 }
 
 impl Default for SchedulerConfig {
@@ -56,10 +57,12 @@ impl Default for SchedulerConfig {
             scheduler_pacing: SchedulerPacing::FillTimeMillis(
                 DEFAULT_SCHEDULER_PACING_FILL_TIME_MILLIS,
             ),
+            num_check_workers: DEFAULT_NUM_CHECK_WORKERS,
         }
     }
 }
 
+pub(crate) const DEFAULT_NUM_CHECK_WORKERS: NonZeroUsize = NonZeroUsize::new(8).unwrap();
 const DEFAULT_SCHEDULER_PACING_NON_FILL_TIME_MILLIS: u64 = 50;
 pub(crate) const DEFAULT_SCHEDULER_PACING_FILL_TIME_MILLIS: NonZeroU64 =
     NonZeroU64::new(DEFAULT_MS_PER_SLOT - DEFAULT_SCHEDULER_PACING_NON_FILL_TIME_MILLIS).unwrap();
@@ -565,6 +568,17 @@ mod tests {
 
     fn create_channels<T>(num: usize) -> (Vec<Sender<T>>, Vec<Receiver<T>>) {
         (0..num).map(|_| bounded(1024)).unzip()
+    }
+
+    #[test]
+    fn test_default_and_programmatic_num_check_workers() {
+        assert_eq!(SchedulerConfig::default().num_check_workers.get(), 8);
+
+        let config = SchedulerConfig {
+            num_check_workers: NonZeroUsize::new(3).unwrap(),
+            ..SchedulerConfig::default()
+        };
+        assert_eq!(config.num_check_workers.get(), 3);
     }
 
     // Helper struct to create tests that hold channels, files, etc.

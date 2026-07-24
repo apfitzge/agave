@@ -34,6 +34,7 @@ pub(crate) enum IngressCheckError {
     PacketHandling(PacketHandlingError),
     Transaction(TransactionError),
     FeePayer,
+    BelowPriorityFloor,
 }
 
 #[derive(Debug, PartialEq, Eq)]
