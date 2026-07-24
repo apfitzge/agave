@@ -182,7 +182,7 @@ pub(crate) mod external {
         crate::banking_stage::{
             committer::CommitTransactionDetails,
             scheduler_messages::MaxAge,
-            transaction_scheduler::receive_and_buffer::{
+            transaction_scheduler::ingress_check::{
                 PacketHandlingError, translate_to_runtime_view,
             },
         },

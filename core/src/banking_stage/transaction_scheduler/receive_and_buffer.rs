@@ -1,30 +1,16 @@
 use {
     super::{
+        ingress_check::{
+            IngressCheckError, PacketHandlingError, check_parsed_transaction, parse_transaction,
+        },
         transaction_priority_id::TransactionPriorityId,
-        transaction_state::TransactionState,
-        transaction_state_container::{
-            StateContainer, TransactionViewState, TransactionViewStateContainer,
-        },
+        transaction_state_container::{StateContainer, TransactionViewStateContainer},
     },
-    crate::{
-        banking_stage::{
-            consumer::Consumer, decision_maker::BufferedPacketsDecision, packet_bytes,
-            scheduler_messages::MaxAge,
-        },
-        transaction_priority::calculate_priority_and_cost,
-    },
+    crate::banking_stage::{decision_maker::BufferedPacketsDecision, packet_bytes},
     agave_banking_stage_ingress_types::{BankingPacketBatch, BankingPacketReceiver},
-    agave_transaction_view::{
-        resolved_transaction_view::ResolvedTransactionView, sanitize::SanitizeConfig,
-        transaction_data::TransactionData, transaction_version::TransactionVersion,
-        transaction_view::SanitizedTransactionView,
-    },
+    agave_transaction_view::resolved_transaction_view::ResolvedTransactionView,
     core::time::Duration,
     crossbeam_channel::{RecvTimeoutError, TryRecvError},
-    solana_accounts_db::account_locks::validate_account_locks,
-    solana_address_lookup_table_interface::state::estimate_last_valid_slot,
-    solana_clock::{Epoch, Slot},
-    solana_message::v0::LoadedAddresses,
     solana_perf::packet::bytes::Bytes,
     solana_pubkey::Pubkey,
     solana_runtime::{
@@ -32,12 +18,9 @@ use {
         bank_forks::{BankPair, SharableBanks},
     },
     solana_runtime_transaction::{
-        runtime_transaction::RuntimeTransaction, sanitize_config::sanitize_config,
-        transaction_meta::TransactionMeta, transaction_with_meta::TransactionWithMeta,
+        runtime_transaction::RuntimeTransaction, transaction_with_meta::TransactionWithMeta,
     },
-    solana_svm::transaction_error_metrics::TransactionErrorMetrics,
     solana_svm_transaction::svm_message::SVMMessage,
-    solana_transaction::sanitized::MessageHash,
     solana_transaction_error::TransactionError,
     std::{collections::HashSet, sync::Arc, time::Instant},
 };
@@ -72,6 +55,14 @@ pub(crate) struct ReceivingStats {
 }
 
 impl ReceivingStats {
+    fn add_ingress_check_error(&mut self, err: &IngressCheckError) {
+        match err {
+            IngressCheckError::PacketHandling(err) => self.add_packet_handling_error(err),
+            IngressCheckError::Transaction(err) => self.add_transaction_error(err),
+            IngressCheckError::FeePayer => self.num_dropped_on_fee_payer += 1,
+        }
+    }
+
     fn add_packet_handling_error(&mut self, err: &PacketHandlingError) {
         match err {
             PacketHandlingError::Sanitization | PacketHandlingError::ALTResolution => {
@@ -231,14 +222,6 @@ impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
     }
 }
 
-pub(crate) enum PacketHandlingError {
-    Sanitization,
-    LockValidation,
-    ComputeBudget,
-    ALTResolution,
-    FilterKey,
-}
-
 impl TransactionViewReceiveAndBuffer {
     /// Return number of received packets.
     fn handle_packet_batch_message(
@@ -253,10 +236,6 @@ impl TransactionViewReceiveAndBuffer {
         // If outside holding window, do not parse.
         let should_parse = !matches!(decision, BufferedPacketsDecision::Forward);
 
-        let sanitize_config = sanitize_config();
-        let transaction_account_lock_limit = working_bank.get_transaction_account_lock_limit();
-
-        let mut error_counters = TransactionErrorMetrics::default();
         let mut receiving_stats = ReceivingStats::default();
 
         for packet in packet_batch_message.iter() {
@@ -271,245 +250,72 @@ impl TransactionViewReceiveAndBuffer {
             }
 
             let bytes = packet_bytes(packet, packet_data);
-            let state = match Self::try_handle_packet(
-                bytes,
-                root_bank,
-                working_bank,
-                transaction_account_lock_limit,
-                &sanitize_config,
-                &self.filter_keys,
-            ) {
-                // Successful parse, ALTs resolved, and no obvious static issues.
-                Ok(state) => state,
-
-                // Parsing or some other static checks failed.
-                Err(ref err) => {
-                    receiving_stats.add_packet_handling_error(err);
-                    continue;
-                }
-            };
-            let transaction_id = container.insert_map_only(state);
-            {
-                let (priority, raw_nonce_address) = container
-                    .get_mut_transaction_state(transaction_id)
-                    .map(|state| {
-                        (
-                            state.priority(),
-                            state.transaction().get_durable_nonce().cloned(),
-                        )
-                    })
-                    .expect("transaction must exist");
-                let priority_id = TransactionPriorityId::new(priority, transaction_id);
-
-                // When we first receive a transaction, we drop it if a) it looks nonce-like, AND
-                // b) there is a higher-priority nonce transaction using the same nonce in the queue
-                // or any in-flight nonce transaction using the same nonce. This means we discard
-                // blockhash transactions structured like nonce transactions; this is acceptable because
-                // they would fail after the earlier nonce transaction is processed, and it allows us to
-                // prefilter without loading from accounts-db.
-                let drop_incoming_nonce_tx = raw_nonce_address
-                    .and_then(|address| container.get_nonce_transaction_priority_id(&address))
-                    .is_some_and(|existing| {
-                        existing.priority >= priority || !container.is_queued(existing)
-                    });
-
-                if drop_incoming_nonce_tx {
-                    receiving_stats.num_dropped_on_nonce_dedup += 1;
-                    container.remove_by_id(transaction_id);
-                    continue;
-                }
-
-                let transaction = container
-                    .get_transaction(transaction_id)
-                    .expect("transaction must exist");
-
-                // Check blockhash transaction age is ok, or nonce transaction has a valid nonce.
-                // Only a fully validated nonce address can be used for priority queue eviction.
-                let validated_nonce_address = match working_bank
-                    .check_transaction_without_status_cache(
-                        transaction,
-                        working_bank.max_processing_age(),
-                        &mut error_counters,
-                    ) {
-                    // Valid nonce transaction
-                    Ok(Some(nonce_address)) => Some(nonce_address),
-
-                    // Valid blockhash transaction
-                    Ok(None) => None,
-
-                    // Invalid
+            let parsed_transaction =
+                match parse_transaction(bytes, root_bank, working_bank, &self.filter_keys) {
+                    // Successful parse, ALT resolution, and static checks.
+                    Ok(parsed_transaction) => parsed_transaction,
                     Err(ref err) => {
-                        receiving_stats.add_transaction_error(err);
-                        container.remove_by_id(transaction_id);
+                        receiving_stats.add_ingress_check_error(err);
                         continue;
                     }
                 };
+            let priority = parsed_transaction.priority();
 
-                // Check the transaction's fee-payer validates.
-                if let Err(_err) = Consumer::check_fee_payer_unlocked(
-                    working_bank,
-                    transaction,
-                    &mut error_counters,
-                ) {
-                    receiving_stats.num_dropped_on_fee_payer += 1;
-                    container.remove_by_id(transaction_id);
-                    continue;
-                };
+            // Drop the transaction if it looks nonce-like and a higher-or-equal-priority
+            // nonce transaction using the same nonce is queued, or any conflicting nonce
+            // transaction is in flight.
+            let drop_incoming_nonce_tx = parsed_transaction
+                .raw_nonce_address()
+                .and_then(|address| container.get_nonce_transaction_priority_id(address))
+                .is_some_and(|existing| {
+                    existing.priority >= priority || !container.is_queued(existing)
+                });
 
-                // Now, if this is a nonce transaction, we know it is validated and higher-priority than any
-                // which may exist in the priority queue. If one is queued, evict it. Regardless, record the
-                // incoming nonce transaction's nonce as in-use.
-                if let Some(nonce_address) = validated_nonce_address {
-                    if let Some(existing_nonce_priority_id) =
-                        container.get_nonce_transaction_priority_id(&nonce_address)
-                    {
-                        receiving_stats.num_evicted_on_nonce_dedup += 1;
-                        container.remove_by_id(existing_nonce_priority_id.id);
-                    }
-                    container.set_nonce_transaction_priority_id(&nonce_address, priority_id);
-                }
-
-                // Transaction is already fully validated and can be inserted into priority queue.
-                receiving_stats.num_dropped_on_capacity +=
-                    container.push_ids_into_queue(std::iter::once(priority_id));
-
-                receiving_stats.num_buffered += 1;
+            if drop_incoming_nonce_tx {
+                receiving_stats.num_dropped_on_nonce_dedup += 1;
+                continue;
             }
+
+            let checked_transaction =
+                match check_parsed_transaction(parsed_transaction, working_bank) {
+                    Ok(checked_transaction) => checked_transaction,
+                    Err(ref err) => {
+                        receiving_stats.add_ingress_check_error(err);
+                        continue;
+                    }
+                };
+            let (state, is_validated_nonce) = checked_transaction.into_parts();
+            let validated_nonce_address = is_validated_nonce.then(|| {
+                *state
+                    .transaction()
+                    .get_durable_nonce()
+                    .expect("validated nonce transaction must contain a nonce address")
+            });
+            let transaction_id = container.insert_map_only(state);
+            let priority_id = TransactionPriorityId::new(priority, transaction_id);
+
+            // A validated nonce transaction is higher priority than any queued
+            // conflict. Evict that conflict only after all ingress checks passed.
+            if let Some(nonce_address) = validated_nonce_address {
+                if let Some(existing_nonce_priority_id) =
+                    container.get_nonce_transaction_priority_id(&nonce_address)
+                {
+                    receiving_stats.num_evicted_on_nonce_dedup += 1;
+                    container.remove_by_id(existing_nonce_priority_id.id);
+                }
+                container.set_nonce_transaction_priority_id(&nonce_address, priority_id);
+            }
+
+            // Transaction is already fully validated and can be inserted into priority queue.
+            receiving_stats.num_dropped_on_capacity +=
+                container.push_ids_into_queue(std::iter::once(priority_id));
+
+            receiving_stats.num_buffered += 1;
         }
 
         // `receive_time_us` is set outside this function
         receiving_stats.buffer_time_us = start.elapsed().as_micros() as u64;
         receiving_stats
-    }
-
-    fn try_handle_packet(
-        bytes: Bytes,
-        root_bank: &Bank,
-        working_bank: &Bank,
-        transaction_account_lock_limit: usize,
-        sanitize_config: &SanitizeConfig,
-        filter_keys: &HashSet<Pubkey>,
-    ) -> Result<TransactionViewState, PacketHandlingError> {
-        let (view, deactivation_slot) = translate_to_runtime_view(
-            bytes,
-            root_bank,
-            transaction_account_lock_limit,
-            sanitize_config,
-        )?;
-
-        if !filter_keys.is_empty()
-            && view
-                .account_keys()
-                .iter()
-                .any(|key| filter_keys.contains(key))
-        {
-            return Err(PacketHandlingError::FilterKey);
-        }
-
-        let Ok(transaction_configuration) =
-            view.transaction_configuration(&working_bank.feature_set)
-        else {
-            return Err(PacketHandlingError::ComputeBudget);
-        };
-
-        let max_age = calculate_max_age(root_bank.epoch(), deactivation_slot, root_bank.slot());
-        let (priority, cost) =
-            calculate_priority_and_cost(working_bank, &view, &transaction_configuration);
-
-        Ok(TransactionState::new(view, max_age, priority, cost))
-    }
-}
-
-/// Perform sanitization checks and transition from data to an executable
-/// [`RuntimeTransaction`]. This additionally returns the minimum slot for
-/// ALT deactivation, if any. If no minimum slot, Slot::MAX is returned.
-pub(crate) fn translate_to_runtime_view<D: TransactionData>(
-    data: D,
-    bank: &Bank,
-    transaction_account_lock_limit: usize,
-    sanitize_config: &SanitizeConfig,
-) -> Result<(RuntimeTransaction<ResolvedTransactionView<D>>, u64), PacketHandlingError> {
-    // Parsing and basic sanitization checks
-    let Ok(view) = SanitizedTransactionView::try_new_sanitized(data, sanitize_config) else {
-        return Err(PacketHandlingError::Sanitization);
-    };
-
-    let Ok(view) = RuntimeTransaction::<SanitizedTransactionView<_>>::try_new(
-        view,
-        MessageHash::Compute,
-        None,
-    ) else {
-        return Err(PacketHandlingError::Sanitization);
-    };
-
-    // Discard non-vote packets if in vote-only mode.
-    if bank.vote_only_bank() && !view.is_simple_vote_transaction() {
-        return Err(PacketHandlingError::Sanitization);
-    }
-
-    if usize::from(view.total_num_accounts()) > transaction_account_lock_limit {
-        return Err(PacketHandlingError::LockValidation);
-    }
-
-    let (loaded_addresses, deactivation_slot) = load_addresses_for_view(&view, bank)?;
-
-    let Ok(view) = RuntimeTransaction::<ResolvedTransactionView<_>>::try_new(
-        view,
-        loaded_addresses,
-        bank.get_reserved_account_keys(),
-    ) else {
-        return Err(PacketHandlingError::Sanitization);
-    };
-
-    // Validate no duplicate accounts (must be after resolution to catch ALT duplicates)
-    if validate_account_locks(view.account_keys(), transaction_account_lock_limit).is_err() {
-        return Err(PacketHandlingError::LockValidation);
-    }
-
-    Ok((view, deactivation_slot))
-}
-
-/// Load addresses from ALTs (if necessary) and return the
-/// [`LoadedAddresses`] with the minimum deactivation slot.
-pub(crate) fn load_addresses_for_view<D: TransactionData>(
-    view: &SanitizedTransactionView<D>,
-    bank: &Bank,
-) -> Result<(Option<LoadedAddresses>, Slot), PacketHandlingError> {
-    match view.version() {
-        TransactionVersion::Legacy | TransactionVersion::V1 => Ok((None, u64::MAX)),
-        TransactionVersion::V0 => bank
-            .load_addresses_from_ref(view.address_table_lookup_iter())
-            .map(|(loaded_addresses, deactivation_slot)| {
-                (Some(loaded_addresses), deactivation_slot)
-            })
-            .map_err(|_| PacketHandlingError::ALTResolution),
-    }
-}
-
-/// Given the epoch, the minimum deactivation slot, and the current slot,
-/// return the `MaxAge` that should be used for the transaction. This is used
-/// to determine the maximum slot that a transaction will be considered valid
-/// for, without re-resolving addresses or resanitizing.
-///
-/// This function considers the deactivation period of Address Table
-/// accounts. If the deactivation period runs past the end of the epoch,
-/// then the transaction is considered valid until the end of the epoch.
-/// Otherwise, the transaction is considered valid until the deactivation
-/// period.
-///
-/// Since the deactivation period technically uses blocks rather than
-/// slots, the value used here is the lower-bound on the deactivation
-/// period, i.e. the transaction's address lookups are valid until
-/// AT LEAST this slot.
-fn calculate_max_age(
-    sanitized_epoch: Epoch,
-    deactivation_slot: Slot,
-    current_slot: Slot,
-) -> MaxAge {
-    let alt_min_expire_slot = estimate_last_valid_slot(deactivation_slot.min(current_slot));
-    MaxAge {
-        sanitized_epoch,
-        alt_invalidation_slot: alt_min_expire_slot,
     }
 }
 
@@ -639,30 +445,6 @@ mod tests {
         receive_and_buffer
             .receive_and_buffer_packets(container, &BufferedPacketsDecision::Hold)
             .unwrap()
-    }
-
-    #[test]
-    fn test_calculate_max_age() {
-        let current_slot = 100;
-        let sanitized_epoch = 10;
-
-        // ALT deactivation slot is delayed
-        assert_eq!(
-            calculate_max_age(sanitized_epoch, current_slot - 1, current_slot),
-            MaxAge {
-                sanitized_epoch,
-                alt_invalidation_slot: current_slot - 1 + solana_slot_hashes::get_entries() as u64,
-            }
-        );
-
-        // no deactivation slot
-        assert_eq!(
-            calculate_max_age(sanitized_epoch, u64::MAX, current_slot),
-            MaxAge {
-                sanitized_epoch,
-                alt_invalidation_slot: current_slot + solana_slot_hashes::get_entries() as u64,
-            }
-        );
     }
 
     #[test]
@@ -1506,6 +1288,47 @@ mod tests {
 
         assert!(container.is_queued(&current_nonce_entry));
 
+        verify_container(&mut container, 1);
+    }
+
+    // nonce conflict filtering happens before blockhash/nonce and fee-payer validation
+    #[test]
+    fn test_receive_and_buffer_nonce_dedup_precedes_bank_validation() {
+        let (sender, receiver) = bounded(1024);
+        let (bank_forks, mint_keypair) = test_bank_forks_with_fee();
+        let (mut receive_and_buffer, mut container) =
+            setup_transaction_view_receive_and_buffer(receiver, bank_forks.clone());
+        let (nonce_pubkey, durable) = create_nonce_identity(&bank_forks, &mint_keypair.pubkey());
+
+        send_transactions(
+            &sender,
+            &[create_nonce_transaction(
+                &mint_keypair,
+                &nonce_pubkey,
+                HIGH_FEE,
+                durable,
+            )],
+        );
+        assert_eq!(
+            receive(&mut receive_and_buffer, &mut container).num_buffered,
+            1
+        );
+
+        send_transactions(
+            &sender,
+            &[create_nonce_transaction(
+                &mint_keypair,
+                &nonce_pubkey,
+                LOW_FEE,
+                Hash::new_unique(),
+            )],
+        );
+        let stats = receive(&mut receive_and_buffer, &mut container);
+
+        assert_eq!(stats.num_dropped_on_nonce_dedup, 1);
+        assert_eq!(stats.num_dropped_on_age, 0);
+        assert_eq!(stats.num_dropped_on_fee_payer, 0);
+        assert_eq!(stats.num_buffered, 0);
         verify_container(&mut container, 1);
     }
 
