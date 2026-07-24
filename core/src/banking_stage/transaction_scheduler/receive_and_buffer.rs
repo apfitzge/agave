@@ -1,28 +1,26 @@
 use {
     super::{
-        ingress_check::{
-            IngressCheckError, PacketHandlingError, check_parsed_transaction, parse_transaction,
-        },
+        check_worker::{CheckWork, CheckWorkerPool},
+        ingress_check::{CheckedTransaction, IngressCheckError, PacketHandlingError},
         transaction_priority_id::TransactionPriorityId,
         transaction_state_container::{StateContainer, TransactionViewStateContainer},
     },
     crate::banking_stage::{decision_maker::BufferedPacketsDecision, packet_bytes},
-    agave_banking_stage_ingress_types::{BankingPacketBatch, BankingPacketReceiver},
+    agave_banking_stage_ingress_types::{
+        BankingPacketBatch, BankingPacketReceiver, SchedulerPriorityFloor,
+    },
     agave_transaction_view::resolved_transaction_view::ResolvedTransactionView,
     core::time::Duration,
-    crossbeam_channel::{RecvTimeoutError, TryRecvError},
+    crossbeam_channel::{RecvTimeoutError, TryRecvError, TrySendError},
     solana_perf::packet::bytes::Bytes,
     solana_pubkey::Pubkey,
-    solana_runtime::{
-        bank::Bank,
-        bank_forks::{BankPair, SharableBanks},
-    },
+    solana_runtime::bank_forks::SharableBanks,
     solana_runtime_transaction::{
         runtime_transaction::RuntimeTransaction, transaction_with_meta::TransactionWithMeta,
     },
     solana_svm_transaction::svm_message::SVMMessage,
     solana_transaction_error::TransactionError,
-    std::{collections::HashSet, sync::Arc, time::Instant},
+    std::{collections::HashSet, num::NonZeroUsize, sync::Arc, time::Instant},
 };
 
 #[derive(Debug)]
@@ -92,26 +90,6 @@ impl ReceivingStats {
             _ => {}
         }
     }
-
-    fn accumulate(&mut self, other: ReceivingStats) {
-        self.num_received += other.num_received;
-        self.num_dropped_without_parsing += other.num_dropped_without_parsing;
-        self.num_dropped_on_parsing_and_sanitization +=
-            other.num_dropped_on_parsing_and_sanitization;
-        self.num_dropped_on_lock_validation += other.num_dropped_on_lock_validation;
-        self.num_dropped_on_compute_budget += other.num_dropped_on_compute_budget;
-        self.num_dropped_on_age += other.num_dropped_on_age;
-        self.num_dropped_on_already_processed += other.num_dropped_on_already_processed;
-        self.num_dropped_on_fee_payer += other.num_dropped_on_fee_payer;
-        self.num_dropped_on_filter_key += other.num_dropped_on_filter_key;
-        self.num_dropped_on_capacity += other.num_dropped_on_capacity;
-        self.num_dropped_on_nonce_dedup += other.num_dropped_on_nonce_dedup;
-        self.num_buffered += other.num_buffered;
-        self.num_evicted_on_nonce_dedup += other.num_evicted_on_nonce_dedup;
-
-        self.receive_time_us += other.receive_time_us;
-        self.buffer_time_us += other.buffer_time_us;
-    }
 }
 
 pub(crate) trait ReceiveAndBuffer {
@@ -125,12 +103,34 @@ pub(crate) trait ReceiveAndBuffer {
         container: &mut Self::Container,
         decision: &BufferedPacketsDecision,
     ) -> Result<ReceivingStats, DisconnectedError>;
+
+    fn drain_check_results(
+        &mut self,
+        container: &mut Self::Container,
+        decision: &BufferedPacketsDecision,
+    ) -> ReceivingStats;
 }
 
 pub(crate) struct TransactionViewReceiveAndBuffer {
-    pub receiver: BankingPacketReceiver,
-    pub sharable_banks: SharableBanks,
-    pub filter_keys: Arc<HashSet<Pubkey>>,
+    receiver: BankingPacketReceiver,
+    check_workers: CheckWorkerPool,
+    priority_floor: Arc<SchedulerPriorityFloor>,
+}
+
+impl TransactionViewReceiveAndBuffer {
+    pub(crate) fn new(
+        receiver: BankingPacketReceiver,
+        sharable_banks: SharableBanks,
+        filter_keys: Arc<HashSet<Pubkey>>,
+        num_check_workers: NonZeroUsize,
+        priority_floor: Arc<SchedulerPriorityFloor>,
+    ) -> Self {
+        Self {
+            receiver,
+            check_workers: CheckWorkerPool::new(num_check_workers, sharable_banks, filter_keys),
+            priority_floor,
+        }
+    }
 }
 
 impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
@@ -142,78 +142,57 @@ impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
         container: &mut Self::Container,
         decision: &BufferedPacketsDecision,
     ) -> Result<ReceivingStats, DisconnectedError> {
-        let BankPair {
-            root_bank,
-            working_bank,
-        } = self.sharable_banks.load();
-
-        // Receive packet batches.
         const RECV_TIMEOUT: Duration = Duration::from_millis(10);
-        const PACKET_BURST_TIMEOUT: Duration = Duration::from_millis(1);
-        const PACKET_BURST_LIMIT: usize = 1000;
-        let start = Instant::now();
+        const MAX_PACKET_RECEIVES: usize = 512;
 
         let mut received_message = false;
         let mut stats = ReceivingStats::default();
+        let should_check = !matches!(decision, BufferedPacketsDecision::Forward);
 
         // If not leader/unknown, do a blocking-receive initially. This lets
         // the thread sleep until a message is received, or until the timeout.
-        // Additionally, only sleep if the container is empty.
+        // Do not pop from ingress when the check-work queue is full.
         let mut timed_out = false;
-        if container.is_empty()
-            && matches!(
-                decision,
-                BufferedPacketsDecision::Forward | BufferedPacketsDecision::ForwardAndHold
-            )
-        {
+        let should_block = match decision {
+            BufferedPacketsDecision::Forward => true,
+            BufferedPacketsDecision::ForwardAndHold => self.check_capacity() > 0,
+            BufferedPacketsDecision::Consume(_) | BufferedPacketsDecision::Hold => false,
+        };
+        if container.is_empty() && should_block {
             // TODO: Is it better to manually sleep instead, avoiding the locking
             //       overhead for wakers? But then risk not waking up when message
             //       received - as long as sleep is somewhat short, this should be
             //       fine.
             match self.receiver.recv_timeout(RECV_TIMEOUT) {
-                Ok(packet_batch_message) => {
+                Ok(batch) => {
                     received_message = true;
-                    stats.accumulate(self.handle_packet_batch_message(
-                        container,
-                        decision,
-                        &root_bank,
-                        &working_bank,
-                        packet_batch_message,
-                    ));
+                    self.process_packet_batch(batch, should_check, &mut stats)?;
                 }
                 Err(RecvTimeoutError::Timeout) => timed_out = true,
-                Err(RecvTimeoutError::Disconnected) => {
-                    if !received_message {
-                        return Err(DisconnectedError);
-                    }
-                }
+                Err(RecvTimeoutError::Disconnected) => return Err(DisconnectedError),
             }
         }
 
         if !timed_out {
-            while start.elapsed() < PACKET_BURST_TIMEOUT && stats.num_received < PACKET_BURST_LIMIT
-            {
+            // This is a soft limit: finish the current batch before checking it again.
+            while stats.num_received < MAX_PACKET_RECEIVES {
+                if should_check && self.check_capacity() == 0 {
+                    break;
+                }
+
                 let receive_start = Instant::now();
                 match self.receiver.try_recv() {
-                    Ok(packet_batch_message) => {
+                    Ok(batch) => {
                         stats.receive_time_us += receive_start.elapsed().as_micros() as u64;
                         received_message = true;
-                        let batch_stats = self.handle_packet_batch_message(
-                            container,
-                            decision,
-                            &root_bank,
-                            &working_bank,
-                            packet_batch_message,
-                        );
-                        stats.accumulate(batch_stats);
+                        self.process_packet_batch(batch, should_check, &mut stats)?;
                     }
-                    Err(TryRecvError::Empty) => {
-                        break;
-                    }
+                    Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
-                        if !received_message {
+                        if !received_message && stats.num_received == 0 {
                             return Err(DisconnectedError);
                         }
+                        break;
                     }
                 }
             }
@@ -221,102 +200,139 @@ impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
 
         Ok(stats)
     }
+
+    fn drain_check_results(
+        &mut self,
+        container: &mut Self::Container,
+        decision: &BufferedPacketsDecision,
+    ) -> ReceivingStats {
+        const MAX_CHECK_RESULTS: usize = 1024;
+
+        let start = Instant::now();
+        let mut stats = ReceivingStats::default();
+        let should_buffer = !matches!(decision, BufferedPacketsDecision::Forward);
+
+        for _ in 0..MAX_CHECK_RESULTS {
+            let Ok(result) = self.check_workers.result_receiver.try_recv() else {
+                break;
+            };
+            if !should_buffer {
+                stats.num_dropped_without_parsing += 1;
+                continue;
+            }
+
+            match result {
+                Ok(transaction) => {
+                    Self::admit_checked_transaction(transaction, container, &mut stats)
+                }
+                Err(err) => stats.add_ingress_check_error(&err),
+            }
+        }
+
+        stats.buffer_time_us = start.elapsed().as_micros() as u64;
+        stats
+    }
 }
 
 impl TransactionViewReceiveAndBuffer {
-    /// Return number of received packets.
-    fn handle_packet_batch_message(
-        &mut self,
-        container: &mut TransactionViewStateContainer,
-        decision: &BufferedPacketsDecision,
-        root_bank: &Bank,
-        working_bank: &Bank,
-        packet_batch_message: BankingPacketBatch,
-    ) -> ReceivingStats {
-        let start = Instant::now();
-        // If outside holding window, do not parse.
-        let should_parse = !matches!(decision, BufferedPacketsDecision::Forward);
+    fn check_capacity(&self) -> usize {
+        self.check_workers
+            .work_sender
+            .capacity()
+            .expect("check-work queue must be bounded")
+            .saturating_sub(self.check_workers.work_sender.len())
+    }
 
-        let mut receiving_stats = ReceivingStats::default();
-
-        for packet in packet_batch_message.iter() {
+    fn process_packet_batch(
+        &self,
+        batch: BankingPacketBatch,
+        should_check: bool,
+        stats: &mut ReceivingStats,
+    ) -> Result<(), DisconnectedError> {
+        for packet in batch.iter() {
             let Some(packet_data) = packet.data(..) else {
                 continue;
             };
 
-            receiving_stats.num_received += 1;
-            if !should_parse {
-                receiving_stats.num_dropped_without_parsing += 1;
+            stats.num_received += 1;
+            if !should_check {
+                stats.num_dropped_without_parsing += 1;
                 continue;
             }
 
-            let bytes = packet_bytes(packet, packet_data);
-            let parsed_transaction =
-                match parse_transaction(bytes, root_bank, working_bank, &self.filter_keys) {
-                    // Successful parse, ALT resolution, and static checks.
-                    Ok(parsed_transaction) => parsed_transaction,
-                    Err(ref err) => {
-                        receiving_stats.add_ingress_check_error(err);
-                        continue;
-                    }
-                };
-            let priority = parsed_transaction.priority();
-
-            // Drop the transaction if it looks nonce-like and a higher-or-equal-priority
-            // nonce transaction using the same nonce is queued, or any conflicting nonce
-            // transaction is in flight.
-            let drop_incoming_nonce_tx = parsed_transaction
-                .raw_nonce_address()
-                .and_then(|address| container.get_nonce_transaction_priority_id(address))
-                .is_some_and(|existing| {
-                    existing.priority >= priority || !container.is_queued(existing)
-                });
-
-            if drop_incoming_nonce_tx {
-                receiving_stats.num_dropped_on_nonce_dedup += 1;
-                continue;
+            let work = CheckWork {
+                bytes: packet_bytes(packet, packet_data),
+                priority_floor: self.priority_floor.get(),
+            };
+            match self.check_workers.work_sender.try_send(work) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => stats.num_dropped_on_capacity += 1,
+                Err(TrySendError::Disconnected(_)) => return Err(DisconnectedError),
             }
-
-            let checked_transaction =
-                match check_parsed_transaction(parsed_transaction, working_bank) {
-                    Ok(checked_transaction) => checked_transaction,
-                    Err(ref err) => {
-                        receiving_stats.add_ingress_check_error(err);
-                        continue;
-                    }
-                };
-            let (state, is_validated_nonce) = checked_transaction.into_parts();
-            let validated_nonce_address = is_validated_nonce.then(|| {
-                *state
-                    .transaction()
-                    .get_durable_nonce()
-                    .expect("validated nonce transaction must contain a nonce address")
-            });
-            let transaction_id = container.insert_map_only(state);
-            let priority_id = TransactionPriorityId::new(priority, transaction_id);
-
-            // A validated nonce transaction is higher priority than any queued
-            // conflict. Evict that conflict only after all ingress checks passed.
-            if let Some(nonce_address) = validated_nonce_address {
-                if let Some(existing_nonce_priority_id) =
-                    container.get_nonce_transaction_priority_id(&nonce_address)
-                {
-                    receiving_stats.num_evicted_on_nonce_dedup += 1;
-                    container.remove_by_id(existing_nonce_priority_id.id);
-                }
-                container.set_nonce_transaction_priority_id(&nonce_address, priority_id);
-            }
-
-            // Transaction is already fully validated and can be inserted into priority queue.
-            receiving_stats.num_dropped_on_capacity +=
-                container.push_ids_into_queue(std::iter::once(priority_id));
-
-            receiving_stats.num_buffered += 1;
         }
 
-        // `receive_time_us` is set outside this function
-        receiving_stats.buffer_time_us = start.elapsed().as_micros() as u64;
-        receiving_stats
+        Ok(())
+    }
+
+    fn admit_checked_transaction(
+        checked_transaction: CheckedTransaction,
+        container: &mut TransactionViewStateContainer,
+        stats: &mut ReceivingStats,
+    ) {
+        let CheckedTransaction {
+            state,
+            is_validated_nonce,
+        } = checked_transaction;
+        let priority = state.priority();
+
+        // Reject a nonce-like transaction if a higher-or-equal-priority conflict
+        // is queued, or any conflict is already in flight.
+        let nonce_priority = state
+            .transaction()
+            .get_durable_nonce()
+            .map(|address| (*address, priority));
+        if Self::should_drop_nonce(nonce_priority, container) {
+            stats.num_dropped_on_nonce_dedup += 1;
+            return;
+        }
+
+        let validated_nonce_address = is_validated_nonce.then(|| {
+            *state
+                .transaction()
+                .get_durable_nonce()
+                .expect("validated nonce transaction must contain a nonce address")
+        });
+        let transaction_id = container.insert_map_only(state);
+        let priority_id = TransactionPriorityId::new(priority, transaction_id);
+
+        // A validated nonce transaction is higher priority than any queued
+        // conflict. Evict that conflict only after all ingress checks passed.
+        if let Some(nonce_address) = validated_nonce_address {
+            if let Some(existing_nonce_priority_id) =
+                container.get_nonce_transaction_priority_id(&nonce_address)
+            {
+                stats.num_evicted_on_nonce_dedup += 1;
+                container.remove_by_id(existing_nonce_priority_id.id);
+            }
+            container.set_nonce_transaction_priority_id(&nonce_address, priority_id);
+        }
+
+        stats.num_dropped_on_capacity +=
+            container.push_ids_into_queue(std::iter::once(priority_id));
+        stats.num_buffered += 1;
+    }
+
+    fn should_drop_nonce(
+        nonce_priority: Option<(Pubkey, u64)>,
+        container: &TransactionViewStateContainer,
+    ) -> bool {
+        nonce_priority.is_some_and(|(address, priority)| {
+            container
+                .get_nonce_transaction_priority_id(&address)
+                .is_some_and(|existing| {
+                    existing.priority >= priority || !container.is_queued(existing)
+                })
+        })
     }
 }
 
@@ -342,7 +358,7 @@ mod tests {
         solana_packet::{Meta, PACKET_DATA_SIZE},
         solana_perf::packet::{Packet, PacketBatch, RecycledPacketBatch},
         solana_pubkey::Pubkey,
-        solana_runtime::bank_forks::BankForks,
+        solana_runtime::{bank::Bank, bank_forks::BankForks},
         solana_sdk_ids::system_program,
         solana_signer::Signer,
         solana_system_interface::instruction as system_instruction,
@@ -396,11 +412,13 @@ mod tests {
         TransactionViewReceiveAndBuffer,
         TransactionViewStateContainer,
     ) {
-        let receive_and_buffer = TransactionViewReceiveAndBuffer {
+        let receive_and_buffer = TransactionViewReceiveAndBuffer::new(
             receiver,
-            sharable_banks: bank_forks.read().unwrap().sharable_banks(),
+            bank_forks.read().unwrap().sharable_banks(),
             filter_keys,
-        };
+            NonZeroUsize::new(1).unwrap(),
+            Arc::new(SchedulerPriorityFloor::default()),
+        );
         let container = TransactionViewStateContainer::with_capacity(TEST_CONTAINER_CAPACITY);
         (receive_and_buffer, container)
     }
@@ -439,13 +457,68 @@ mod tests {
         sender.send(to_banking_packet_batch(transactions)).unwrap();
     }
 
+    fn accumulate_stats(stats: &mut ReceivingStats, other: ReceivingStats) {
+        stats.num_received += other.num_received;
+        stats.num_dropped_without_parsing += other.num_dropped_without_parsing;
+        stats.num_dropped_on_parsing_and_sanitization +=
+            other.num_dropped_on_parsing_and_sanitization;
+        stats.num_dropped_on_lock_validation += other.num_dropped_on_lock_validation;
+        stats.num_dropped_on_compute_budget += other.num_dropped_on_compute_budget;
+        stats.num_dropped_on_age += other.num_dropped_on_age;
+        stats.num_dropped_on_already_processed += other.num_dropped_on_already_processed;
+        stats.num_dropped_on_fee_payer += other.num_dropped_on_fee_payer;
+        stats.num_dropped_on_filter_key += other.num_dropped_on_filter_key;
+        stats.num_dropped_on_capacity += other.num_dropped_on_capacity;
+        stats.num_dropped_on_nonce_dedup += other.num_dropped_on_nonce_dedup;
+        stats.num_buffered += other.num_buffered;
+        stats.num_evicted_on_nonce_dedup += other.num_evicted_on_nonce_dedup;
+        stats.receive_time_us += other.receive_time_us;
+        stats.buffer_time_us += other.buffer_time_us;
+    }
+
+    fn num_check_results(stats: &ReceivingStats) -> usize {
+        stats.num_dropped_without_parsing
+            + stats.num_dropped_on_parsing_and_sanitization
+            + stats.num_dropped_on_lock_validation
+            + stats.num_dropped_on_compute_budget
+            + stats.num_dropped_on_age
+            + stats.num_dropped_on_already_processed
+            + stats.num_dropped_on_fee_payer
+            + stats.num_dropped_on_filter_key
+            + stats.num_dropped_on_nonce_dedup
+            + stats.num_buffered
+    }
+
     fn receive(
         receive_and_buffer: &mut TransactionViewReceiveAndBuffer,
         container: &mut TransactionViewStateContainer,
     ) -> ReceivingStats {
-        receive_and_buffer
-            .receive_and_buffer_packets(container, &BufferedPacketsDecision::Hold)
-            .unwrap()
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut stats = ReceivingStats::default();
+        loop {
+            accumulate_stats(
+                &mut stats,
+                receive_and_buffer.drain_check_results(container, &BufferedPacketsDecision::Hold),
+            );
+            accumulate_stats(
+                &mut stats,
+                receive_and_buffer
+                    .receive_and_buffer_packets(container, &BufferedPacketsDecision::Hold)
+                    .unwrap(),
+            );
+
+            if receive_and_buffer.receiver.is_empty()
+                && num_check_results(&stats) == stats.num_received
+            {
+                return stats;
+            }
+
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for check-worker results"
+            );
+            std::thread::yield_now();
+        }
     }
 
     #[test]
@@ -459,6 +532,68 @@ mod tests {
         let r = receive_and_buffer
             .receive_and_buffer_packets(&mut container, &BufferedPacketsDecision::Hold);
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn full_check_queue_does_not_pop_ingress() {
+        let (packet_sender, receiver) = bounded(1);
+        packet_sender
+            .send(to_single_banking_packet_batch(&Transaction::default()))
+            .unwrap();
+        let (work_sender, _work_receiver) = bounded(1);
+        work_sender
+            .send(CheckWork {
+                bytes: Bytes::new(),
+                priority_floor: 0,
+            })
+            .unwrap();
+        let (_result_sender, result_receiver) = bounded(1);
+        let mut receive_and_buffer = TransactionViewReceiveAndBuffer {
+            receiver,
+            check_workers: CheckWorkerPool {
+                work_sender,
+                result_receiver,
+            },
+            priority_floor: Arc::new(SchedulerPriorityFloor::default()),
+        };
+        let mut container = TransactionViewStateContainer::with_capacity(1);
+
+        let stats = receive_and_buffer
+            .receive_and_buffer_packets(&mut container, &BufferedPacketsDecision::Hold)
+            .unwrap();
+
+        assert_eq!(stats.num_received, 0);
+        assert_eq!(receive_and_buffer.receiver.len(), 1);
+    }
+
+    #[test]
+    fn partial_batch_tail_is_dropped_when_check_queue_fills() {
+        let (packet_sender, receiver) = bounded(1);
+        packet_sender
+            .send(to_banking_packet_batch(&[
+                Transaction::default(),
+                Transaction::default(),
+            ]))
+            .unwrap();
+        let (work_sender, work_receiver) = bounded(1);
+        let (_result_sender, result_receiver) = bounded(1);
+        let mut receive_and_buffer = TransactionViewReceiveAndBuffer {
+            receiver,
+            check_workers: CheckWorkerPool {
+                work_sender,
+                result_receiver,
+            },
+            priority_floor: Arc::new(SchedulerPriorityFloor::default()),
+        };
+        let mut container = TransactionViewStateContainer::with_capacity(1);
+
+        let first = receive_and_buffer
+            .receive_and_buffer_packets(&mut container, &BufferedPacketsDecision::Hold)
+            .unwrap();
+        assert_eq!(first.num_received, 2);
+        assert_eq!(first.num_dropped_on_capacity, 1);
+        assert!(receive_and_buffer.receiver.is_empty());
+        assert_eq!(work_receiver.len(), 1);
     }
 
     #[test]
@@ -552,9 +687,7 @@ mod tests {
             num_evicted_on_nonce_dedup,
             receive_time_us: _,
             buffer_time_us: _,
-        } = receive_and_buffer
-            .receive_and_buffer_packets(&mut container, &BufferedPacketsDecision::Hold)
-            .unwrap();
+        } = receive(&mut receive_and_buffer, &mut container);
 
         assert_eq!(num_received, 0);
         assert_eq!(num_dropped_without_parsing, 0);
@@ -600,9 +733,7 @@ mod tests {
             num_evicted_on_nonce_dedup,
             receive_time_us: _,
             buffer_time_us: _,
-        } = receive_and_buffer
-            .receive_and_buffer_packets(&mut container, &BufferedPacketsDecision::Hold)
-            .unwrap();
+        } = receive(&mut receive_and_buffer, &mut container);
 
         assert_eq!(num_received, 1);
         assert_eq!(num_dropped_without_parsing, 0);
@@ -647,9 +778,7 @@ mod tests {
             num_evicted_on_nonce_dedup,
             receive_time_us: _,
             buffer_time_us: _,
-        } = receive_and_buffer
-            .receive_and_buffer_packets(&mut container, &BufferedPacketsDecision::Hold)
-            .unwrap();
+        } = receive(&mut receive_and_buffer, &mut container);
 
         assert_eq!(num_received, 1);
         assert_eq!(num_dropped_without_parsing, 0);
@@ -699,9 +828,7 @@ mod tests {
             num_evicted_on_nonce_dedup,
             receive_time_us: _,
             buffer_time_us: _,
-        } = receive_and_buffer
-            .receive_and_buffer_packets(&mut container, &BufferedPacketsDecision::Hold)
-            .unwrap();
+        } = receive(&mut receive_and_buffer, &mut container);
 
         assert_eq!(num_received, 1);
         assert_eq!(num_dropped_without_parsing, 0);
@@ -766,9 +893,7 @@ mod tests {
             num_evicted_on_nonce_dedup,
             receive_time_us: _,
             buffer_time_us: _,
-        } = receive_and_buffer
-            .receive_and_buffer_packets(&mut container, &BufferedPacketsDecision::Hold)
-            .unwrap();
+        } = receive(&mut receive_and_buffer, &mut container);
 
         assert_eq!(num_received, 1);
         assert_eq!(num_dropped_without_parsing, 0);
@@ -818,9 +943,7 @@ mod tests {
             num_evicted_on_nonce_dedup,
             receive_time_us: _,
             buffer_time_us: _,
-        } = receive_and_buffer
-            .receive_and_buffer_packets(&mut container, &BufferedPacketsDecision::Hold)
-            .unwrap();
+        } = receive(&mut receive_and_buffer, &mut container);
 
         assert_eq!(num_received, 1);
         assert_eq!(num_dropped_without_parsing, 0);
@@ -884,9 +1007,7 @@ mod tests {
         let packet_batch = to_single_banking_packet_batch(&transaction);
         sender.send(packet_batch).unwrap();
 
-        let stats = receive_and_buffer
-            .receive_and_buffer_packets(&mut container, &BufferedPacketsDecision::Hold)
-            .unwrap();
+        let stats = receive(&mut receive_and_buffer, &mut container);
 
         assert_eq!(stats.num_received, 1);
         assert_eq!(stats.num_dropped_on_age, 0);
@@ -915,9 +1036,7 @@ mod tests {
         let packet_batch = to_single_banking_packet_batch(&transaction);
         sender.send(packet_batch).unwrap();
 
-        let stats = receive_and_buffer
-            .receive_and_buffer_packets(&mut container, &BufferedPacketsDecision::Hold)
-            .unwrap();
+        let stats = receive(&mut receive_and_buffer, &mut container);
 
         assert_eq!(stats.num_received, 1);
         assert_eq!(stats.num_dropped_on_filter_key, 1);
@@ -946,9 +1065,7 @@ mod tests {
         let packet_batch = to_single_banking_packet_batch(&transaction);
         sender.send(packet_batch).unwrap();
 
-        let stats = receive_and_buffer
-            .receive_and_buffer_packets(&mut container, &BufferedPacketsDecision::Hold)
-            .unwrap();
+        let stats = receive(&mut receive_and_buffer, &mut container);
 
         assert_eq!(stats.num_received, 1);
         assert_eq!(stats.num_dropped_on_filter_key, 1);
@@ -976,9 +1093,7 @@ mod tests {
         let packet_batch = to_single_banking_packet_batch(&transaction);
         sender.send(packet_batch).unwrap();
 
-        let stats = receive_and_buffer
-            .receive_and_buffer_packets(&mut container, &BufferedPacketsDecision::Hold)
-            .unwrap();
+        let stats = receive(&mut receive_and_buffer, &mut container);
 
         assert_eq!(stats.num_received, 1);
         assert_eq!(stats.num_dropped_on_filter_key, 0);
@@ -1022,9 +1137,7 @@ mod tests {
             num_evicted_on_nonce_dedup,
             receive_time_us: _,
             buffer_time_us: _,
-        } = receive_and_buffer
-            .receive_and_buffer_packets(&mut container, &BufferedPacketsDecision::Hold)
-            .unwrap();
+        } = receive(&mut receive_and_buffer, &mut container);
 
         assert_eq!(num_received, num_transactions);
         assert_eq!(num_dropped_without_parsing, 0);
@@ -1106,9 +1219,7 @@ mod tests {
             num_evicted_on_nonce_dedup,
             receive_time_us: _,
             buffer_time_us: _,
-        } = receive_and_buffer
-            .receive_and_buffer_packets(&mut container, &BufferedPacketsDecision::Hold)
-            .unwrap();
+        } = receive(&mut receive_and_buffer, &mut container);
 
         assert_eq!(num_received, 1);
         assert_eq!(num_dropped_without_parsing, 0);
@@ -1292,9 +1403,9 @@ mod tests {
         verify_container(&mut container, 1);
     }
 
-    // nonce conflict filtering happens before blockhash/nonce and fee-payer validation
+    // Workers validate the blockhash/nonce before scheduler-side nonce deduplication.
     #[test]
-    fn test_receive_and_buffer_nonce_dedup_precedes_bank_validation() {
+    fn test_receive_and_buffer_bank_validation_precedes_nonce_dedup() {
         let (sender, receiver) = bounded(1024);
         let (bank_forks, mint_keypair) = test_bank_forks_with_fee();
         let (mut receive_and_buffer, mut container) =
@@ -1326,8 +1437,8 @@ mod tests {
         );
         let stats = receive(&mut receive_and_buffer, &mut container);
 
-        assert_eq!(stats.num_dropped_on_nonce_dedup, 1);
-        assert_eq!(stats.num_dropped_on_age, 0);
+        assert_eq!(stats.num_dropped_on_nonce_dedup, 0);
+        assert_eq!(stats.num_dropped_on_age, 1);
         assert_eq!(stats.num_dropped_on_fee_payer, 0);
         assert_eq!(stats.num_buffered, 0);
         verify_container(&mut container, 1);

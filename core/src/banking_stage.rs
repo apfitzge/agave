@@ -512,11 +512,14 @@ impl BankingStage {
 
         // Setup receive & buffer.
         let sharable_banks = self.bank_forks.read().unwrap().sharable_banks();
-        let receive_and_buffer = TransactionViewReceiveAndBuffer {
-            receiver: self.non_vote_receiver.clone(),
-            sharable_banks: sharable_banks.clone(),
-            filter_keys: self.filter_keys.clone(),
-        };
+        let priority_floor = self.priority_floor.clone();
+        let receive_and_buffer = TransactionViewReceiveAndBuffer::new(
+            self.non_vote_receiver.clone(),
+            sharable_banks.clone(),
+            self.filter_keys.clone(),
+            scheduler_config.num_check_workers,
+            priority_floor.clone(),
+        );
 
         // Spawn vote worker.
         let mut threads = Vec::with_capacity(num_workers + 2);
@@ -567,7 +570,6 @@ impl BankingStage {
             finished_work_receiver,
             GreedySchedulerConfig::default(),
         );
-        let priority_floor = self.priority_floor.clone();
         let exit = exit.clone();
         let shutdown_signal = self.banking_shutdown_signal.clone();
         threads.push(

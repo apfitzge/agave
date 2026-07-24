@@ -255,6 +255,7 @@ where
             }
 
             self.receive_completed()?;
+            let check_result_stats = self.drain_check_results(&decision);
             let scheduled = self.process_transactions(&decision, cost_pacer.as_ref(), &now)?;
             if scheduled == 0 {
                 let (_, clean_time_us) = measure_us!(self.incremental_recheck());
@@ -272,7 +273,11 @@ where
             self.count_metrics.update(|count_metrics| {
                 count_metrics.update_priority_stats(priority_min_max);
             });
-            self.update_scheduler_priority_floor(receiving_stats.num_dropped_on_capacity);
+            self.update_scheduler_priority_floor(
+                check_result_stats
+                    .num_dropped_on_capacity
+                    .saturating_add(receiving_stats.num_dropped_on_capacity),
+            );
             self.count_metrics
                 .maybe_report_and_reset_interval(should_report);
             self.timing_metrics
@@ -458,7 +463,19 @@ where
         let receiving_stats = self
             .receive_and_buffer
             .receive_and_buffer_packets(&mut self.container, decision)?;
+        self.update_receiving_metrics(&receiving_stats);
+        Ok(receiving_stats)
+    }
 
+    fn drain_check_results(&mut self, decision: &BufferedPacketsDecision) -> ReceivingStats {
+        let receiving_stats = self
+            .receive_and_buffer
+            .drain_check_results(&mut self.container, decision);
+        self.update_receiving_metrics(&receiving_stats);
+        receiving_stats
+    }
+
+    fn update_receiving_metrics(&mut self, receiving_stats: &ReceivingStats) {
         self.count_metrics.update(|count_metrics| {
             let ReceivingStats {
                 num_received,
@@ -499,8 +516,6 @@ where
             timing_metrics.receive_time_us += receiving_stats.receive_time_us;
             timing_metrics.buffer_time_us += receiving_stats.buffer_time_us;
         });
-
-        Ok(receiving_stats)
     }
 }
 
@@ -598,11 +613,13 @@ mod tests {
         receiver: BankingPacketReceiver,
         bank_forks: Arc<RwLock<BankForks>>,
     ) -> TransactionViewReceiveAndBuffer {
-        TransactionViewReceiveAndBuffer {
+        TransactionViewReceiveAndBuffer::new(
             receiver,
-            sharable_banks: bank_forks.read().unwrap().sharable_banks(),
-            filter_keys: Arc::default(),
-        }
+            bank_forks.read().unwrap().sharable_banks(),
+            Arc::default(),
+            NonZeroUsize::new(1).unwrap(),
+            Arc::new(SchedulerPriorityFloor::default()),
+        )
     }
 
     #[allow(clippy::type_complexity)]
@@ -731,9 +748,7 @@ mod tests {
         banking_packet_sender
             .send(to_banking_packet_batch(&[transaction]))
             .unwrap();
-        scheduler_controller
-            .receive_and_buffer_packets(&BufferedPacketsDecision::Hold)
-            .unwrap();
+        test_receive_all(&mut scheduler_controller, &BufferedPacketsDecision::Hold);
 
         assert!(
             scheduler_controller
@@ -768,9 +783,7 @@ mod tests {
         banking_packet_sender
             .send(to_banking_packet_batch(std::slice::from_ref(&transaction)))
             .unwrap();
-        scheduler_controller
-            .receive_and_buffer_packets(&BufferedPacketsDecision::Hold)
-            .unwrap();
+        test_receive_all(&mut scheduler_controller, &BufferedPacketsDecision::Hold);
 
         assert!(
             scheduler_controller
@@ -790,6 +803,52 @@ mod tests {
         );
     }
 
+    fn test_receive_all<R: ReceiveAndBuffer>(
+        scheduler_controller: &mut SchedulerController<R, impl Scheduler<R::Transaction>>,
+        decision: &BufferedPacketsDecision,
+    ) {
+        fn count_check_results(stats: &ReceivingStats) -> usize {
+            stats.num_dropped_without_parsing
+                + stats.num_dropped_on_parsing_and_sanitization
+                + stats.num_dropped_on_lock_validation
+                + stats.num_dropped_on_compute_budget
+                + stats.num_dropped_on_age
+                + stats.num_dropped_on_already_processed
+                + stats.num_dropped_on_fee_payer
+                + stats.num_dropped_on_filter_key
+                + stats.num_dropped_on_nonce_dedup
+                + stats.num_buffered
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut num_received = 0;
+        let mut num_check_results = 0;
+        loop {
+            let check_result_stats = scheduler_controller.drain_check_results(decision);
+            let stats = scheduler_controller
+                .receive_and_buffer_packets(decision)
+                .unwrap();
+            if num_received == 0
+                && num_check_results == 0
+                && stats.num_received == 0
+                && count_check_results(&check_result_stats) == 0
+            {
+                return;
+            }
+            num_received += stats.num_received;
+            num_check_results += count_check_results(&check_result_stats);
+            if num_received > 0 && num_check_results == num_received {
+                return;
+            }
+
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for check-worker results"
+            );
+            std::thread::yield_now();
+        }
+    }
+
     // Helper function to let test receive and then schedule packets.
     // The order of operations here is convenient for testing, but does not
     // match the order of operations in the actual scheduler.
@@ -806,15 +865,7 @@ mod tests {
         assert!(matches!(decision, BufferedPacketsDecision::Consume(_)));
         assert!(scheduler_controller.receive_completed().is_ok());
 
-        // Time is not a reliable way for deterministic testing.
-        // Loop here until no more packets are received, this avoids parallel
-        // tests from inconsistently timing out and not receiving
-        // from the channel.
-        while scheduler_controller
-            .receive_and_buffer_packets(&decision)
-            .map(|n| n.num_received > 0)
-            .unwrap_or_default()
-        {}
+        test_receive_all(scheduler_controller, &decision);
         let now = Instant::now();
         let slot_time = decision
             .bank()

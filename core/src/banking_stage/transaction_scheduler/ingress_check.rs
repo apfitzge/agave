@@ -47,8 +47,8 @@ pub(crate) enum PacketHandlingError {
 }
 
 pub(crate) struct CheckedTransaction {
-    state: TransactionViewState,
-    is_validated_nonce: bool,
+    pub(crate) state: TransactionViewState,
+    pub(crate) is_validated_nonce: bool,
 }
 
 pub(crate) struct ParsedTransaction {
@@ -58,16 +58,6 @@ pub(crate) struct ParsedTransaction {
 impl ParsedTransaction {
     pub(crate) fn priority(&self) -> u64 {
         self.state.priority()
-    }
-
-    pub(crate) fn raw_nonce_address(&self) -> Option<&Pubkey> {
-        self.state.transaction().get_durable_nonce()
-    }
-}
-
-impl CheckedTransaction {
-    pub(crate) fn into_parts(self) -> (TransactionViewState, bool) {
-        (self.state, self.is_validated_nonce)
     }
 }
 
@@ -287,7 +277,10 @@ mod tests {
 
         let parsed_transaction = parse_transaction(bytes, &bank, &bank, &HashSet::new()).unwrap();
         let checked_transaction = check_parsed_transaction(parsed_transaction, &bank).unwrap();
-        let (state, is_validated_nonce) = checked_transaction.into_parts();
+        let CheckedTransaction {
+            state,
+            is_validated_nonce,
+        } = checked_transaction;
 
         assert_runtime_view(state.transaction());
         assert_eq!(state.transaction().data().as_ptr(), bytes_ptr);

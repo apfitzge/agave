@@ -1,5 +1,4 @@
 mod batch_id_generator;
-#[allow(dead_code)] // Used by the controller-side ingress integration.
 pub(crate) mod check_worker;
 pub(crate) mod greedy_scheduler;
 mod in_flight_tracker;
