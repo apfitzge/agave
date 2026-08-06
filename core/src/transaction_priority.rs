@@ -17,19 +17,45 @@ use {
 pub(crate) struct TransactionPriorityResourceLimits {
     block_cost: u64,
     block_bytes: u64,
+    penalize_alt_lookups: bool,
 }
 
 impl TransactionPriorityResourceLimits {
     pub(crate) fn for_bank(bank: &Bank) -> Self {
         let block_cost = bank.read_cost_tracker().unwrap().get_block_limit();
         let block_bytes = bank.max_entry_bytes_per_slot();
+        let penalize_alt_lookups = bank.feature_set.snapshot().enable_tx_v1;
         debug_assert!(block_cost > 0);
         debug_assert!(block_bytes > 0);
         Self {
             block_cost,
             block_bytes,
+            penalize_alt_lookups,
         }
     }
+}
+
+const ALT_LOOKUP_PUBKEY_BYTE_PENALTY: u64 = 32;
+
+fn prioritized_transaction_bytes<Tx: SVMStaticMessage>(
+    transaction: &Tx,
+    serialized_bytes: u64,
+    penalize_alt_lookups: bool,
+) -> u64 {
+    if !penalize_alt_lookups {
+        return serialized_bytes;
+    }
+
+    let num_looked_up_pubkeys =
+        transaction
+            .message_address_table_lookups()
+            .fold(0u64, |num_looked_up_pubkeys, lookup| {
+                num_looked_up_pubkeys
+                    .saturating_add(lookup.writable_indexes.len() as u64)
+                    .saturating_add(lookup.readonly_indexes.len() as u64)
+            });
+    serialized_bytes
+        .saturating_add(num_looked_up_pubkeys.saturating_mul(ALT_LOOKUP_PUBKEY_BYTE_PENALTY))
 }
 
 /// Calculate transaction priority from its reward and consumption of the two
@@ -38,20 +64,22 @@ impl TransactionPriorityResourceLimits {
 /// Serialized bytes are converted to cost-model units using the ratio of the
 /// block limits. Cross multiplication retains the fractional byte cost instead
 /// of rounding it before calculating priority.
-pub(crate) fn calculate_priority(
+/// This affects transaction ordering only; hard byte accounting continues to
+/// use the actual serialized transaction size.
+fn calculate_priority(
     reward: u64,
     cost: u64,
-    transaction_bytes: u64,
+    prioritized_bytes: u64,
     resource_limits: TransactionPriorityResourceLimits,
 ) -> u64 {
     const MULTIPLIER: u64 = 1_000_000;
 
     // This is equivalent to:
-    // reward * MULTIPLIER / (cost + 1 + transaction_bytes * block_cost / block_bytes)
+    // reward * MULTIPLIER / (cost + 1 + prioritized_bytes * block_cost / block_bytes)
     let denominator = u128::from(cost.saturating_add(1))
         .saturating_mul(u128::from(resource_limits.block_bytes))
         .saturating_add(
-            u128::from(transaction_bytes).saturating_mul(u128::from(resource_limits.block_cost)),
+            u128::from(prioritized_bytes).saturating_mul(u128::from(resource_limits.block_cost)),
         );
     let priority = u128::from(reward)
         .saturating_mul(u128::from(MULTIPLIER))
@@ -60,6 +88,21 @@ pub(crate) fn calculate_priority(
         .unwrap_or(0);
 
     priority.min(u128::from(u64::MAX)) as u64
+}
+
+pub(crate) fn calculate_priority_for_transaction<Tx: SVMStaticMessage>(
+    transaction: &Tx,
+    reward: u64,
+    cost: u64,
+    serialized_bytes: u64,
+    resource_limits: TransactionPriorityResourceLimits,
+) -> u64 {
+    let prioritized_bytes = prioritized_transaction_bytes(
+        transaction,
+        serialized_bytes,
+        resource_limits.penalize_alt_lookups,
+    );
+    calculate_priority(reward, cost, prioritized_bytes, resource_limits)
 }
 
 /// Calculate priority and cost for a transaction:
@@ -71,8 +114,10 @@ pub(crate) fn calculate_priority(
 /// The priority is calculated as:
 /// P = R / (1 + C + B * L_C / L_B)
 /// where P is the priority, R is the reward,
-/// C is the cost towards the block cost limit, B is the serialized transaction
+/// C is the cost towards the block cost limit, B is the prioritized transaction
 /// size, L_C is the block cost limit, and L_B is the block entry-bytes limit.
+/// Once txv1 is enabled, B includes a 32-byte penalty for each pubkey loaded
+/// through an address lookup table.
 ///
 /// The +1 explicitly avoids division by zero. Giving the normalized resource
 /// terms equal weight means that consuming the same fraction of either block
@@ -102,7 +147,13 @@ pub(crate) fn calculate_priority_and_cost<Tx: TransactionMeta + SVMStaticMessage
         .get_deposit();
 
     (
-        calculate_priority(reward, cost, transaction_bytes, resource_limits),
+        calculate_priority_for_transaction(
+            transaction,
+            reward,
+            cost,
+            transaction_bytes,
+            resource_limits,
+        ),
         cost,
     )
 }
@@ -142,11 +193,16 @@ pub(crate) fn calculate_priority_from_bytes(
 mod tests {
     use {
         super::*,
+        agave_transaction_view::resolved_transaction_view::ResolvedTransactionView,
         solana_compute_budget_interface::ComputeBudgetInstruction,
         solana_hash::Hash,
+        solana_instruction::{AccountMeta, Instruction},
         solana_keypair::Keypair,
         solana_ledger::genesis_utils::{GenesisConfigInfo, create_genesis_config},
-        solana_message::Message,
+        solana_message::{
+            AddressLookupTableAccount, Message, VersionedMessage,
+            v0::{self, LoadedAddresses},
+        },
         solana_pubkey::Pubkey,
         solana_signer::Signer,
         solana_system_interface::instruction as system_instruction,
@@ -178,7 +234,32 @@ mod tests {
         let prioritization = ComputeBudgetInstruction::set_compute_unit_price(compute_unit_price);
         let message = Message::new(&[transfer, prioritization], Some(&mint.pubkey()));
         let tx = Transaction::new(&[mint], message, recent_blockhash);
-        bincode::serialize(&VersionedTransaction::from(tx)).unwrap()
+        wincode::serialize(&VersionedTransaction::from(tx)).unwrap()
+    }
+
+    fn make_v0_tx_bytes(mint: &Keypair, recent_blockhash: Hash) -> Vec<u8> {
+        let writable = Pubkey::new_unique();
+        let readonly = Pubkey::new_unique();
+        let instruction = Instruction::new_with_bytes(
+            Pubkey::new_unique(),
+            &[],
+            vec![
+                AccountMeta::new(writable, false),
+                AccountMeta::new_readonly(readonly, false),
+            ],
+        );
+        let message = v0::Message::try_compile(
+            &mint.pubkey(),
+            &[instruction],
+            &[AddressLookupTableAccount {
+                key: Pubkey::new_unique(),
+                addresses: vec![writable, readonly],
+            }],
+            recent_blockhash,
+        )
+        .unwrap();
+        let tx = VersionedTransaction::try_new(VersionedMessage::V0(message), &[mint]).unwrap();
+        wincode::serialize(&tx).unwrap()
     }
 
     fn priority_from(bank: &Bank, bytes: &[u8]) -> u64 {
@@ -260,6 +341,7 @@ mod tests {
         let resource_limits = TransactionPriorityResourceLimits {
             block_cost: 100_000_000,
             block_bytes: 20 * 1024 * 1024,
+            penalize_alt_lookups: false,
         };
 
         assert_eq!(
@@ -275,6 +357,7 @@ mod tests {
         let resource_limits = TransactionPriorityResourceLimits {
             block_cost: 100_000_000,
             block_bytes: 20 * 1024 * 1024,
+            penalize_alt_lookups: false,
         };
         let smaller = calculate_priority(5_000, 20_000, 500, resource_limits);
         let larger = calculate_priority(5_000, 20_000, 1_000, resource_limits);
@@ -287,6 +370,7 @@ mod tests {
         let resource_limits = TransactionPriorityResourceLimits {
             block_cost: 1_000,
             block_bytes: 100,
+            penalize_alt_lookups: false,
         };
 
         // cost + 1 consumes 1% of the cost limit, and one byte consumes 1%
@@ -294,5 +378,65 @@ mod tests {
         let cost_only = calculate_priority(1_000, 9, 0, resource_limits);
         let cost_and_bytes = calculate_priority(1_000, 9, 1, resource_limits);
         assert_eq!(cost_only, cost_and_bytes * 2);
+    }
+
+    #[test]
+    fn alt_lookup_byte_penalty_requires_tx_v1_feature() {
+        let GenesisConfigInfo {
+            genesis_config,
+            mint_keypair: mint,
+            ..
+        } = create_genesis_config(u64::MAX);
+        let mut bank = Bank::new_for_tests(&genesis_config);
+        let bytes = make_v0_tx_bytes(&mint, bank.last_blockhash());
+        let view =
+            SanitizedTransactionView::try_new_sanitized(&bytes[..], &sanitize_config()).unwrap();
+        let runtime_tx = RuntimeTransaction::<SanitizedTransactionView<_>>::try_new(
+            view,
+            MessageHash::Compute,
+            None,
+        )
+        .unwrap();
+        let serialized_bytes = bytes.len() as u64;
+
+        bank.deactivate_feature(&agave_feature_set::enable_tx_v1::id());
+        let resource_limits = TransactionPriorityResourceLimits::for_bank(&bank);
+        assert_eq!(
+            prioritized_transaction_bytes(
+                &runtime_tx,
+                serialized_bytes,
+                resource_limits.penalize_alt_lookups,
+            ),
+            serialized_bytes,
+        );
+
+        bank.activate_feature(&agave_feature_set::enable_tx_v1::id());
+        let resource_limits = TransactionPriorityResourceLimits::for_bank(&bank);
+        assert_eq!(
+            prioritized_transaction_bytes(
+                &runtime_tx,
+                serialized_bytes,
+                resource_limits.penalize_alt_lookups,
+            ),
+            serialized_bytes + 2 * ALT_LOOKUP_PUBKEY_BYTE_PENALTY,
+        );
+
+        let resolved_tx = RuntimeTransaction::<ResolvedTransactionView<_>>::try_new(
+            runtime_tx,
+            Some(LoadedAddresses {
+                writable: vec![Pubkey::new_unique()],
+                readonly: vec![Pubkey::new_unique()],
+            }),
+            bank.get_reserved_account_keys(),
+        )
+        .unwrap();
+        assert_eq!(
+            prioritized_transaction_bytes(
+                &resolved_tx,
+                serialized_bytes,
+                resource_limits.penalize_alt_lookups,
+            ),
+            serialized_bytes + 2 * ALT_LOOKUP_PUBKEY_BYTE_PENALTY,
+        );
     }
 }

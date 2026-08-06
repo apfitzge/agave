@@ -5,7 +5,7 @@ use {
     crate::{
         next_leader::next_leaders,
         transaction_priority::{
-            TransactionPriorityResourceLimits, calculate_priority as calculate_transaction_priority,
+            TransactionPriorityResourceLimits, calculate_priority_for_transaction,
         },
     },
     agave_banking_stage_ingress_types::BankingPacketBatch,
@@ -602,8 +602,10 @@ impl NotifyKeyUpdate for TpuClientNextClient {
 /// The priority is calculated as:
 /// P = R / (1 + C + B * L_C / L_B)
 /// where P is the priority, R is the reward,
-/// C is the cost towards the block cost limit, B is the serialized transaction
+/// C is the cost towards the block cost limit, B is the prioritized transaction
 /// size, L_C is the block cost limit, and L_B is the block entry-bytes limit.
+/// Once txv1 is enabled, B includes a 32-byte penalty for each pubkey loaded
+/// through an address lookup table.
 ///
 /// The +1 explicitly avoids division by zero. Giving the normalized resource
 /// terms equal weight means that consuming the same fraction of either block
@@ -638,7 +640,8 @@ fn calculate_priority(
         &bank.feature_set,
     );
 
-    Some(calculate_transaction_priority(
+    Some(calculate_priority_for_transaction(
+        transaction,
         reward,
         cost.sum(),
         transaction_bytes,
