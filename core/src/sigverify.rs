@@ -8,7 +8,7 @@ use {
         transaction_priority::calculate_priority_from_bytes,
     },
     agave_banking_stage_ingress_types::{BankingPacketBatch, SchedulerPriorityFloor},
-    crossbeam_channel::{Receiver, Sender, TrySendError, bounded},
+    crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounded},
     solana_measure::measure_us,
     solana_perf::{
         deduper::{self, Deduper},
@@ -130,26 +130,8 @@ impl GossipSigVerifier {
 /// Gossip votes use a bounded queue into the worker pool.
 const SIGVERIFY_GOSSIP_VOTE_WORK_CHANNEL_SIZE: usize = 50_000;
 
-pub(crate) struct SigVerifyWorkerSenders {
-    pub(crate) gossip_verified_vote_sender: Sender<GossipVerifiedVoteBatch>,
-    pub(crate) forward_stage_sender: Sender<(BankingPacketBatch, bool)>,
-}
-
-#[derive(Clone)]
-struct WorkerPoolChannels {
-    non_vote_receiver: Receiver<PacketBatch>,
-    tpu_vote_receiver: Receiver<PacketBatch>,
-    gossip_receiver: Receiver<GossipVerifyTask>,
-    gossip_verified_vote_sender: Sender<GossipVerifiedVoteBatch>,
-    forward_stage_sender: Sender<(BankingPacketBatch, bool)>,
-    sharable_banks: SharableBanks,
-    non_vote_state: SigVerifyWorkerState,
-    tpu_vote_state: SigVerifyWorkerState,
-}
-
 pub(crate) struct SigVerifyWorkerPool {
     exit: Arc<AtomicBool>,
-    gossip_sender: Sender<GossipVerifyTask>,
     worker_hdls: Vec<JoinHandle<()>>,
 }
 
@@ -165,102 +147,103 @@ impl Drop for SigVerifyWorkerPool {
 }
 
 impl SigVerifyWorkerPool {
-    pub(crate) fn new(
+    #[cfg(test)]
+    pub(crate) fn num_workers(&self) -> usize {
+        self.worker_hdls.len()
+    }
+
+    fn new<T, F>(
         num_workers: NonZeroUsize,
-        non_vote_receiver: Receiver<PacketBatch>,
-        tpu_vote_receiver: Receiver<PacketBatch>,
-        senders: SigVerifyWorkerSenders,
-        forward_non_votes: bool,
-        sharable_banks: SharableBanks,
-        non_vote_state: SigVerifyWorkerState,
-        tpu_vote_state: SigVerifyWorkerState,
-    ) -> Self {
-        let (gossip_sender, gossip_receiver) = bounded(SIGVERIFY_GOSSIP_VOTE_WORK_CHANNEL_SIZE);
-        let channels = WorkerPoolChannels {
-            non_vote_receiver,
-            tpu_vote_receiver,
-            gossip_receiver,
-            gossip_verified_vote_sender: senders.gossip_verified_vote_sender,
-            forward_stage_sender: senders.forward_stage_sender,
-            sharable_banks,
-            non_vote_state,
-            tpu_vote_state,
-        };
+        thread_name_prefix: &'static str,
+        receiver: Receiver<T>,
+        process: F,
+    ) -> Self
+    where
+        T: Send + 'static,
+        F: Fn(T) -> bool + Clone + Send + 'static,
+    {
         let exit = Arc::new(AtomicBool::new(false));
         let worker_hdls = (0..num_workers.get())
             .map(|idx| {
                 let exit = exit.clone();
-                let channels = channels.clone();
-
+                let receiver = receiver.clone();
+                let process = process.clone();
                 std::thread::Builder::new()
-                    .name(format!("solSigVerify{idx:02}"))
-                    .spawn(move || Self::worker(exit, channels, forward_non_votes))
+                    .name(format!("{thread_name_prefix}{idx:02}"))
+                    .spawn(move || {
+                        while !exit.load(Ordering::Relaxed) {
+                            match receiver.recv_timeout(Duration::from_millis(10)) {
+                                Ok(work) => {
+                                    if !process(work) {
+                                        break;
+                                    }
+                                }
+                                Err(RecvTimeoutError::Timeout) => {}
+                                Err(RecvTimeoutError::Disconnected) => break,
+                            }
+                        }
+                    })
                     .expect("failed to spawn sigverify worker thread")
             })
             .collect();
-        Self {
-            exit,
-            gossip_sender,
-            worker_hdls,
-        }
+        Self { exit, worker_hdls }
     }
 
-    pub(crate) fn gossip_verifier(&self) -> GossipSigVerifier {
-        GossipSigVerifier {
-            worker_sender: self.gossip_sender.clone(),
-        }
+    pub(crate) fn new_non_vote(
+        num_workers: NonZeroUsize,
+        receiver: Receiver<PacketBatch>,
+        forward_stage_sender: Sender<(BankingPacketBatch, bool)>,
+        forward_non_votes: bool,
+        sharable_banks: SharableBanks,
+        state: SigVerifyWorkerState,
+    ) -> Self {
+        Self::new(num_workers, "solSigVerify", receiver, move |batch| {
+            Self::run_transaction_task(
+                batch,
+                false,
+                &forward_stage_sender,
+                forward_non_votes,
+                false,
+                &sharable_banks,
+                &state,
+            )
+        })
     }
 
-    fn worker(exit: Arc<AtomicBool>, channels: WorkerPoolChannels, forward_non_votes: bool) {
-        while !exit.load(Ordering::Relaxed) {
-            if !Self::worker_iteration(&channels, forward_non_votes) {
-                break;
-            }
-        }
+    pub(crate) fn new_tpu_vote(
+        num_workers: NonZeroUsize,
+        receiver: Receiver<PacketBatch>,
+        forward_stage_sender: Sender<(BankingPacketBatch, bool)>,
+        sharable_banks: SharableBanks,
+        state: SigVerifyWorkerState,
+    ) -> Self {
+        Self::new(num_workers, "solSigVerVote", receiver, move |batch| {
+            Self::run_transaction_task(
+                batch,
+                true,
+                &forward_stage_sender,
+                true,
+                true,
+                &sharable_banks,
+                &state,
+            )
+        })
     }
 
-    /// Returns false if some channel connection is disconnected.
-    fn worker_iteration(channels: &WorkerPoolChannels, forward_non_votes: bool) -> bool {
-        crossbeam_channel::select! {
-            recv(&channels.non_vote_receiver) -> maybe_work => {
-                match maybe_work {
-                    Ok(batch) => Self::run_transaction_task(
-                        batch,
-                        false,
-                        &channels.forward_stage_sender,
-                        forward_non_votes,
-                        false,
-                        &channels.sharable_banks,
-                        &channels.non_vote_state,
-                    ),
-                    Err(_) => false,
-                }
-            }
-            recv(&channels.tpu_vote_receiver) -> maybe_work => {
-                match maybe_work {
-                    Ok(batch) => Self::run_transaction_task(
-                        batch,
-                        true,
-                        &channels.forward_stage_sender,
-                        true,
-                        true,
-                        &channels.sharable_banks,
-                        &channels.tpu_vote_state,
-                    ),
-                    Err(_) => false,
-                }
-            }
-            recv(&channels.gossip_receiver) -> maybe_work => {
-                match maybe_work {
-                    Ok(work) => Self::run_gossip_task(
-                        work,
-                        &channels.gossip_verified_vote_sender,
-                    ),
-                    Err(_) => false,
-                }
-            }
-            default(Duration::from_millis(10)) => { true }
-        }
+    pub(crate) fn new_gossip(
+        num_workers: NonZeroUsize,
+        verified_vote_sender: Sender<GossipVerifiedVoteBatch>,
+    ) -> (Self, GossipSigVerifier) {
+        let (gossip_sender, receiver) = bounded(SIGVERIFY_GOSSIP_VOTE_WORK_CHANNEL_SIZE);
+        let pool = Self::new(num_workers, "solSigVerGsp", receiver, move |work| {
+            Self::run_gossip_task(work, &verified_vote_sender)
+        });
+        (
+            pool,
+            GossipSigVerifier {
+                worker_sender: gossip_sender,
+            },
+        )
     }
 
     fn run_transaction_task(

@@ -328,8 +328,8 @@ struct TpuSigverifyThreadsArg;
 impl ThreadArg for TpuSigverifyThreadsArg {
     const NAME: &'static str = "tpu_sigverify_threads";
     const LONG_NAME: &'static str = "tpu-sigverify-threads";
-    const HELP: &'static str =
-        "Number of threads to use for performing signature verification of received transactions";
+    const HELP: &'static str = "Number of threads to use for performing signature verification of \
+                                received non-vote transactions";
 
     fn default() -> usize {
         get_thread_count()

@@ -629,7 +629,7 @@ pub struct ValidatorTpuConfig {
     pub tpu_fwd_quic_server_config: SwQosQuicStreamerConfig,
     /// QUIC server config for Vote
     pub vote_quic_server_config: SimpleQosQuicStreamerConfig,
-    /// Number of threads to use for signature verification
+    /// Number of threads to use for non-vote signature verification
     pub sigverify_threads: NonZeroUsize,
 }
 

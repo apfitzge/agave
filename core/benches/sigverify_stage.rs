@@ -86,6 +86,8 @@ fn bench_sigverify_stage(bencher: &mut Bencher, use_same_tx: bool) {
         tpu_vote_s,
         forward_stage_s,
         NonZeroUsize::new(sigverify::threadpool_for_benches().current_num_threads()).unwrap(),
+        NonZeroUsize::new(1).unwrap(),
+        NonZeroUsize::new(1).unwrap(),
         false,
         sharable_banks,
         None,

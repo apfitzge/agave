@@ -93,6 +93,9 @@ const TPU_CHANNEL_SIZE: usize = 50_000;
 /// Chosen based on nominal voting load for a cluster with ~2000 validators + some margin.
 pub(crate) const TPU_VOTE_CHANNEL_SIZE: usize = 4_000;
 
+const TPU_VOTE_SIGVERIFY_THREADS: NonZeroUsize = NonZeroUsize::new(8).unwrap();
+const GOSSIP_VOTE_SIGVERIFY_THREADS: NonZeroUsize = NonZeroUsize::new(8).unwrap();
+
 /// Size of the channel between the TPU forwards streamer and the fetch stage.
 /// Mirrors `TPU_CHANNEL_SIZE`; the streamer uses `try_send`, so an over-full
 /// channel drops packets (tracked via streamer metrics) rather than blocking.
@@ -287,6 +290,8 @@ impl Tpu {
             tpu_vote_sender,
             forward_stage_sender.clone(),
             tpu_sigverify_threads,
+            TPU_VOTE_SIGVERIFY_THREADS,
+            GOSSIP_VOTE_SIGVERIFY_THREADS,
             enable_block_production_forwarding,
             bank_forks.read().unwrap().sharable_banks(),
             Some(scheduler_priority_floor.clone()),

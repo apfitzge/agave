@@ -7,8 +7,8 @@ use {
     crate::{
         banking_trace::BankingPacketSender,
         sigverify::{
-            GossipSigVerifier, GossipVerifiedVoteBatch, SigVerifyWorkerPool,
-            SigVerifyWorkerSenders, SigVerifyWorkerState, SigVerifyWorkerStats,
+            GossipSigVerifier, GossipVerifiedVoteBatch, SigVerifyWorkerPool, SigVerifyWorkerState,
+            SigVerifyWorkerStats,
         },
     },
     agave_banking_stage_ingress_types::{BankingPacketBatch, SchedulerPriorityFloor},
@@ -42,8 +42,10 @@ const DEDUPER_FALSE_POSITIVE_RATE: f64 = 0.001;
 pub struct SigVerifyStage {
     exit: Arc<AtomicBool>,
     servicer_thread_hdl: Option<JoinHandle<()>>,
-    // pool held so workers stay alive. If dropped, workers in pool shut down.
-    _worker_pool: SigVerifyWorkerPool,
+    // Pools are held so workers stay alive. Dropping the pools signals and joins the workers.
+    _non_vote_worker_pool: SigVerifyWorkerPool,
+    _tpu_vote_worker_pool: SigVerifyWorkerPool,
+    _gossip_worker_pool: SigVerifyWorkerPool,
 }
 
 pub struct GossipSigVerifyHandle {
@@ -152,7 +154,9 @@ impl SigVerifyStage {
         non_vote_sender: BankingPacketSender,
         tpu_vote_sender: BankingPacketSender,
         forward_stage_sender: Sender<(BankingPacketBatch, bool)>,
-        num_workers: NonZeroUsize,
+        num_non_vote_workers: NonZeroUsize,
+        num_tpu_vote_workers: NonZeroUsize,
+        num_gossip_vote_workers: NonZeroUsize,
         forward_non_votes: bool,
         sharable_banks: SharableBanks,
         scheduler_priority_floor: Option<Arc<SchedulerPriorityFloor>>,
@@ -164,16 +168,12 @@ impl SigVerifyStage {
         let mut rng = rand::rng();
         let non_vote_deduper = Arc::new(Deduper::<2, [u8]>::new(&mut rng, DEDUPER_NUM_BITS));
         let tpu_vote_deduper = Arc::new(Deduper::<2, [u8]>::new(&mut rng, DEDUPER_NUM_BITS));
-        let worker_pool = SigVerifyWorkerPool::new(
-            num_workers,
+        let non_vote_worker_pool = SigVerifyWorkerPool::new_non_vote(
+            num_non_vote_workers,
             packet_receiver,
-            vote_packet_receiver,
-            SigVerifyWorkerSenders {
-                gossip_verified_vote_sender,
-                forward_stage_sender,
-            },
+            forward_stage_sender.clone(),
             forward_non_votes,
-            sharable_banks,
+            sharable_banks.clone(),
             SigVerifyWorkerState::new(
                 non_vote_sender,
                 non_vote_deduper.clone(),
@@ -195,6 +195,12 @@ impl SigVerifyStage {
                 },
                 scheduler_priority_floor,
             ),
+        );
+        let tpu_vote_worker_pool = SigVerifyWorkerPool::new_tpu_vote(
+            num_tpu_vote_workers,
+            vote_packet_receiver,
+            forward_stage_sender,
+            sharable_banks,
             SigVerifyWorkerState::new(
                 tpu_vote_sender,
                 tpu_vote_deduper.clone(),
@@ -217,6 +223,8 @@ impl SigVerifyStage {
                 None, // votes are not dropped for priority-floor
             ),
         );
+        let (gossip_worker_pool, gossip_verifier) =
+            SigVerifyWorkerPool::new_gossip(num_gossip_vote_workers, gossip_verified_vote_sender);
         let servicer_thread_hdl = Self::servicer(
             exit.clone(),
             ServicerState {
@@ -231,7 +239,7 @@ impl SigVerifyStage {
             },
         );
         let gossip_sigverify_handle = GossipSigVerifyHandle {
-            verifier: worker_pool.gossip_verifier(),
+            verifier: gossip_verifier,
             verified_vote_receiver,
         };
 
@@ -239,12 +247,15 @@ impl SigVerifyStage {
             Self {
                 exit,
                 servicer_thread_hdl: Some(servicer_thread_hdl),
-                _worker_pool: worker_pool,
+                _non_vote_worker_pool: non_vote_worker_pool,
+                _tpu_vote_worker_pool: tpu_vote_worker_pool,
+                _gossip_worker_pool: gossip_worker_pool,
             },
             gossip_sigverify_handle,
         )
     }
 
+    /// Joins all stage threads.
     pub fn join(mut self) -> thread::Result<()> {
         self.join_servicer_thread()
     }
@@ -366,6 +377,8 @@ mod tests {
         solana_signer::Signer,
         solana_system_interface::instruction as system_instruction,
         solana_transaction::versioned::VersionedTransaction,
+        solana_vote::vote_transaction,
+        solana_vote_program::vote_state::TowerSync,
         test_case::test_case,
     };
 
@@ -421,6 +434,8 @@ mod tests {
             tpu_vote_s,
             forward_stage_s,
             NonZeroUsize::new(4).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
             false,
             sharable_banks,
             None,
@@ -469,6 +484,73 @@ mod tests {
         stage.join().unwrap();
     }
 
+    #[test]
+    fn test_sigverify_stage_dedicated_worker_pools() {
+        let (_bank, bank_forks) =
+            Bank::new_with_bank_forks_for_tests(&create_genesis_config(1).genesis_config);
+        let sharable_banks = bank_forks.read().unwrap().sharable_banks();
+        let (packet_s, packet_r) = bounded(1024);
+        let (vote_packet_s, vote_packet_r) = bounded(1024);
+        let (non_vote_s, non_vote_r) = BankingTracer::channel_for_test();
+        let (tpu_vote_s, tpu_vote_r) = BankingTracer::channel_for_test();
+        let (forward_stage_s, _forward_stage_r) = bounded(1024);
+        let (stage, mut gossip_sigverify_handle) = SigVerifyStage::new(
+            packet_r,
+            vote_packet_r,
+            non_vote_s,
+            tpu_vote_s,
+            forward_stage_s,
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(3).unwrap(),
+            NonZeroUsize::new(4).unwrap(),
+            false,
+            sharable_banks,
+            None,
+        );
+
+        assert_eq!(stage._non_vote_worker_pool.num_workers(), 2);
+        assert_eq!(stage._tpu_vote_worker_pool.num_workers(), 3);
+        assert_eq!(stage._gossip_worker_pool.num_workers(), 4);
+
+        let non_vote_batch = to_packet_batches(&[test_tx()], 1).pop().unwrap();
+        packet_s.send(non_vote_batch).unwrap();
+        let verified_non_votes = non_vote_r.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert_eq!(verified_non_votes.len(), 1);
+        assert!(!verified_non_votes.get(0).unwrap().meta().discard());
+
+        let node_keypair = Keypair::new();
+        let vote_keypair = Keypair::new();
+        let vote_tx = vote_transaction::new_tower_sync_transaction(
+            TowerSync::new_from_slot(0, Hash::new_unique()),
+            Hash::new_unique(),
+            &node_keypair,
+            &vote_keypair,
+            &vote_keypair,
+            None,
+        );
+        let vote_batch = to_packet_batches(std::slice::from_ref(&vote_tx), 1)
+            .pop()
+            .unwrap();
+        vote_packet_s.send(vote_batch).unwrap();
+        let verified_tpu_votes = tpu_vote_r.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert_eq!(verified_tpu_votes.len(), 1);
+        assert!(!verified_tpu_votes.get(0).unwrap().meta().discard());
+
+        let gossip_batches = to_packet_batches(std::slice::from_ref(&vote_tx), 1);
+        let (verified_gossip_votes, verified_gossip_batches) = gossip_sigverify_handle
+            .verify_and_receive_votes(vec![vote_tx], gossip_batches)
+            .unwrap();
+        assert_eq!(verified_gossip_votes.len(), 1);
+        assert_eq!(verified_gossip_batches.len(), 1);
+        assert!(!verified_gossip_batches[0].get(0).unwrap().meta().discard());
+
+        // Pool shutdown must not depend on disconnecting the input channels first.
+        stage.join().unwrap();
+        drop(packet_s);
+        drop(vote_packet_s);
+        drop(gossip_sigverify_handle);
+    }
+
     #[test_case(false, false; "tx_v1_disabled")]
     #[test_case(true, true; "tx_v1_enabled")]
     fn test_sigverify_stage_tx_v1_feature_gate(enable_tx_v1: bool, expect_v1_output: bool) {
@@ -492,6 +574,8 @@ mod tests {
             verified_s,
             tpu_vote_s,
             forward_stage_s,
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
             NonZeroUsize::new(1).unwrap(),
             false,
             sharable_banks,
