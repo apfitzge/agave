@@ -89,8 +89,8 @@ fn handle_packet_batch(
     // room as possible.
     allocator.clean_remote_free_lists();
 
-    // Sync producer queue with reader so we have as much room as possible.
-    producer.sync();
+    // Sync once and publish the entire packet batch together.
+    let mut write_batch = producer.write_batch();
 
     for packet in packet_batch.iter() {
         // Check if the packet is valid and get the bytes.
@@ -119,16 +119,14 @@ fn handle_packet_batch(
             )
         };
 
-        if producer.try_write(message).is_err() {
+        if write_batch.try_write(message).is_err() {
             // SAFETY: `allocated_ptr` was allocated by `allocator`
             //         and not previously freed.
             unsafe { allocator.free(allocated_ptr) };
         }
     }
 
-    // Commit the messages to the producer queue.
-    // This makes the messages available to the consumer.
-    producer.commit();
+    // Dropping the write batch publishes its messages to the consumer.
 }
 
 /// # Safety:

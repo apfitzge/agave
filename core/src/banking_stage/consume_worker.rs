@@ -312,23 +312,15 @@ pub(crate) mod external {
         ) -> Result<IterationResult, ExternalConsumeWorkerError> {
             self.allocator.clean_remote_free_lists();
             if receiver.is_empty() {
-                receiver.sync();
                 *should_drain_executes = false;
             }
 
             match receiver.try_read() {
                 Some(message) => {
-                    self.sender.sync();
-
                     // Process message, if bank is unavailable enable draining for the
-                    // remainder of the current batch (i.e. what our `receiver.sync()`
-                    // fetched).
+                    // remainder of the currently observed queue batch.
                     *should_drain_executes |=
-                        self.process_message(message, *should_drain_executes)?;
-
-                    // Publish our send & read offsets.
-                    self.sender.commit();
-                    receiver.finalize();
+                        self.process_message(&message, *should_drain_executes)?;
 
                     Ok(IterationResult::ProcessedMessage)
                 }
@@ -1184,7 +1176,6 @@ pub(crate) mod external {
 
             fn send_message(&mut self, message: PackToWorkerMessage) {
                 self.pack_to_worker.try_write(message).unwrap();
-                self.pack_to_worker.commit();
             }
 
             fn iterate(&mut self) -> Result<(), ExternalConsumeWorkerError> {
@@ -1196,10 +1187,7 @@ pub(crate) mod external {
             }
 
             fn recv_response(&mut self) -> WorkerToPackMessage {
-                self.worker_to_pack.sync();
-                let message = *self.worker_to_pack.try_read().unwrap();
-                self.worker_to_pack.finalize();
-                message
+                self.worker_to_pack.try_read().unwrap()
             }
 
             fn execution_responses(
