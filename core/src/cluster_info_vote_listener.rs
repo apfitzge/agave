@@ -1109,7 +1109,7 @@ mod tests {
     };
 
     fn pre_send_for_tests(
-        verified_vote_sender: &Sender<GossipVerifiedVoteBatch>,
+        verified_vote_sender: &crate::shaq_channel::Sender<GossipVerifiedVoteBatch>,
         votes: &[Transaction],
     ) {
         let mut packet_batches = packet::to_packet_batches(votes, 1);
@@ -1138,8 +1138,8 @@ mod tests {
         votes: Vec<Transaction>,
         sharable_banks: &SharableBanks,
     ) -> (Vec<Transaction>, Vec<PacketBatch>) {
-        let (worker_sender, _worker_receiver) = bounded(1024);
-        let (verified_vote_sender, verified_vote_receiver) = bounded(1024);
+        let (worker_sender, _worker_receiver) = crate::shaq_channel::bounded(1024);
+        let (verified_vote_sender, verified_vote_receiver) = crate::shaq_channel::bounded(1024);
         let mut gossip_sigverify_handle =
             GossipSigVerifyHandle::new_for_tests(worker_sender, verified_vote_receiver);
 

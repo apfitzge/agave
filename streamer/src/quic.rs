@@ -7,9 +7,8 @@ use {
             swqos::{SwQos, SwQosConfig},
         },
         quic_socket::QuicSocket,
-        streamer::StakedNodes,
+        streamer::{ChannelSend, StakedNodes},
     },
-    crossbeam_channel::Sender,
     pem::Pem,
     quinn::{
         Endpoint, IdleTimeout, ServerConfig, VarInt,
@@ -608,13 +607,13 @@ impl QuicStreamerConfig {
 
 /// Generic function to spawn a tokio runtime with a QUIC server
 /// Generic over QoS implementation
-fn spawn_runtime_and_server<Q, C>(
+fn spawn_runtime_and_server<Q, C, S>(
     thread_name: &'static str,
     metrics_name: &'static str,
     stats: Arc<StreamerStats>,
     sockets: impl IntoIterator<Item = QuicSocket>,
     keypair: &Keypair,
-    packet_sender: Sender<PacketBatch>,
+    packet_sender: S,
     quic_server_params: QuicStreamerConfig,
     qos: Q,
     cancel: CancellationToken,
@@ -622,6 +621,7 @@ fn spawn_runtime_and_server<Q, C>(
 where
     Q: QosController<C> + Send + Sync + 'static,
     C: ConnectionContext + Send + Sync + 'static,
+    S: ChannelSend<PacketBatch> + Clone + Sync,
 {
     let runtime = rt(format!("{thread_name}Rt"), quic_server_params.num_threads);
     let result = {
@@ -658,17 +658,20 @@ where
 
 /// Spawns a tokio runtime and a streamer instance inside it.
 /// Uses Stake Weighted QoS
-pub fn spawn_stake_weighted_qos_server(
+pub fn spawn_stake_weighted_qos_server<S>(
     thread_name: &'static str,
     metrics_name: &'static str,
     sockets: impl IntoIterator<Item = QuicSocket>,
     keypair: &Keypair,
-    packet_sender: Sender<PacketBatch>,
+    packet_sender: S,
     staked_nodes: Arc<RwLock<StakedNodes>>,
     quic_server_params: QuicStreamerConfig,
     qos_config: SwQosConfig,
     cancel: CancellationToken,
-) -> Result<SpawnServerResult, QuicServerError> {
+) -> Result<SpawnServerResult, QuicServerError>
+where
+    S: ChannelSend<PacketBatch> + Clone + Sync,
+{
     let stats = Arc::<StreamerStats>::default();
     let swqos = SwQos::new(qos_config, stats.clone(), staked_nodes, cancel.clone());
     spawn_runtime_and_server(
@@ -687,17 +690,20 @@ pub fn spawn_stake_weighted_qos_server(
 /// Spawns a tokio runtime and a streamer instance inside it.
 ///
 /// Additionally returns a banlist for control over connection admission
-pub fn spawn_simple_qos_server(
+pub fn spawn_simple_qos_server<S>(
     thread_name: &'static str,
     metrics_name: &'static str,
     sockets: impl IntoIterator<Item = QuicSocket>,
     keypair: &Keypair,
-    packet_sender: Sender<PacketBatch>,
+    packet_sender: S,
     staked_nodes: Arc<RwLock<StakedNodes>>,
     quic_server_params: QuicStreamerConfig,
     qos_config: SimpleQosConfig,
     cancel: CancellationToken,
-) -> Result<(SpawnServerResult, Arc<SimpleQosBanlist>), QuicServerError> {
+) -> Result<(SpawnServerResult, Arc<SimpleQosBanlist>), QuicServerError>
+where
+    S: ChannelSend<PacketBatch> + Clone + Sync,
+{
     let server_params = SimpleQosQuicStreamerConfig {
         quic_streamer_config: quic_server_params,
         qos_config,

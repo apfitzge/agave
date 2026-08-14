@@ -4,11 +4,13 @@
 
 use {
     crate::{
-        banking_trace::BankingPacketSender, sigverify_stage::SigVerifyServiceError,
+        banking_trace::BankingPacketSender,
+        shaq_channel::{Receiver, Sender, bounded},
+        sigverify_stage::SigVerifyServiceError,
         transaction_priority::calculate_priority_from_bytes,
     },
     agave_banking_stage_ingress_types::{BankingPacketBatch, SchedulerPriorityFloor},
-    crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounded},
+    crossbeam_channel::{RecvTimeoutError, TrySendError},
     solana_measure::measure_us,
     solana_perf::{
         deduper::{self, Deduper},
@@ -128,7 +130,7 @@ impl GossipSigVerifier {
 }
 
 /// Gossip votes use a bounded queue into the worker pool.
-const SIGVERIFY_GOSSIP_VOTE_WORK_CHANNEL_SIZE: usize = 50_000;
+pub(crate) const SIGVERIFY_GOSSIP_VOTE_WORK_CHANNEL_SIZE: usize = 50_000;
 
 pub(crate) struct SigVerifyWorkerPool {
     exit: Arc<AtomicBool>,

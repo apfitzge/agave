@@ -12,7 +12,7 @@ use {
     solana_poh::poh_recorder::PohRecorder,
     solana_streamer::{
         evicting_sender::EvictingSender,
-        streamer::{self, PacketBatchReceiver, PacketBatchSender, StreamerReceiveStats},
+        streamer::{self, ChannelSend, PacketBatchReceiver, StreamerReceiveStats},
     },
     std::{
         net::UdpSocket,
@@ -99,15 +99,19 @@ impl FetchStage {
         )
     }
 
-    pub fn new_with_sender(
+    pub fn new_with_sender<S, V>(
         tpu_vote_sockets: Vec<UdpSocket>,
         exit: Arc<AtomicBool>,
-        sender: &PacketBatchSender,
-        vote_sender: &EvictingSender<PacketBatch>,
+        sender: &S,
+        vote_sender: &V,
         forward_receiver: PacketBatchReceiver,
         poh_recorder: &Arc<RwLock<PohRecorder>>,
         coalesce: Option<Duration>,
-    ) -> Self {
+    ) -> Self
+    where
+        S: ChannelSend<PacketBatch> + Clone,
+        V: ChannelSend<PacketBatch> + Clone,
+    {
         let tpu_vote_sockets = tpu_vote_sockets.into_iter().map(Arc::new).collect();
         Self::new_multi_socket(
             tpu_vote_sockets,
@@ -120,9 +124,9 @@ impl FetchStage {
         )
     }
 
-    fn handle_forwarded_packets(
+    fn handle_forwarded_packets<S: ChannelSend<PacketBatch>>(
         recvr: &PacketBatchReceiver,
-        sendr: &PacketBatchSender,
+        sendr: &S,
         poh_recorder: &Arc<RwLock<PohRecorder>>,
         stats: &mut ForwardingStats,
     ) -> Result<()> {
@@ -168,18 +172,23 @@ impl FetchStage {
         Ok(())
     }
 
-    fn new_multi_socket(
+    fn new_multi_socket<S, V>(
         tpu_vote_sockets: Vec<Arc<UdpSocket>>,
         exit: Arc<AtomicBool>,
-        sender: &PacketBatchSender,
-        vote_sender: &EvictingSender<PacketBatch>,
+        sender: &S,
+        vote_sender: &V,
         forward_receiver: PacketBatchReceiver,
         poh_recorder: &Arc<RwLock<PohRecorder>>,
         coalesce: Option<Duration>,
-    ) -> Self {
+    ) -> Self
+    where
+        S: ChannelSend<PacketBatch> + Clone,
+        V: ChannelSend<PacketBatch> + Clone,
+    {
         let recycler: PacketBatchRecycler = Recycler::new();
 
         let tpu_vote_stats = Arc::new(StreamerReceiveStats::new("tpu_vote_receiver"));
+        let vote_sender: V = vote_sender.clone();
         let tpu_vote_threads: Vec<_> = tpu_vote_sockets
             .into_iter()
             .enumerate()
@@ -198,7 +207,7 @@ impl FetchStage {
             })
             .collect();
 
-        let sender = sender.clone();
+        let sender: S = sender.clone();
         let poh_recorder = poh_recorder.clone();
 
         let fwd_thread_hdl = Builder::new()

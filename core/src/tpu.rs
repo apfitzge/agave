@@ -18,6 +18,7 @@ use {
             ForwardAddressGetter, ForwardingClientConfig, SpawnForwardingStageResult,
             spawn_forwarding_stage,
         },
+        shaq_channel::{self, EvictingSender},
         sigverify_stage::SigVerifyStage,
         staked_nodes_updater_service::StakedNodesUpdaterService,
         tpu_entry_notifier::TpuEntryNotifier,
@@ -48,7 +49,6 @@ use {
         vote_sender_types::{ReplayVoteReceiver, ReplayVoteSender},
     },
     solana_streamer::{
-        evicting_sender::EvictingSender,
         quic::{
             SimpleQosQuicStreamerConfig, SpawnServerResult, SwQosQuicStreamerConfig,
             spawn_simple_qos_server, spawn_stake_weighted_qos_server,
@@ -177,8 +177,9 @@ impl Tpu {
             vote_forwarding_client: vote_forwarding_client_socket,
         } = sockets;
 
-        let (packet_sender, packet_receiver) = bounded(TPU_CHANNEL_SIZE);
-        let (vote_packet_sender, vote_packet_receiver) = bounded(TPU_VOTE_CHANNEL_SIZE);
+        let (packet_sender, packet_receiver) = shaq_channel::bounded(TPU_CHANNEL_SIZE);
+        let (vote_packet_sender, vote_packet_receiver) =
+            shaq_channel::bounded(TPU_VOTE_CHANNEL_SIZE);
         let evicting_vote_sender =
             EvictingSender::new(vote_packet_sender.clone(), vote_packet_receiver.clone());
         let (forwarded_packet_sender, forwarded_packet_receiver) =
@@ -276,7 +277,7 @@ impl Tpu {
         )
         .unwrap();
 
-        let (forward_stage_sender, forward_stage_receiver) = bounded(50_000);
+        let (forward_stage_sender, forward_stage_receiver) = shaq_channel::bounded(50_000);
 
         // Shared between sigverify and scheduler. The scheduler publishes
         // a priority floor under saturation; sigverify reads it and drops

@@ -2,9 +2,11 @@
 //!
 
 use {
-    agave_banking_stage_ingress_types::{BankingPacketBatch, BankingPacketReceiver},
+    crate::banking_trace::BankingPacketReceiver,
+    agave_banking_stage_ingress_types::BankingPacketBatch,
     agave_scheduler_bindings::{SharableTransactionRegion, TpuToPackMessage, tpu_message_flags},
-    agave_scheduling_utils::handshake::AgaveTpuToPackSession,
+    agave_scheduling_utils::handshake::{AgaveTpuToPackSession, TPU_TO_PACK_WORKERS},
+    crossbeam_channel::RecvTimeoutError,
     rts_alloc::Allocator,
     solana_packet::PacketFlags,
     std::{
@@ -26,71 +28,81 @@ pub struct BankingPacketReceivers {
     pub tpu_vote_receiver: Option<BankingPacketReceiver>,
 }
 
-/// Spawns a thread to receive packets from TPU and send them to the external scheduler.
+/// Spawns one thread per packet receiver to send packets to the external scheduler.
 pub fn spawn(
     exit: Arc<AtomicBool>,
     shutdown_signal: CancellationToken,
     receivers: BankingPacketReceivers,
     AgaveTpuToPackSession {
-        allocator,
+        allocators,
         producer,
     }: AgaveTpuToPackSession,
-) -> JoinHandle<()> {
-    std::thread::Builder::new()
-        .name("solTpu2Pack".to_string())
-        .spawn(move || {
-            tpu_to_pack(exit, shutdown_signal, receivers, allocator, producer);
+) -> Vec<JoinHandle<()>> {
+    let done = Arc::new(AtomicBool::new(false));
+    let BankingPacketReceivers {
+        non_vote_receiver,
+        gossip_vote_receiver,
+        tpu_vote_receiver,
+    } = receivers;
+
+    let receivers: [(&str, Option<BankingPacketReceiver>); TPU_TO_PACK_WORKERS] = [
+        ("solTpu2PackNv", Some(non_vote_receiver)),
+        ("solTpu2PackGsp", gossip_vote_receiver),
+        ("solTpu2PackVote", tpu_vote_receiver),
+    ];
+    receivers
+        .into_iter()
+        .zip(allocators)
+        .filter_map(|((thread_name, receiver), allocator)| {
+            let receiver = receiver?;
+            let exit = exit.clone();
+            let done = done.clone();
+            let shutdown_signal = shutdown_signal.clone();
+            let producer = producer.clone();
+            Some(
+                std::thread::Builder::new()
+                    .name(thread_name.to_string())
+                    .spawn(move || {
+                        tpu_to_pack(exit, done, shutdown_signal, receiver, allocator, producer);
+                    })
+                    .unwrap(),
+            )
         })
-        .unwrap()
+        .collect()
 }
 
 fn tpu_to_pack(
     exit: Arc<AtomicBool>,
+    done: Arc<AtomicBool>,
     shutdown_signal: CancellationToken,
-    receivers: BankingPacketReceivers,
+    receiver: BankingPacketReceiver,
     allocator: Allocator,
-    mut producer: shaq::spsc::Producer<TpuToPackMessage>,
+    producer: shaq::mpmc::Producer<TpuToPackMessage>,
 ) {
-    // select! requires actual receivers, so in the case of None for vote receivers,
-    // we create a dummy channel that can never receive.
-    let non_vote_receiver = receivers.non_vote_receiver;
-    let gossip_vote_receiver = receivers
-        .gossip_vote_receiver
-        .unwrap_or_else(crossbeam_channel::never);
-    let tpu_vote_receiver = receivers
-        .tpu_vote_receiver
-        .unwrap_or_else(crossbeam_channel::never);
-
-    while !exit.load(Ordering::Relaxed) {
-        let packet_batch = match crossbeam_channel::select! {
-            recv(non_vote_receiver) -> msg => msg,
-            recv(gossip_vote_receiver) -> msg => msg,
-            recv(tpu_vote_receiver) -> msg => msg,
-            default(Duration::from_secs(1)) => continue,
-        } {
-            Ok(packet_batch) => packet_batch,
-            Err(crossbeam_channel::RecvError) => {
-                // Senders have been dropped, signal shutdown and exit.
+    while !exit.load(Ordering::Relaxed) && !done.load(Ordering::Relaxed) {
+        match receiver.recv_timeout(Duration::from_millis(10)) {
+            Ok(packet_batch) => {
+                handle_packet_batch(&allocator, &producer, packet_batch);
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                // Any disconnected ingress terminates all tpu-to-pack workers.
+                done.store(true, Ordering::Relaxed);
                 shutdown_signal.cancel();
-
                 break;
             }
-        };
-        handle_packet_batch(&allocator, &mut producer, packet_batch);
+        }
     }
 }
 
 fn handle_packet_batch(
     allocator: &Allocator,
-    producer: &mut shaq::spsc::Producer<TpuToPackMessage>,
+    producer: &shaq::mpmc::Producer<TpuToPackMessage>,
     packet_batch: BankingPacketBatch,
 ) {
     // Clean all remote frees in allocator so we have as much
     // room as possible.
     allocator.clean_remote_free_lists();
-
-    // Sync once and publish the entire packet batch together.
-    let mut write_batch = producer.write_batch();
 
     for packet in packet_batch.iter() {
         // Check if the packet is valid and get the bytes.
@@ -119,14 +131,12 @@ fn handle_packet_batch(
             )
         };
 
-        if write_batch.try_write(message).is_err() {
+        if producer.try_write(message).is_err() {
             // SAFETY: `allocated_ptr` was allocated by `allocator`
             //         and not previously freed.
             unsafe { allocator.free(allocated_ptr) };
         }
     }
-
-    // Dropping the write batch publishes its messages to the consumer.
 }
 
 /// # Safety:

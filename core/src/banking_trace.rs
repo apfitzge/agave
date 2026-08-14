@@ -1,13 +1,16 @@
 use {
-    agave_banking_stage_ingress_types::{BankingPacketBatch, BankingPacketReceiver},
+    crate::shaq_channel::{self, EvictingSender as ShaqEvictingSender},
+    agave_banking_stage_ingress_types::BankingPacketBatch,
     bincode::serialize_into,
     chrono::{DateTime, Local},
-    crossbeam_channel::{Receiver, SendError, TryRecvError, TrySendError, bounded},
+    crossbeam_channel::{Receiver, SendError, TryRecvError, TrySendError},
     rolling_file::{RollingCondition, RollingConditionBasic, RollingFileAppender},
     serde::{Deserialize, Serialize},
     solana_clock::Slot,
     solana_hash::Hash,
-    solana_streamer::{evicting_sender::EvictingSender, streamer::ChannelSend},
+    solana_streamer::{
+        evicting_sender::EvictingSender as CrossbeamEvictingSender, streamer::ChannelSend,
+    },
     std::{
         fs::{create_dir_all, remove_dir_all},
         io::{self, Write},
@@ -31,6 +34,7 @@ const VOTE_CHANNEL_CAPACITY: usize = 1024 * 8;
 const NON_VOTE_CHANNEL_CAPACITY: usize = 1024 * 16;
 
 pub type BankingPacketSender = TracedSender;
+pub type BankingPacketReceiver = shaq_channel::Receiver<BankingPacketBatch>;
 pub type TracerThreadResult = Result<(), TraceError>;
 pub type TracerThread = Option<JoinHandle<TracerThreadResult>>;
 pub type DirByteLimit = u64;
@@ -58,7 +62,7 @@ pub const TRACE_FILE_DEFAULT_ROTATE_BYTE_THRESHOLD: u64 = 1024 * 1024 * 1024;
 
 #[derive(Clone)]
 struct ActiveTracer {
-    trace_sender: EvictingSender<TimedTracedEvent>,
+    trace_sender: CrossbeamEvictingSender<TimedTracedEvent>,
     exit: Arc<AtomicBool>,
 }
 
@@ -173,9 +177,25 @@ impl Write for GroupedWriter<'_> {
     }
 }
 
-pub fn receiving_loop_with_minimized_sender_overhead<T, E, const SLEEP_MS: u64>(
+trait TryReceiver<T> {
+    fn try_recv(&self) -> Result<T, TryRecvError>;
+}
+
+impl<T> TryReceiver<T> for Receiver<T> {
+    fn try_recv(&self) -> Result<T, TryRecvError> {
+        Receiver::try_recv(self)
+    }
+}
+
+impl TryReceiver<BankingPacketBatch> for BankingPacketReceiver {
+    fn try_recv(&self) -> Result<BankingPacketBatch, TryRecvError> {
+        BankingPacketReceiver::try_recv(self)
+    }
+}
+
+fn receiving_loop_with_minimized_sender_overhead<T, E, const SLEEP_MS: u64>(
     exit: Arc<AtomicBool>,
-    receiver: Receiver<T>,
+    receiver: impl TryReceiver<T>,
     mut on_recv: impl FnMut(T) -> Result<(), E>,
 ) -> Result<(), E> {
     'outer: while !exit.load(Ordering::Relaxed) {
@@ -227,7 +247,7 @@ impl BankingTracer {
 
                 const TRACING_CHANNEL_CAPACITY: usize = 50_000;
                 let (trace_sender, trace_receiver) =
-                    EvictingSender::new_bounded(TRACING_CHANNEL_CAPACITY);
+                    CrossbeamEvictingSender::new_bounded(TRACING_CHANNEL_CAPACITY);
 
                 let file_appender = Self::create_file_appender(path, rotate_threshold_size)?;
 
@@ -304,7 +324,7 @@ impl BankingTracer {
         )
     }
 
-    pub fn channel_for_test() -> (TracedSender, Receiver<BankingPacketBatch>) {
+    pub fn channel_for_test() -> (TracedSender, BankingPacketReceiver) {
         Self::channel(ChannelLabel::Dummy, VOTE_CHANNEL_CAPACITY, None)
     }
 
@@ -312,9 +332,9 @@ impl BankingTracer {
         label: ChannelLabel,
         capacity: usize,
         active_tracer: Option<ActiveTracer>,
-    ) -> (TracedSender, Receiver<BankingPacketBatch>) {
-        let (sender, receiver) = bounded(capacity);
-        let evicting = EvictingSender::new(sender, receiver.clone());
+    ) -> (TracedSender, BankingPacketReceiver) {
+        let (sender, receiver) = shaq_channel::bounded(capacity);
+        let evicting = ShaqEvictingSender::new(sender, receiver.clone());
 
         (TracedSender::new(label, evicting, active_tracer), receiver)
     }
@@ -373,7 +393,7 @@ impl BankingTracer {
     }
 }
 
-/// A small wrapper around the sender of crossbeam channels to message banking packet batches.
+/// A small wrapper around the sender of channels carrying banking packet batches.
 ///
 /// The underlying channels are used by the banking stage to receive packets from multiple sources.
 /// The sources are labelled as non-vote, tpu-vote, and gossip-vote respectively. As such, traced
@@ -383,21 +403,21 @@ impl BankingTracer {
 /// This wrapper exists to enable the banking trace functionality conditionally on creation.
 ///
 /// Also, this wrapper can dynamically switch sending batches to an alternate channel, called the
-/// unified channel, depending on a flag. Both the actual crossbeam sender for the unified channel
-/// and the flag are expected to be shared among all of traced sender instances, which will be used
-/// by the trio of sources respectively. This routing functionality is needed for unified scheduler
-/// and its runtime switching.
+/// unified channel, depending on a flag. Both the backing sender for the unified channel and the
+/// flag are expected to be shared among all traced sender instances, which will be used by the trio
+/// of sources respectively. This routing functionality is needed for unified scheduler and its
+/// runtime switching.
 #[derive(Clone)]
 pub struct TracedSender {
     label: ChannelLabel,
-    sender: EvictingSender<BankingPacketBatch>,
+    sender: ShaqEvictingSender<BankingPacketBatch>,
     active_tracer: Option<ActiveTracer>,
 }
 
 impl TracedSender {
     fn new(
         label: ChannelLabel,
-        sender: EvictingSender<BankingPacketBatch>,
+        sender: ShaqEvictingSender<BankingPacketBatch>,
         active_tracer: Option<ActiveTracer>,
     ) -> Self {
         Self {

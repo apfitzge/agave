@@ -12,11 +12,13 @@ pub(crate) type ShaqError = shaq::error::Error;
 pub const MAX_WORKERS: usize = 64;
 
 /// Protocol version.
-pub(crate) const VERSION: u64 = 4;
+pub(crate) const VERSION: u64 = 5;
 pub(crate) const LOGON_SUCCESS: u8 = 0x01;
 pub(crate) const LOGON_FAILURE: u8 = 0x02;
 pub(crate) const MAX_ALLOCATOR_HANDLES: usize = 128;
-pub(crate) const GLOBAL_ALLOCATORS: usize = 1;
+/// Number of producers feeding the shared TPU-to-pack queue.
+pub const TPU_TO_PACK_WORKERS: usize = 3;
+pub(crate) const GLOBAL_ALLOCATORS: usize = TPU_TO_PACK_WORKERS;
 
 /// The logon message sent by the client to the server.
 #[derive(Debug, Default, Clone, Copy)]
@@ -64,7 +66,7 @@ pub mod logon_flags {}
 /// The complete initialized scheduling session.
 pub struct ClientSession {
     pub allocators: Vec<Allocator>,
-    pub tpu_to_pack: shaq::spsc::Consumer<TpuToPackMessage>,
+    pub tpu_to_pack: shaq::mpmc::Consumer<TpuToPackMessage>,
     pub progress_tracker: shaq::spsc::Consumer<ProgressMessage>,
     pub workers: Vec<ClientWorkerSession>,
 }
@@ -102,8 +104,8 @@ pub struct AgaveSession {
 
 /// Shared memory objects for the tpu to pack worker.
 pub struct AgaveTpuToPackSession {
-    pub allocator: Allocator,
-    pub producer: shaq::spsc::Producer<TpuToPackMessage>,
+    pub allocators: [Allocator; TPU_TO_PACK_WORKERS],
+    pub producer: shaq::mpmc::Producer<TpuToPackMessage>,
 }
 
 /// Shared memory objects for a single banking worker.

@@ -6,14 +6,14 @@
 use {
     crate::{
         banking_trace::BankingPacketSender,
+        shaq_channel::{Receiver, Sender, bounded},
         sigverify::{
-            GossipSigVerifier, GossipVerifiedVoteBatch, SigVerifyWorkerPool, SigVerifyWorkerState,
-            SigVerifyWorkerStats,
+            GossipSigVerifier, GossipVerifiedVoteBatch, SIGVERIFY_GOSSIP_VOTE_WORK_CHANNEL_SIZE,
+            SigVerifyWorkerPool, SigVerifyWorkerState, SigVerifyWorkerStats,
         },
     },
     agave_banking_stage_ingress_types::{BankingPacketBatch, SchedulerPriorityFloor},
     core::time::Duration,
-    crossbeam_channel::{Receiver, Sender, unbounded},
     solana_perf::{deduper::Deduper, packet::PacketBatch},
     solana_runtime::bank_forks::SharableBanks,
     solana_transaction::Transaction,
@@ -161,7 +161,8 @@ impl SigVerifyStage {
         sharable_banks: SharableBanks,
         scheduler_priority_floor: Option<Arc<SchedulerPriorityFloor>>,
     ) -> (Self, GossipSigVerifyHandle) {
-        let (gossip_verified_vote_sender, verified_vote_receiver) = unbounded();
+        let (gossip_verified_vote_sender, verified_vote_receiver) =
+            bounded(SIGVERIFY_GOSSIP_VOTE_WORK_CHANNEL_SIZE);
         let non_vote_stats = SigVerifierStats::default();
         let tpu_vote_stats = SigVerifierStats::default();
         let exit = Arc::new(AtomicBool::new(false));
@@ -364,7 +365,6 @@ mod tests {
     use {
         super::*,
         crate::banking_trace::BankingTracer,
-        crossbeam_channel::bounded,
         solana_hash::Hash,
         solana_keypair::Keypair,
         solana_message::{VersionedMessage, v1},

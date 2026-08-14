@@ -3,7 +3,8 @@ use {
         BankingStageStats, latest_validator_vote_packet::VoteSource,
         leader_slot_metrics::LeaderSlotMetricsTracker, packet_bytes, vote_storage::VoteStorage,
     },
-    agave_banking_stage_ingress_types::{BankingPacketBatch, BankingPacketReceiver},
+    crate::banking_trace::BankingPacketReceiver,
+    agave_banking_stage_ingress_types::BankingPacketBatch,
     agave_transaction_view::{
         result::TransactionViewError, sanitize::SanitizeConfig,
         transaction_view::SanitizedTransactionView,
@@ -271,13 +272,15 @@ pub struct PacketReceiverStats {
 mod tests {
     use {
         super::*,
-        crate::banking_stage::{
-            BankingStageStats,
-            latest_validator_vote_packet::VoteSource,
-            leader_slot_metrics::LeaderSlotMetricsTracker,
-            vote_storage::{VoteStorage, tests::packet_from_slots},
+        crate::{
+            banking_stage::{
+                BankingStageStats,
+                latest_validator_vote_packet::VoteSource,
+                leader_slot_metrics::LeaderSlotMetricsTracker,
+                vote_storage::{VoteStorage, tests::packet_from_slots},
+            },
+            shaq_channel::bounded,
         },
-        crossbeam_channel::bounded,
         solana_perf::packet::PacketBatch,
         solana_runtime::{
             bank::Bank,

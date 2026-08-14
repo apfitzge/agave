@@ -1,7 +1,9 @@
 use {
     crate::handshake::{
-        AgaveHandshakeError, ClientHandshakeError, ClientLogon, client::connect, server::Server,
-        shared::MAX_WORKERS,
+        AgaveHandshakeError, ClientHandshakeError, ClientLogon,
+        client::connect,
+        server::Server,
+        shared::{MAX_WORKERS, TPU_TO_PACK_WORKERS},
     },
     agave_scheduler_bindings::{
         PackToWorkerMessage, ProgressMessage, SharableTransactionBatchRegion,
@@ -61,8 +63,20 @@ fn message_passing_on_all_queues() {
     let server_handle = std::thread::spawn(move || {
         let mut session = server.accept().unwrap();
 
-        // Send a tpu_to_pack message.
-        session.tpu_to_pack.producer.try_write(tpu_to_pack).unwrap();
+        // Send tpu_to_pack messages concurrently through cloned MPMC producers.
+        std::thread::scope(|scope| {
+            for index in 0..TPU_TO_PACK_WORKERS {
+                let producer = session.tpu_to_pack.producer.clone();
+                scope.spawn(move || {
+                    producer
+                        .try_write(TpuToPackMessage {
+                            flags: tpu_to_pack.flags + index as u8,
+                            ..tpu_to_pack
+                        })
+                        .unwrap();
+                });
+            }
+        });
 
         // Send a progress_tracker message.
         session
@@ -117,13 +131,26 @@ fn message_passing_on_all_queues() {
         )
         .unwrap();
 
-        // Receive tpu_to_pack message.
-        let msg = loop {
-            if let Some(msg) = session.tpu_to_pack.try_read() {
-                break msg;
-            };
-        };
-        assert_eq!(msg, tpu_to_pack);
+        // Receive all tpu_to_pack messages from the shared MPMC consumer.
+        let mut messages = (0..TPU_TO_PACK_WORKERS)
+            .map(|_| {
+                loop {
+                    if let Some(msg) = session.tpu_to_pack.try_read() {
+                        break msg;
+                    };
+                }
+            })
+            .collect::<Vec<_>>();
+        messages.sort_unstable_by_key(|message| message.flags);
+        assert_eq!(
+            messages,
+            (0..TPU_TO_PACK_WORKERS)
+                .map(|index| TpuToPackMessage {
+                    flags: tpu_to_pack.flags + index as u8,
+                    ..tpu_to_pack
+                })
+                .collect::<Vec<_>>()
+        );
 
         // Receive progress_tracker message.
         let msg = loop {

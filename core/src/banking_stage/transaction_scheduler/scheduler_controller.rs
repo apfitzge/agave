@@ -548,19 +548,20 @@ impl CostPacer {
 mod tests {
     use {
         super::*,
-        crate::banking_stage::{
-            TransactionViewReceiveAndBuffer,
-            consumer::{RetryableIndex, TARGET_NUM_TRANSACTIONS_PER_BATCH},
-            scheduler_messages::{ConsumeWork, FinishedConsumeWork, TransactionBatchId},
-            tests::create_slow_genesis_config,
-            transaction_scheduler::{
-                check_worker::spawn_check_workers,
-                greedy_scheduler::{GreedyScheduler, GreedySchedulerConfig},
+        crate::{
+            banking_stage::{
+                TransactionViewReceiveAndBuffer,
+                consumer::{RetryableIndex, TARGET_NUM_TRANSACTIONS_PER_BATCH},
+                scheduler_messages::{ConsumeWork, FinishedConsumeWork, TransactionBatchId},
+                tests::create_slow_genesis_config,
+                transaction_scheduler::{
+                    check_worker::spawn_check_workers,
+                    greedy_scheduler::{GreedyScheduler, GreedySchedulerConfig},
+                },
             },
+            banking_trace::{BankingPacketReceiver, BankingPacketSender, BankingTracer},
         },
-        agave_banking_stage_ingress_types::{
-            BankingPacketBatch, BankingPacketReceiver, to_banking_packet_batch,
-        },
+        agave_banking_stage_ingress_types::to_banking_packet_batch,
         crossbeam_channel::{Receiver, Sender, bounded},
         itertools::Itertools,
         solana_account::AccountSharedData,
@@ -596,7 +597,7 @@ mod tests {
         #[allow(dead_code)]
         bank_forks: Arc<RwLock<BankForks>>,
         mint_keypair: Keypair,
-        banking_packet_sender: Sender<BankingPacketBatch>,
+        banking_packet_sender: BankingPacketSender,
         shared_leader_state: SharedLeaderState,
         consume_work_receivers: Vec<Receiver<ConsumeWork<Tx>>>,
         finished_consume_work_sender: Sender<FinishedConsumeWork<Tx>>,
@@ -638,7 +639,7 @@ mod tests {
 
         let decision_maker = DecisionMaker::new(shared_leader_state.clone());
 
-        let (banking_packet_sender, banking_packet_receiver) = bounded(1024);
+        let (banking_packet_sender, banking_packet_receiver) = BankingTracer::channel_for_test();
         let receive_and_buffer =
             create_receive_and_buffer(banking_packet_receiver, bank_forks.clone());
 

@@ -1426,8 +1426,7 @@ fn should_include_genesis_certificate(
 mod tests {
     use {
         super::*,
-        crate::banking_trace::BankingTracer,
-        agave_banking_stage_ingress_types::BankingPacketReceiver,
+        crate::banking_trace::{BankingPacketReceiver, BankingTracer},
         crossbeam_channel::bounded,
         solana_bls_signatures::{BLS_SIGNATURE_AFFINE_SIZE, Signature as BLSSignature},
         solana_entry::{block_component::VersionedUpdateParent, entry_or_marker::EntryOrMarker},

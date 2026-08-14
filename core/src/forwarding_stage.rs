@@ -2,11 +2,11 @@
 //! packets to a node that is or will be leader soon.
 
 use {
-    crate::next_leader::next_leaders,
+    crate::{next_leader::next_leaders, shaq_channel::Receiver},
     agave_banking_stage_ingress_types::BankingPacketBatch,
     agave_transaction_view::transaction_view::SanitizedTransactionView,
     async_trait::async_trait,
-    crossbeam_channel::{Receiver, RecvTimeoutError},
+    crossbeam_channel::RecvTimeoutError,
     packet_container::PacketContainer,
     solana_cost_model::cost_model::CostModel,
     solana_fee_structure::FeeDetails,
@@ -773,7 +773,7 @@ fn initial_packet_meta_filter(meta: &packet::Meta) -> bool {
 mod tests {
     use {
         super::*,
-        crossbeam_channel::bounded,
+        crate::shaq_channel::bounded,
         packet::PacketFlags,
         solana_hash::Hash,
         solana_keypair::Keypair,

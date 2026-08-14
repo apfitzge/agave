@@ -3,7 +3,7 @@ use {
         AgaveHandshakeError, AgaveTpuToPackSession, AgaveWorkerSession, ClientLogon,
         shared::{
             AgaveSession, GLOBAL_ALLOCATORS, LOGON_FAILURE, LOGON_SUCCESS, MAX_ALLOCATOR_HANDLES,
-            MAX_WORKERS, VERSION,
+            MAX_WORKERS, TPU_TO_PACK_WORKERS, VERSION,
         },
     },
     agave_scheduler_bindings::PackToWorkerMessage,
@@ -148,10 +148,15 @@ impl Server {
         // Setup the allocator in shared memory (`worker_count` & `allocator_handles` have been
         // validated so this won't panic).
         let (allocator_file, tpu_to_pack_allocator) = Self::create_allocator(&logon)?;
+        let tpu_to_pack_allocators: [Allocator; TPU_TO_PACK_WORKERS] = [
+            tpu_to_pack_allocator,
+            Allocator::join(&allocator_file)?,
+            Allocator::join(&allocator_file)?,
+        ];
 
         // Setup the global queues.
         let (tpu_to_pack_file, tpu_to_pack_queue) =
-            Self::create_producer(logon.tpu_to_pack_capacity, true)?;
+            Self::create_mpmc_producer(logon.tpu_to_pack_capacity, true)?;
         let (progress_tracker_file, progress_tracker) =
             Self::create_producer(logon.progress_tracker_capacity, false)?;
 
@@ -181,7 +186,7 @@ impl Server {
             AgaveSession {
                 flags: logon.flags,
                 tpu_to_pack: AgaveTpuToPackSession {
-                    allocator: tpu_to_pack_allocator,
+                    allocators: tpu_to_pack_allocators,
                     producer: tpu_to_pack_queue,
                 },
                 progress_tracker,
@@ -232,6 +237,27 @@ impl Server {
 
             // SAFETY: uniqely creating as producer
             unsafe { shaq::spsc::Producer::create(&file, file_size) }
+                .map(|producer| (file, producer))
+        };
+
+        // Try to create with huge pages, fallback to regular pages.
+        match huge {
+            true => create(true).or_else(|_| create(false)),
+            false => create(false),
+        }
+    }
+
+    fn create_mpmc_producer<T>(
+        capacity: usize,
+        huge: bool,
+    ) -> Result<(File, shaq::mpmc::Producer<T>), ShaqError> {
+        let create = |huge: bool| {
+            let file = Self::create_shmem(huge)?;
+            let minimum_file_size = shaq::mpmc::minimum_file_size::<T>(capacity);
+            let file_size = Self::align_file_size(minimum_file_size, huge);
+
+            // SAFETY: uniquely creating as producer.
+            unsafe { shaq::mpmc::Producer::create(&file, file_size) }
                 .map(|producer| (file, producer))
         };
 

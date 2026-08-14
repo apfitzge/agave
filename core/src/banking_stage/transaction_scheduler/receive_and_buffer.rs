@@ -11,9 +11,10 @@ use {
             consumer::Consumer, decision_maker::BufferedPacketsDecision, packet_bytes,
             scheduler_messages::MaxAge,
         },
+        banking_trace::BankingPacketReceiver,
         transaction_priority::calculate_priority_and_cost,
     },
-    agave_banking_stage_ingress_types::{BankingPacketBatch, BankingPacketReceiver},
+    agave_banking_stage_ingress_types::BankingPacketBatch,
     agave_transaction_view::{
         resolved_transaction_view::ResolvedTransactionView, sanitize::SanitizeConfig,
         transaction_data::TransactionData, transaction_version::TransactionVersion,
@@ -522,17 +523,20 @@ impl TransactionViewReceiveAndBuffer {
 mod tests {
     use {
         super::*,
-        crate::banking_stage::{
-            tests::create_slow_genesis_config,
-            transaction_scheduler::{
-                check_worker::spawn_check_workers,
-                transaction_state_container::RuntimeTransactionView,
+        crate::{
+            banking_stage::{
+                tests::create_slow_genesis_config,
+                transaction_scheduler::{
+                    check_worker::spawn_check_workers,
+                    transaction_state_container::RuntimeTransactionView,
+                },
             },
+            shaq_channel::{Sender as ShaqSender, bounded},
         },
         agave_banking_stage_ingress_types::{
             BankingPacketBatch, to_banking_packet_batch, to_single_banking_packet_batch,
         },
-        crossbeam_channel::{Receiver, Sender, bounded},
+        crossbeam_channel::bounded as crossbeam_bounded,
         solana_account::AccountSharedData,
         solana_compute_budget_interface::ComputeBudgetInstruction,
         solana_fee_calculator::FeeRateGovernor,
@@ -638,7 +642,7 @@ mod tests {
     const TEST_CONTAINER_CAPACITY: usize = 100;
 
     fn setup_transaction_view_receive_and_buffer(
-        receiver: Receiver<BankingPacketBatch>,
+        receiver: BankingPacketReceiver,
         bank_forks: Arc<RwLock<BankForks>>,
     ) -> (
         TransactionViewReceiveAndBuffer,
@@ -652,15 +656,15 @@ mod tests {
     }
 
     fn setup_transaction_view_receive_and_buffer_with_filter_keys(
-        receiver: Receiver<BankingPacketBatch>,
+        receiver: BankingPacketReceiver,
         bank_forks: Arc<RwLock<BankForks>>,
         filter_keys: Arc<HashSet<Pubkey>>,
     ) -> (
         TransactionViewReceiveAndBuffer,
         TransactionViewStateContainer,
     ) {
-        let (check_work_sender, check_work_receiver) = bounded(10_000);
-        let (check_result_sender, check_result_receiver) = bounded(10_000);
+        let (check_work_sender, check_work_receiver) = crossbeam_bounded(10_000);
+        let (check_result_sender, check_result_receiver) = crossbeam_bounded(10_000);
         let _check_worker_handles = spawn_check_workers(
             NonZeroUsize::new(1).unwrap(),
             check_work_receiver,
@@ -707,7 +711,7 @@ mod tests {
         assert_eq!(actual_length, expected_length);
     }
 
-    fn send_transactions(sender: &Sender<BankingPacketBatch>, transactions: &[Transaction]) {
+    fn send_transactions(sender: &ShaqSender<BankingPacketBatch>, transactions: &[Transaction]) {
         sender.send(to_banking_packet_batch(transactions)).unwrap();
     }
 
@@ -773,9 +777,9 @@ mod tests {
         packet_sender
             .send(to_single_banking_packet_batch(&Transaction::default()))
             .unwrap();
-        let (work_sender, _work_receiver) = bounded(1);
+        let (work_sender, _work_receiver) = crossbeam_bounded(1);
         work_sender.send(Bytes::new()).unwrap();
-        let (_result_sender, result_receiver) = bounded(1);
+        let (_result_sender, result_receiver) = crossbeam_bounded(1);
         let mut receive_and_buffer = TransactionViewReceiveAndBuffer {
             receiver,
             check_work_sender: work_sender,
@@ -800,8 +804,8 @@ mod tests {
                 Transaction::default(),
             ]))
             .unwrap();
-        let (work_sender, work_receiver) = bounded(1);
-        let (_result_sender, result_receiver) = bounded(1);
+        let (work_sender, work_receiver) = crossbeam_bounded(1);
+        let (_result_sender, result_receiver) = crossbeam_bounded(1);
         let mut receive_and_buffer = TransactionViewReceiveAndBuffer {
             receiver,
             check_work_sender: work_sender,

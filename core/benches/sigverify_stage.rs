@@ -2,14 +2,15 @@
 
 use {
     bencher::{Bencher, TDynBenchFn, TestDesc, TestDescAndFn, TestFn, benchmark_main},
-    crossbeam_channel::bounded,
     log::*,
     rand::{
         Rng,
         distr::{Distribution, Uniform},
         rng,
     },
-    solana_core::{banking_trace::BankingTracer, sigverify_stage::SigVerifyStage},
+    solana_core::{
+        banking_trace::BankingTracer, shaq_channel::bounded, sigverify_stage::SigVerifyStage,
+    },
     solana_hash::Hash,
     solana_keypair::Keypair,
     solana_measure::measure::Measure,
