@@ -18,6 +18,13 @@ updates:
         - "rts-alloc"
         - "shaq"
         - "wincode"
+    ignore:
+      - dependency-name: "rts-alloc"
+        update-types:
+          - "version-update:semver-major"
+      - dependency-name: "shaq"
+        update-types:
+          - "version-update:semver-major"
 
   # split from root directory schedule to avoid duplicate checks
   - package-ecosystem: cargo
@@ -40,6 +47,13 @@ updates:
         - "rts-alloc"
         - "shaq"
         - "wincode"
+    ignore:
+      - dependency-name: "rts-alloc"
+        update-types:
+          - "version-update:semver-major"
+      - dependency-name: "shaq"
+        update-types:
+          - "version-update:semver-major"
 
   - package-ecosystem: "github-actions"
     directory: "/"
