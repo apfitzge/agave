@@ -70,6 +70,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "agave-block-production-scheduler"
+version = "4.4.0-alpha.3"
+
+[[package]]
 name = "agave-bls-cert-verify"
 version = "4.4.0-alpha.3"
 dependencies = [
