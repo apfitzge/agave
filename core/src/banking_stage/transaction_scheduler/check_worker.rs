@@ -133,7 +133,7 @@ pub(crate) mod external {
             },
         },
         agave_scheduling_utils::{
-            responses_region::allocate_check_response_region,
+            responses_region::resolve_responses_from_iter,
             transaction_ptr::{TransactionPtr, TransactionPtrBatch},
         },
         agave_transaction_view::{
@@ -274,23 +274,14 @@ pub(crate) mod external {
                 )
             };
 
-            let (responses_ptr, responses) = allocate_check_response_region(
-                &self.allocator,
-                usize::from(message.batch.num_transactions),
-            )
-            .ok_or(ExternalCheckWorkerError::AllocationFailure)?;
-
-            // SAFETY: responses_ptr is aligned and sized for the batch. Initialize
-            // every response before constructing the mutable slice.
-            unsafe { Self::check_populate_initial_messages(message, responses_ptr) };
-            // SAFETY: every element in this batch-sized allocation is initialized above.
-            let response_slice =
-                unsafe { core::slice::from_raw_parts_mut(responses_ptr.as_ptr(), batch.len()) };
+            let mut responses: ArrayVec<_, MAX_TRANSACTIONS_PER_MESSAGE> =
+                core::iter::repeat_n(Self::initial_check_response(message.flags), batch.len())
+                    .collect();
 
             let sanitize_config = sanitize_config();
             let mut status_transactions = ArrayVec::<_, MAX_TRANSACTIONS_PER_MESSAGE>::new();
             for (index, ((transaction_ptr, _), response)) in
-                batch.iter().zip(response_slice.iter_mut()).enumerate()
+                batch.iter().zip(responses.iter_mut()).enumerate()
             {
                 let Ok(transaction) =
                     SanitizedTransactionView::try_new_sanitized(transaction_ptr, &sanitize_config)
@@ -313,9 +304,11 @@ pub(crate) mod external {
             }
 
             if message.flags & check_message_flags::STATUS_CHECKS != 0 {
-                Self::check_status_checks(&status_transactions, response_slice, &working_bank);
+                Self::check_status_checks(&status_transactions, &mut responses, &working_bank);
             }
 
+            let responses = resolve_responses_from_iter(&self.allocator, responses.into_iter())
+                .ok_or(ExternalCheckWorkerError::AllocationFailure)?;
             self.sender
                 .try_write(CheckWorkerToPackMessage {
                     batch: message.batch,
@@ -448,62 +441,50 @@ pub(crate) mod external {
             Ok(())
         }
 
-        /// # Safety
-        /// - `responses_ptr` is valid ptr for a slice of [`CheckResponse`] with at least
-        ///   length `message.batch.num_transactions`.
-        unsafe fn check_populate_initial_messages(
-            message: &PackToCheckWorkerMessage,
-            responses_ptr: NonNull<CheckResponse>,
-        ) {
-            let initial_status_check_flags =
-                if message.flags & check_message_flags::STATUS_CHECKS != 0 {
-                    status_check_flags::REQUESTED
-                } else {
-                    0
-                };
+        fn initial_check_response(flags: u16) -> CheckResponse {
+            let initial_status_check_flags = if flags & check_message_flags::STATUS_CHECKS != 0 {
+                status_check_flags::REQUESTED
+            } else {
+                0
+            };
             let initial_fee_payer_balance_flags =
-                if message.flags & check_message_flags::LOAD_FEE_PAYER_BALANCE != 0 {
+                if flags & check_message_flags::LOAD_FEE_PAYER_BALANCE != 0 {
                     fee_payer_balance_flags::REQUESTED
                 } else {
                     0
                 };
             let initial_resolve_flags =
-                if message.flags & check_message_flags::LOAD_ADDRESS_LOOKUP_TABLES != 0 {
+                if flags & check_message_flags::LOAD_ADDRESS_LOOKUP_TABLES != 0 {
                     resolve_flags::REQUESTED
                 } else {
                     0
                 };
             let initial_scheduling_details_flags =
-                if message.flags & check_message_flags::CALCULATE_SCHEDULING_DETAILS != 0 {
+                if flags & check_message_flags::CALCULATE_SCHEDULING_DETAILS != 0 {
                     scheduling_details_flags::REQUESTED
                 } else {
                     0
                 };
 
-            for transaction_index in 0..usize::from(message.batch.num_transactions) {
-                // SAFETY: transaction_index is in bounds.
-                unsafe {
-                    responses_ptr.add(transaction_index).write(CheckResponse {
-                        parsing_and_sanitization_flags: 0,
-                        status_check_flags: initial_status_check_flags,
-                        fee_payer_balance_flags: initial_fee_payer_balance_flags,
-                        resolve_flags: initial_resolve_flags,
-                        scheduling_details_flags: initial_scheduling_details_flags,
-                        included_slot: 0,
-                        transaction_fee: 0,
-                        prioritization_fee: 0,
-                        estimated_cost_units: 0,
-                        allocated_accounts_data_size: 0,
-                        balance_slot: 0,
-                        fee_payer_balance: 0,
-                        resolution_slot: 0,
-                        min_alt_deactivation_slot: 0,
-                        resolved_pubkeys: SharablePubkeys {
-                            offset: 0,
-                            num_pubkeys: 0,
-                        },
-                    })
-                };
+            CheckResponse {
+                parsing_and_sanitization_flags: 0,
+                status_check_flags: initial_status_check_flags,
+                fee_payer_balance_flags: initial_fee_payer_balance_flags,
+                resolve_flags: initial_resolve_flags,
+                scheduling_details_flags: initial_scheduling_details_flags,
+                included_slot: 0,
+                transaction_fee: 0,
+                prioritization_fee: 0,
+                estimated_cost_units: 0,
+                allocated_accounts_data_size: 0,
+                balance_slot: 0,
+                fee_payer_balance: 0,
+                resolution_slot: 0,
+                min_alt_deactivation_slot: 0,
+                resolved_pubkeys: SharablePubkeys {
+                    offset: 0,
+                    num_pubkeys: 0,
+                },
             }
         }
 
