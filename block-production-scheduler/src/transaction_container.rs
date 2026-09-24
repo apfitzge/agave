@@ -35,6 +35,12 @@ impl<T> TransactionContainer<T> {
         self.transactions.len()
     }
 
+    /// Removes all transactions, including popped ones, returning ownership to the caller.
+    pub(crate) fn drain(&mut self) -> impl Iterator<Item = T> + '_ {
+        self.queue = TransactionPriorityQueue::default();
+        self.transactions.drain().map(|entry| entry.transaction)
+    }
+
     /// Inserts and queues a transaction, returning its ID and any evicted transaction.
     ///
     /// At capacity, the incoming priority must exceed the lowest queued priority. Equal priority
