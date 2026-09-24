@@ -19,6 +19,11 @@ use {
 
 mod progress_tracker;
 mod tpu_ingress;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used by the upcoming transaction container")
+)]
+mod transaction_priority_queue;
 
 #[cfg(test)]
 mod tests;
