@@ -31,7 +31,7 @@ use {
         tpu::{Tpu, TpuSockets},
         tvu::{AlpenglowInitializationState, Tvu, TvuConfig, TvuSockets},
     },
-    agave_event_system::EventSystem,
+    agave_event_system::{EventSystem, stream_policy::StreamPolicy},
     agave_jemalloc::group::ArenaGroup,
     agave_snapshots::{
         SnapshotInterval, snapshot_archive_info::SnapshotArchiveInfoGetter as _,
@@ -987,7 +987,7 @@ impl Validator {
         )
         .map_err(ValidatorError::Other)?;
 
-        let _event_system = initialize_event_system(&blockstore)?;
+        let event_system = initialize_event_system(&blockstore)?;
 
         let migration_status = bank_forks.read().unwrap().migration_status();
 
@@ -1885,6 +1885,7 @@ impl Validator {
         }
 
         *admin_rpc_service_post_init.write().unwrap() = Some(AdminRpcRequestMetadataPostInit {
+            event_system,
             bank_forks: bank_forks.clone(),
             cluster_info: cluster_info.clone(),
             vote_account: *vote_account,
@@ -2441,6 +2442,17 @@ fn initialize_event_system(
     if !blockstore.is_primary_access() {
         return Err(InitializeEventSystemError::PrimaryAccessRequired);
     }
+    let stream_policy = match std::env::var("AGAVE_EVENTS") {
+        Ok(filter) => filter.parse::<StreamPolicy>().unwrap_or_else(|err| {
+            warn!("Invalid AGAVE_EVENTS filter: {err}; disabling all events");
+            StreamPolicy::default()
+        }),
+        Err(std::env::VarError::NotPresent) => StreamPolicy::default(),
+        Err(err) => {
+            warn!("Failed to read AGAVE_EVENTS: {err}; disabling all events");
+            StreamPolicy::default()
+        }
+    };
     let events_path = blockstore.ledger_path().join("events");
     match std::fs::remove_dir_all(&events_path) {
         Ok(()) => (),
@@ -2452,10 +2464,13 @@ fn initialize_event_system(
             });
         }
     }
-    EventSystem::new(&events_path).map_err(|source| InitializeEventSystemError::Create {
-        path: events_path,
-        source,
-    })
+    let event_system =
+        EventSystem::new(&events_path).map_err(|source| InitializeEventSystemError::Create {
+            path: events_path,
+            source,
+        })?;
+    event_system.set_stream_policy(stream_policy);
+    Ok(event_system)
 }
 
 #[allow(clippy::type_complexity)]
