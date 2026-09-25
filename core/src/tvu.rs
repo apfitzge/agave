@@ -31,6 +31,7 @@ use {
         generated_cert_types::GeneratedCertTypes,
         rewards::RewardInput,
     },
+    agave_event_system::EventSystem,
     agave_jemalloc::jemalloc::Arena,
     agave_votor::{
         event::{LatestSwitchRequest, LeaderWindowInfo, VotorEventReceiver, VotorEventSender},
@@ -222,6 +223,7 @@ impl Tvu {
     /// * `blockstore` - the ledger itself
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        event_system: &EventSystem,
         vote_account: &Pubkey,
         authorized_voter_keypairs: Arc<RwLock<Vec<Arc<Keypair>>>>,
         bank_forks: Arc<RwLock<BankForks>>,
@@ -648,7 +650,12 @@ impl Tvu {
 
         let drop_bank_service = DropBankService::new(drop_bank_receiver);
 
-        let replay_stage = ReplayStage::new(replay_stage_config, replay_senders, replay_receivers)?;
+        let replay_stage = ReplayStage::new(
+            event_system,
+            replay_stage_config,
+            replay_senders,
+            replay_receivers,
+        )?;
 
         let blockstore_cleanup_service = BlockstoreCleanupService::new(
             blockstore.clone(),
@@ -861,6 +868,7 @@ pub mod tests {
         let votor_client_socket =
             QuicSocket::Kernel(bind_to_localhost_unique().expect("bind votor client socket"));
         let tvu = Tvu::new(
+            &EventSystem::stub(),
             &vote_keypair.pubkey(),
             Arc::new(RwLock::new(vec![Arc::new(vote_keypair)])),
             bank_forks.clone(),

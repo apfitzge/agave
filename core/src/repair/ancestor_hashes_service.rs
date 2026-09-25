@@ -2025,6 +2025,7 @@ mod test {
         let mut duplicate_slots_to_repair = DuplicateSlotsToRepair::default();
         duplicate_slots_to_repair.insert(dead_slot, Hash::new_unique());
         ReplayStage::dump_then_repair_correct_slots(
+            &mut agave_event_system::publisher::Publisher::stub(),
             &mut duplicate_slots_to_repair,
             &mut bank_forks.read().unwrap().ancestors(),
             &mut bank_forks.read().unwrap().descendants(),

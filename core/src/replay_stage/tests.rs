@@ -467,6 +467,7 @@ fn test_child_slots_of_same_parent() {
     let mut replay_timing = ReplayLoopTiming::default();
     ReplayStage::generate_new_bank_forks(
         NewBankForksContext {
+            slot_event_publisher: &mut Publisher::stub(),
             blockstore: &blockstore,
             bank_forks: &bank_forks,
             leader_schedule_cache: &leader_schedule_cache,
@@ -499,6 +500,7 @@ fn test_child_slots_of_same_parent() {
     );
     ReplayStage::generate_new_bank_forks(
         NewBankForksContext {
+            slot_event_publisher: &mut Publisher::stub(),
             blockstore: &blockstore,
             bank_forks: &bank_forks,
             leader_schedule_cache: &leader_schedule_cache,
@@ -669,6 +671,7 @@ fn test_process_set_root_command_requires_matching_frozen_bank() {
         new_root: Block::new_unique(2),
     };
     ReplayStage::process_set_root_command(
+        &mut agave_event_system::publisher::Publisher::stub(),
         missing_command,
         &context,
         &my_pubkey,
@@ -681,6 +684,7 @@ fn test_process_set_root_command_requires_matching_frozen_bank() {
         new_root: Block::new_unique(1),
     };
     ReplayStage::process_set_root_command(
+        &mut agave_event_system::publisher::Publisher::stub(),
         mismatched_command,
         &context,
         &my_pubkey,
@@ -700,6 +704,7 @@ fn test_process_set_root_command_requires_matching_frozen_bank() {
         },
     };
     ReplayStage::process_set_root_command(
+        &mut agave_event_system::publisher::Publisher::stub(),
         unfrozen_command,
         &context,
         &my_pubkey,
@@ -713,6 +718,7 @@ fn test_process_set_root_command_requires_matching_frozen_bank() {
         new_root: Block { slot: 1, block_id },
     };
     ReplayStage::process_set_root_command(
+        &mut agave_event_system::publisher::Publisher::stub(),
         matching_command,
         &context,
         &my_pubkey,
@@ -1179,6 +1185,7 @@ fn do_test_dead_slot_on_complete_bank(failure: CompleteBankFailure) {
     let mut duplicate_slots_to_repair = DuplicateSlotsToRepair::default();
     let mut purge_repair_slot_counter = PurgeRepairSlotCounter::default();
     ReplayStage::process_replay_results(
+        &mut Publisher::stub(),
         &process_active_banks_context,
         &mut progress,
         &mut Vec::new(),
@@ -1334,6 +1341,7 @@ fn test_cmr_mismatch_hard_dead() {
     };
 
     ReplayStage::process_replay_results(
+        &mut Publisher::stub(),
         &process_active_banks_context,
         &mut progress,
         &mut Vec::new(),
@@ -1413,6 +1421,7 @@ fn test_alpenglow_migration_transition_does_not_mark_bank_dead() {
     };
 
     ReplayStage::process_replay_results(
+        &mut Publisher::stub(),
         &process_active_banks_context,
         &mut progress,
         &mut Vec::new(),
@@ -1476,6 +1485,7 @@ fn test_abandon_invalidates() {
     };
 
     ReplayStage::process_replay_results(
+        &mut Publisher::stub(),
         &process_active_banks_context,
         &mut progress,
         &mut Vec::new(),
@@ -2820,7 +2830,13 @@ fn test_clear_slots_clears_status_cache_for_removed_bank() {
     assert!(bank_forks.read().unwrap().get(1).is_none());
     assert!(bank1.get_signature_status(&transfer_signature).is_some());
 
-    ReplayStage::clear_slots([1], &bank_forks, &mut progress, &mut Vec::new());
+    ReplayStage::clear_slots(
+        &mut agave_event_system::publisher::Publisher::stub(),
+        [1],
+        &bank_forks,
+        &mut progress,
+        &mut Vec::new(),
+    );
 
     assert!(bank1.get_signature_status(&transfer_signature).is_none());
 }
@@ -2892,6 +2908,7 @@ fn test_purge_unconfirmed_duplicate_slot() {
     // Purging slot 5 should purge only slots 5 and its descendant 6. Since 7 is already dead,
     // it gets reset but not removed
     ReplayStage::purge_unconfirmed_slot(
+        &mut agave_event_system::publisher::Publisher::stub(),
         5,
         &mut ancestors,
         &mut descendants,
@@ -2932,6 +2949,7 @@ fn test_purge_unconfirmed_duplicate_slot() {
     let mut descendants = bank_forks.read().unwrap().descendants();
     let mut ancestors = bank_forks.read().unwrap().ancestors();
     ReplayStage::purge_unconfirmed_slot(
+        &mut agave_event_system::publisher::Publisher::stub(),
         4,
         &mut ancestors,
         &mut descendants,
@@ -2955,6 +2973,7 @@ fn test_purge_unconfirmed_duplicate_slot() {
     let mut descendants = bank_forks.read().unwrap().descendants();
     let mut ancestors = bank_forks.read().unwrap().ancestors();
     ReplayStage::purge_unconfirmed_slot(
+        &mut agave_event_system::publisher::Publisher::stub(),
         1,
         &mut ancestors,
         &mut descendants,
@@ -3022,6 +3041,7 @@ fn test_purge_unconfirmed_duplicate_slots_and_reattach() {
 
     // Purge slot 3 as it is duplicate, this should also purge slot 5 but not touch 6 and 7
     ReplayStage::purge_unconfirmed_slot(
+        &mut agave_event_system::publisher::Publisher::stub(),
         3,
         &mut ancestors,
         &mut descendants,
@@ -3063,6 +3083,7 @@ fn test_purge_unconfirmed_duplicate_slots_and_reattach() {
     // 3 should now be an active bank
     ReplayStage::generate_new_bank_forks(
         NewBankForksContext {
+            slot_event_publisher: &mut Publisher::stub(),
             blockstore: &blockstore,
             bank_forks: &bank_forks,
             leader_schedule_cache: &leader_schedule_cache,
@@ -3096,6 +3117,7 @@ fn test_purge_unconfirmed_duplicate_slots_and_reattach() {
     // 5 Should now be an active bank
     ReplayStage::generate_new_bank_forks(
         NewBankForksContext {
+            slot_event_publisher: &mut Publisher::stub(),
             blockstore: &blockstore,
             bank_forks: &bank_forks,
             leader_schedule_cache: &leader_schedule_cache,
@@ -3130,6 +3152,7 @@ fn test_purge_unconfirmed_duplicate_slots_and_reattach() {
     // wasn't dumped
     ReplayStage::generate_new_bank_forks(
         NewBankForksContext {
+            slot_event_publisher: &mut Publisher::stub(),
             blockstore: &blockstore,
             bank_forks: &bank_forks,
             leader_schedule_cache: &leader_schedule_cache,
@@ -3163,6 +3186,7 @@ fn test_purge_unconfirmed_duplicate_slots_and_reattach() {
     // 7 should be found as an active bank
     ReplayStage::generate_new_bank_forks(
         NewBankForksContext {
+            slot_event_publisher: &mut Publisher::stub(),
             blockstore: &blockstore,
             bank_forks: &bank_forks,
             leader_schedule_cache: &leader_schedule_cache,
@@ -3232,6 +3256,7 @@ fn test_update_parent_restart() {
     let (entry_notification_sender, entry_notification_receiver) = bounded(1);
     let mut async_verification_freelist = Vec::new();
     handle_update_parent_interrupts(
+        &mut agave_event_system::publisher::Publisher::stub(),
         &Pubkey::new_unique(),
         &blockstore,
         &bank_forks,
@@ -3317,6 +3342,7 @@ fn test_headerless_update_parent() {
     let mut replay_timing = ReplayLoopTiming::default();
     ReplayStage::generate_new_bank_forks(
         NewBankForksContext {
+            slot_event_publisher: &mut Publisher::stub(),
             blockstore: &blockstore,
             bank_forks: &bank_forks,
             leader_schedule_cache: &leader_schedule_cache,
@@ -3369,6 +3395,7 @@ fn test_update_parent_tower_gated() {
     let (replay_vote_sender, _replay_vote_receiver) = bounded(1024);
     let mut async_verification_freelist = Vec::new();
     handle_update_parent_interrupts(
+        &mut agave_event_system::publisher::Publisher::stub(),
         &Pubkey::new_unique(),
         &blockstore,
         &bank_forks,
@@ -3414,6 +3441,7 @@ fn test_update_parent_interrupt_ignores_non_first_leader_window_slot() {
     let (replay_vote_sender, _replay_vote_receiver) = bounded(1024);
     let mut async_verification_freelist = Vec::new();
     handle_update_parent_interrupts(
+        &mut agave_event_system::publisher::Publisher::stub(),
         &Pubkey::new_unique(),
         &blockstore,
         &bank_forks,
@@ -3462,6 +3490,7 @@ fn test_update_parent_keeps_hard() {
     let (replay_vote_sender, _replay_vote_receiver) = bounded(1024);
     let mut async_verification_freelist = Vec::new();
     handle_update_parent_interrupts(
+        &mut agave_event_system::publisher::Publisher::stub(),
         &Pubkey::new_unique(),
         &blockstore,
         &bank_forks,
@@ -3675,6 +3704,7 @@ fn test_spurious_update_parent_boundary(replayed_shreds: u64, should_be_hard: bo
 
     let mut async_verification_freelist = Vec::new();
     process_soft_dead_slots(
+        &mut agave_event_system::publisher::Publisher::stub(),
         &Pubkey::new_unique(),
         &blockstore,
         &bank_forks,
@@ -3785,6 +3815,7 @@ fn test_soft_dead_restarts() {
     let (replay_vote_sender, _replay_vote_receiver) = bounded(1024);
     let mut async_verification_freelist = Vec::new();
     process_soft_dead_slots(
+        &mut agave_event_system::publisher::Publisher::stub(),
         &Pubkey::new_unique(),
         &blockstore,
         &bank_forks,
@@ -3829,6 +3860,7 @@ fn test_full_soft_dead_hardens() {
     let (replay_vote_sender, _replay_vote_receiver) = bounded(1024);
     let mut async_verification_freelist = Vec::new();
     process_soft_dead_slots(
+        &mut agave_event_system::publisher::Publisher::stub(),
         &Pubkey::new_unique(),
         &blockstore,
         &bank_forks,
@@ -3965,6 +3997,7 @@ fn test_replay_own_update_full() {
     let migration_status = post_migration_status_for_tests();
     ReplayStage::generate_new_bank_forks(
         NewBankForksContext {
+            slot_event_publisher: &mut Publisher::stub(),
             blockstore: &blockstore,
             bank_forks: &bank_forks,
             leader_schedule_cache: &leader_schedule_cache,
@@ -4554,6 +4587,7 @@ fn test_dump_then_repair_correct_slots() {
         .collect_vec();
 
     ReplayStage::dump_then_repair_correct_slots(
+        &mut agave_event_system::publisher::Publisher::stub(),
         &mut duplicate_slots_to_repair,
         &mut ancestors,
         &mut descendants,
@@ -4673,6 +4707,7 @@ fn setup_vote_then_rollback(
     let (dumped_slots_sender, _dumped_slots_receiver) = bounded(1024);
 
     ReplayStage::dump_then_repair_correct_slots(
+        &mut agave_event_system::publisher::Publisher::stub(),
         &mut duplicate_slots_to_repair,
         &mut ancestors,
         &mut descendants,
@@ -6067,6 +6102,7 @@ fn test_dumped_slot_not_causing_panic() {
     let (dumped_slots_sender, dumped_slots_receiver) = bounded(1024);
 
     ReplayStage::dump_then_repair_correct_slots(
+        &mut agave_event_system::publisher::Publisher::stub(),
         &mut duplicate_slots_to_repair,
         &mut ancestors,
         &mut descendants,
@@ -6152,6 +6188,7 @@ fn test_dump_own_slots_fails() {
     let (dumped_slots_sender, _) = bounded(1024);
 
     ReplayStage::dump_then_repair_correct_slots(
+        &mut agave_event_system::publisher::Publisher::stub(),
         &mut duplicate_slots_to_repair,
         &mut ancestors,
         &mut descendants,

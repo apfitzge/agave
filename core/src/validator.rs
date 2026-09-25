@@ -1707,6 +1707,7 @@ impl Validator {
             into_quic_socket(node.sockets.quic_votor_client, votor_xdp_sender.as_ref());
 
         let tvu = Tvu::new(
+            &event_system,
             vote_account,
             authorized_voter_keypairs,
             bank_forks.clone(),
