@@ -432,6 +432,7 @@ name = "agave-validator"
 version = "4.5.0-alpha.2"
 dependencies = [
  "agave-cpu-utils",
+ "agave-event-system",
  "agave-logger",
  "agave-snapshots",
  "agave-votor",
