@@ -26,6 +26,14 @@ use {
 };
 
 mod check_response;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "used by upcoming execution dispatch and response handling"
+    )
+)]
+mod in_flight_tracker;
 mod progress_tracker;
 mod resolved_transaction;
 mod tpu_ingress;
