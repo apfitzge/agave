@@ -133,6 +133,7 @@ mod tests {
         crate::tests::setup,
         agave_scheduler_bindings::{SharableTransactionRegion, TpuToPackMessage},
         agave_scheduler_handshake::AgaveSession,
+        std::time::Instant,
     };
 
     fn enqueue(scheduler: &Scheduler, agave: &mut AgaveSession, count: usize) {
@@ -209,6 +210,8 @@ mod tests {
             slot: 100,
             remaining_cost_units: 0,
             remaining_allocated_accounts_data_size: 0,
+            slot_start: Instant::now(),
+            slot_duration: Duration::from_millis(400),
         }));
         assert!(should_accept_packets(&SchedulerState::NotLeader {
             current_slot: 100,

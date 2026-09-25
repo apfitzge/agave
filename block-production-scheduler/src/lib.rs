@@ -3,7 +3,7 @@
 
 use {
     crate::{
-        check_response::TransactionState, progress_tracker::SchedulerState,
+        check_response::TransactionState, cost_pacer::CostPacer, progress_tracker::SchedulerState,
         transaction_container::TransactionContainer,
     },
     agave_reserved_account_keys::ReservedAccountKeys,
@@ -22,10 +22,11 @@ use {
     solana_clock::Slot,
     solana_cost_model::cost_tracker::{CostTracker, CostTrackerLimits},
     solana_pubkey::{Pubkey, PubkeyHasherBuilder},
-    std::{collections::HashSet, path::PathBuf},
+    std::{collections::HashSet, path::PathBuf, time::Instant},
 };
 
 mod check_response;
+mod cost_pacer;
 #[cfg_attr(
     not(test),
     expect(
@@ -81,6 +82,8 @@ pub struct Config {
     pub transaction_state_capacity: NonZeroUsize,
     /// Initial writable-account map capacity, retained between slots and grown as needed.
     pub writable_accounts_capacity: usize,
+    /// Time before slot end by which pacing releases the full cost budget.
+    pub execution_margin: Duration,
 }
 
 #[expect(
@@ -91,6 +94,8 @@ struct Scheduler {
     state: SchedulerState,
     cost_tracker: CostTracker,
     scheduling_slot: Option<Slot>,
+    cost_pacer: Option<CostPacer>,
+    execution_margin: Duration,
     allocator: Allocator,
     tpu_receiver: shaq::spsc::Consumer<TpuToPackMessage>,
     progress_receiver: shaq::spsc::Consumer<ProgressMessage>,
@@ -107,6 +112,7 @@ impl Scheduler {
         session: ClientSession,
         transaction_state_capacity: NonZeroUsize,
         writable_accounts_capacity: usize,
+        execution_margin: Duration,
     ) -> Self {
         let ClientSession {
             allocator,
@@ -121,6 +127,8 @@ impl Scheduler {
             state: SchedulerState::new(),
             cost_tracker: CostTracker::with_capacity(writable_accounts_capacity),
             scheduling_slot: None,
+            cost_pacer: None,
+            execution_margin,
             allocator,
             tpu_receiver: tpu_to_pack,
             progress_receiver: progress_tracker,
@@ -150,6 +158,8 @@ impl Scheduler {
             slot,
             remaining_cost_units,
             remaining_allocated_accounts_data_size,
+            slot_start,
+            slot_duration,
         } = self.state
         else {
             return;
@@ -169,6 +179,26 @@ impl Scheduler {
             remaining_allocated_accounts_data_size,
         ));
         self.scheduling_slot = Some(slot);
+        self.cost_pacer = Some(CostPacer::new(
+            remaining_cost_units,
+            slot_start,
+            slot_duration,
+            self.execution_margin,
+        ));
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by upcoming execution dispatch")
+    )]
+    fn pacing_budget(&self, now: Instant) -> u64 {
+        if !matches!(self.state, SchedulerState::LeaderReady { slot, .. } if self.scheduling_slot == Some(slot))
+        {
+            return 0;
+        }
+        self.cost_pacer.as_ref().map_or(0, |pacer| {
+            pacer.available_budget(now, self.cost_tracker.block_cost())
+        })
     }
 }
 
@@ -211,6 +241,7 @@ pub fn run(config: Config, exit: &AtomicBool) -> Result<(), ClientHandshakeError
         client::connect(config.ipc_path, logon, config.handshake_timeout)?,
         config.transaction_state_capacity,
         config.writable_accounts_capacity,
+        config.execution_margin,
     );
 
     while !exit.load(Ordering::Relaxed) {

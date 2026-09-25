@@ -21,6 +21,7 @@ fn config(path: &Path) -> Config {
         check_worker_to_pack_capacity: 512,
         transaction_state_capacity: NonZeroUsize::new(512).unwrap(),
         writable_accounts_capacity: 512,
+        execution_margin: Duration::from_millis(10),
     }
 }
 
@@ -43,11 +44,18 @@ pub(super) fn setup(check_capacity: usize) -> (Scheduler, AgaveSession) {
         flags: 0,
     })
     .unwrap();
-    let mut scheduler = Scheduler::new(client, NonZeroUsize::new(512).unwrap(), 512);
+    let mut scheduler = Scheduler::new(
+        client,
+        NonZeroUsize::new(512).unwrap(),
+        512,
+        Duration::from_millis(10),
+    );
     scheduler.state = SchedulerState::LeaderReady {
         slot: 100,
         remaining_cost_units: 0,
         remaining_allocated_accounts_data_size: 0,
+        slot_start: Instant::now(),
+        slot_duration: Duration::from_millis(400),
     };
     (scheduler, agave)
 }
@@ -55,14 +63,21 @@ pub(super) fn setup(check_capacity: usize) -> (Scheduler, AgaveSession) {
 #[test]
 fn resets_costs_only_when_entering_a_new_slot_without_outstanding_work() {
     let (mut scheduler, _agave) = setup(2);
+    let start = Instant::now();
     scheduler.state = SchedulerState::LeaderReady {
         slot: 100,
         remaining_cost_units: 100,
         remaining_allocated_accounts_data_size: 50,
+        slot_start: start,
+        slot_duration: Duration::from_millis(400),
     };
     scheduler.handle_slot_change();
     let limits = scheduler.cost_tracker.get_limits();
     assert_eq!(limits, CostTrackerLimits::new(40, 100, 50));
+    assert_eq!(
+        scheduler.pacing_budget(start + Duration::from_millis(195)),
+        50
+    );
     scheduler
         .cost_tracker
         .try_add_cost(10, 5, core::iter::empty())
@@ -72,19 +87,31 @@ fn resets_costs_only_when_entering_a_new_slot_without_outstanding_work() {
         slot: 100,
         remaining_cost_units: 90,
         remaining_allocated_accounts_data_size: 45,
+        slot_start: Instant::now(),
+        slot_duration: Duration::from_millis(400),
     };
     scheduler.handle_slot_change();
     assert_eq!(scheduler.cost_tracker.get_limits(), limits);
     assert_eq!(scheduler.cost_tracker.block_cost(), 10);
+    assert_eq!(
+        scheduler.pacing_budget(start + Duration::from_millis(195)),
+        40
+    );
 
     scheduler.cost_tracker.add_transactions_in_flight(1);
     scheduler.state = SchedulerState::LeaderReady {
         slot: 101,
         remaining_cost_units: 200,
         remaining_allocated_accounts_data_size: 75,
+        slot_start: Instant::now(),
+        slot_duration: Duration::from_millis(400),
     };
     scheduler.handle_slot_change();
     assert_eq!(scheduler.scheduling_slot, Some(100));
+    assert_eq!(
+        scheduler.pacing_budget(start + Duration::from_millis(390)),
+        0
+    );
     assert_eq!(scheduler.cost_tracker.block_cost(), 10);
 
     scheduler.cost_tracker.sub_transactions_in_flight(1);
