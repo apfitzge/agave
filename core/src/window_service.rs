@@ -3,6 +3,7 @@
 //!
 
 use {
+    self::events::FecSetCompleted,
     crate::{
         completed_data_sets_service::CompletedDataSetsSender,
         repair::{
@@ -12,6 +13,9 @@ use {
             },
         },
         result::{Error, Result},
+    },
+    agave_event_system::{
+        EventSystem, PublisherFactory, StreamConfig, monotonic_timestamp_ns, publisher::Publisher,
     },
     agave_feature_set as feature_set,
     crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded},
@@ -42,6 +46,8 @@ use {
         time::{Duration, Instant},
     },
 };
+
+pub mod events;
 
 type DuplicateSlotSender = Sender<Slot>;
 pub(crate) type DuplicateSlotReceiver = Receiver<Slot>;
@@ -183,6 +189,7 @@ fn run_insert<'db, F>(
     metrics: &mut BlockstoreInsertionMetrics,
     ws_metrics: &mut WindowServiceMetrics,
     completed_data_sets_sender: Option<&CompletedDataSetsSender>,
+    fec_set_publisher: &mut Publisher<FecSetCompleted>,
 ) -> Result<()>
 where
     F: Fn(PossibleDuplicateShred),
@@ -218,6 +225,13 @@ where
         pinnable_slice,
         write_batch,
         &handle_duplicate,
+        |slot, fec_set_index| {
+            let _ = fec_set_publisher.publish(&FecSetCompleted {
+                timestamp_ns: monotonic_timestamp_ns(),
+                slot,
+                fec_set_index,
+            });
+        },
         metrics,
     )?;
 
@@ -267,6 +281,7 @@ pub(crate) struct WindowService {
 impl WindowService {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
+        event_system: &EventSystem,
         blockstore: Arc<Blockstore>,
         repair_socket: Arc<UdpSocket>,
         ancestor_hashes_socket: Arc<UdpSocket>,
@@ -277,7 +292,17 @@ impl WindowService {
         shred_version: u16,
         outstanding_repair_requests: Arc<RwLock<OutstandingShredRepairs>>,
         repair_xdp_sender: Option<PinnedXdpSender>,
-    ) -> WindowService {
+    ) -> std::result::Result<WindowService, String> {
+        let fec_event_factory = event_system
+            .create_stream::<FecSetCompleted>(
+                events::FEC_SET_COMPLETED_STREAM,
+                StreamConfig {
+                    capacity: 1024,
+                    publisher_slots: 1,
+                    subscriber_slots: 8,
+                },
+            )
+            .map_err(|err| format!("Failed to create FEC-set event stream: {err}"))?;
         let cluster_info = repair_info.cluster_info.clone();
         let bank_forks = repair_info.bank_forks.clone();
 
@@ -324,6 +349,7 @@ impl WindowService {
 
         let sharable_banks = bank_forks.read().unwrap().sharable_banks();
         let t_insert = Self::start_window_insert_thread(
+            fec_event_factory,
             exit,
             blockstore,
             sharable_banks,
@@ -334,12 +360,12 @@ impl WindowService {
             retransmit_sender,
         );
 
-        WindowService {
+        Ok(WindowService {
             t_insert,
             t_check_duplicate,
             repair_service,
             block_id_repair_service,
-        }
+        })
     }
 
     fn start_check_duplicate_thread(
@@ -370,6 +396,7 @@ impl WindowService {
     }
 
     fn start_window_insert_thread(
+        fec_event_factory: PublisherFactory<FecSetCompleted>,
         exit: Arc<AtomicBool>,
         blockstore: Arc<Blockstore>,
         sharable_banks: SharableBanks,
@@ -383,6 +410,9 @@ impl WindowService {
         Builder::new()
             .name("solWinInsert".to_string())
             .spawn(move || {
+                let mut fec_set_publisher = fec_event_factory
+                    .try_create_publisher()
+                    .expect("fresh FEC-set stream has one publisher slot");
                 let thread_pool = rayon::ThreadPoolBuilder::new()
                     .num_threads(get_thread_count().min(8))
                     // Use the current thread as one of the workers. This reduces overhead when the
@@ -423,6 +453,7 @@ impl WindowService {
                         &mut metrics,
                         &mut ws_metrics,
                         completed_data_sets_sender.as_ref(),
+                        &mut fec_set_publisher,
                     ) {
                         ws_metrics.record_error(&e);
                         if Self::should_exit_on_error(e) {

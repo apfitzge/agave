@@ -390,6 +390,7 @@ impl Tvu {
         let block_id_repair_socket = Arc::new(block_id_repair);
         let fetch_sockets: Vec<Arc<UdpSocket>> = fetch_sockets.into_iter().map(Arc::new).collect();
         let fetch_stage = ShredFetchStage::new(
+            event_system,
             fetch_sockets,
             repair_socket.clone(),
             fetch_sender,
@@ -399,7 +400,7 @@ impl Tvu {
             outstanding_repair_requests.clone(),
             turbine_mode,
             exit.clone(),
-        );
+        )?;
 
         let (verified_sender, verified_receiver) = unbounded();
 
@@ -493,6 +494,7 @@ impl Tvu {
                 block_id_repair_channels,
             );
             WindowService::new(
+                event_system,
                 blockstore.clone(),
                 repair_socket,
                 ancestor_hashes_socket,
@@ -503,7 +505,7 @@ impl Tvu {
                 tvu_config.shred_version,
                 outstanding_repair_requests,
                 tvu_config.repair_xdp_sender,
-            )
+            )?
         };
 
         let (cluster_slots_update_sender, cluster_slots_update_receiver) = unbounded();

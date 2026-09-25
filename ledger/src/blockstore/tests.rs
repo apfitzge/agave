@@ -4770,6 +4770,7 @@ fn test_recovery() {
             )),
             &mut pinnable_slice,
             &mut write_batch,
+            |_, _| {},
             &mut BlockstoreInsertionMetrics::default(),
         )
         .unwrap();
@@ -4816,6 +4817,7 @@ fn test_skip_alt_recovery() {
             None,
             &mut pinnable_slice,
             &mut write_batch,
+            |_, _| {},
             &mut BlockstoreInsertionMetrics::default(),
         )
         .unwrap();
@@ -4844,6 +4846,7 @@ fn test_skip_alt_recovery() {
             )),
             &mut pinnable_slice,
             &mut write_batch,
+            |_, _| {},
             &mut metrics,
         )
         .unwrap();
@@ -4944,6 +4947,7 @@ fn test_recovery_discards_unexpected_data_complete_shreds() {
             )),
             &mut pinnable_slice,
             &mut write_batch,
+            |_, _| {},
             &mut metrics,
         )
         .unwrap();
@@ -6674,6 +6678,7 @@ fn test_get_double_merkle_root(use_alternate_location: bool) {
             None,
             &mut pinnable_slice,
             &mut write_batch,
+            |_, _| {},
             &mut BlockstoreInsertionMetrics::default(),
         )
         .unwrap();
@@ -6772,6 +6777,7 @@ fn test_get_double_merkle_root(use_alternate_location: bool) {
             None,
             &mut pinnable_slice,
             &mut write_batch,
+            |_, _| {},
             &mut BlockstoreInsertionMetrics::default(),
         )
         .unwrap();
@@ -6805,6 +6811,7 @@ fn insert_test_block_at_location(
             None,
             &mut pinnable_slice,
             &mut write_batch,
+            |_, _| {},
             &mut BlockstoreInsertionMetrics::default(),
         )
         .unwrap();
@@ -6951,6 +6958,7 @@ fn test_get_data_shreds_for_slot() {
                 None,
                 &mut pinnable_slice,
                 &mut write_batch,
+                |_, _| {},
                 &mut BlockstoreInsertionMetrics::default(),
             )
             .unwrap();

@@ -18,13 +18,7 @@ pub enum SlotEvent {
         parent: Slot,
     },
     /// Execution and verification succeeded and the bank has been frozen.
-    ExecutionComplete {
-        timestamp_ns: u64,
-        slot: Slot,
-    },
+    ExecutionComplete { timestamp_ns: u64, slot: Slot },
     /// The bank was removed from BankForks, not necessarily destroyed.
-    Removed {
-        timestamp_ns: u64,
-        slot: Slot,
-    },
+    Removed { timestamp_ns: u64, slot: Slot },
 }
