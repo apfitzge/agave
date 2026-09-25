@@ -82,6 +82,7 @@ dependencies = [
  "shaq",
  "slab",
  "solana-clock",
+ "solana-cost-model",
  "solana-hash",
  "solana-message",
  "solana-pubkey 4.4.0",

@@ -28,6 +28,7 @@ rts-alloc = { workspace = true }
 shaq = { workspace = true }
 slab = { workspace = true }
 solana-clock = { workspace = true }
+solana-cost-model = { workspace = true }
 solana-message = { workspace = true }
 solana-pubkey = { workspace = true, features = ["rand"] }
 solana-runtime-transaction = { workspace = true }

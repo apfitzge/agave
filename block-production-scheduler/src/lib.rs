@@ -19,6 +19,8 @@ use {
         time::Duration,
     },
     rts_alloc::Allocator,
+    solana_clock::Slot,
+    solana_cost_model::cost_tracker::{CostTracker, CostTrackerLimits},
     solana_pubkey::{Pubkey, PubkeyHasherBuilder},
     std::{collections::HashSet, path::PathBuf},
 };
@@ -69,6 +71,8 @@ pub struct Config {
     pub check_worker_to_pack_capacity: usize,
     /// Maximum number of checked transactions retained for scheduling.
     pub transaction_state_capacity: NonZeroUsize,
+    /// Initial writable-account map capacity, retained between slots and grown as needed.
+    pub writable_accounts_capacity: usize,
 }
 
 #[expect(
@@ -77,6 +81,8 @@ pub struct Config {
 )]
 struct Scheduler {
     state: SchedulerState,
+    cost_tracker: CostTracker,
+    scheduling_slot: Option<Slot>,
     allocator: Allocator,
     tpu_receiver: shaq::spsc::Consumer<TpuToPackMessage>,
     progress_receiver: shaq::spsc::Consumer<ProgressMessage>,
@@ -89,7 +95,11 @@ struct Scheduler {
 }
 
 impl Scheduler {
-    fn new(session: ClientSession, transaction_state_capacity: NonZeroUsize) -> Self {
+    fn new(
+        session: ClientSession,
+        transaction_state_capacity: NonZeroUsize,
+        writable_accounts_capacity: usize,
+    ) -> Self {
         let ClientSession {
             allocator,
             tpu_to_pack,
@@ -101,6 +111,8 @@ impl Scheduler {
 
         Self {
             state: SchedulerState::new(),
+            cost_tracker: CostTracker::with_capacity(writable_accounts_capacity),
+            scheduling_slot: None,
             allocator,
             tpu_receiver: tpu_to_pack,
             progress_receiver: progress_tracker,
@@ -115,6 +127,7 @@ impl Scheduler {
 
     fn run_iteration(&mut self) {
         self.handle_leader_progress();
+        self.handle_slot_change();
         self.handle_check_worker_responses();
         self.handle_tpu_ingress();
         core::hint::spin_loop();
@@ -122,6 +135,32 @@ impl Scheduler {
 
     fn handle_leader_progress(&mut self) {
         self.state.drain_progress(&mut self.progress_receiver);
+    }
+
+    fn handle_slot_change(&mut self) {
+        let SchedulerState::LeaderReady {
+            slot,
+            remaining_cost_units,
+            remaining_allocated_accounts_data_size,
+        } = self.state
+        else {
+            return;
+        };
+        if self.scheduling_slot == Some(slot)
+            || self.cost_tracker.in_flight_transaction_count() != 0
+        {
+            return;
+        }
+
+        // Seed the slot once. Later snapshots can include our own reservations and must not
+        // replace the budget against which we account for them locally.
+        // Approximate the account limit as 40% of this budget; progress does not expose it.
+        self.cost_tracker.reset(CostTrackerLimits::new(
+            remaining_cost_units.saturating_mul(40).saturating_div(100),
+            remaining_cost_units,
+            remaining_allocated_accounts_data_size,
+        ));
+        self.scheduling_slot = Some(slot);
     }
 }
 
@@ -163,6 +202,7 @@ pub fn run(config: Config, exit: &AtomicBool) -> Result<(), ClientHandshakeError
     let mut scheduler = Scheduler::new(
         client::connect(config.ipc_path, logon, config.handshake_timeout)?,
         config.transaction_state_capacity,
+        config.writable_accounts_capacity,
     );
 
     while !exit.load(Ordering::Relaxed) {
