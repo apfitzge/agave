@@ -31,6 +31,7 @@ use {
         tpu::{Tpu, TpuSockets},
         tvu::{AlpenglowInitializationState, Tvu, TvuConfig, TvuSockets},
     },
+    agave_event_system::EventSystem,
     agave_jemalloc::group::ArenaGroup,
     agave_snapshots::{
         SnapshotInterval, snapshot_archive_info::SnapshotArchiveInfoGetter as _,
@@ -985,6 +986,8 @@ impl Validator {
                 .then(|| dependency_tracker.clone()),
         )
         .map_err(ValidatorError::Other)?;
+
+        let _event_system = initialize_event_system(&blockstore)?;
 
         let migration_status = bank_forks.read().unwrap().migration_status();
 
@@ -2415,6 +2418,46 @@ fn load_genesis(
     Ok(genesis_config)
 }
 
+#[derive(Debug, Error)]
+enum InitializeEventSystemError {
+    #[error("event system initialization requires primary blockstore access")]
+    PrimaryAccessRequired,
+    #[error("failed to clear event directory {path:?}: {source}")]
+    ClearDirectory {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("failed to initialize event system at {path:?}: {source}")]
+    Create {
+        path: PathBuf,
+        source: agave_event_system::CreateEventSystemError,
+    },
+}
+
+/// The validator owns the event directory for the lifetime of its primary ledger access.
+fn initialize_event_system(
+    blockstore: &Blockstore,
+) -> std::result::Result<EventSystem, InitializeEventSystemError> {
+    if !blockstore.is_primary_access() {
+        return Err(InitializeEventSystemError::PrimaryAccessRequired);
+    }
+    let events_path = blockstore.ledger_path().join("events");
+    match std::fs::remove_dir_all(&events_path) {
+        Ok(()) => (),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => (),
+        Err(err) => {
+            return Err(InitializeEventSystemError::ClearDirectory {
+                path: events_path,
+                source: err,
+            });
+        }
+    }
+    EventSystem::new(&events_path).map_err(|source| InitializeEventSystemError::Create {
+        path: events_path,
+        source,
+    })
+}
+
 #[allow(clippy::type_complexity)]
 fn load_blockstore(
     config: &ValidatorConfig,
@@ -3244,14 +3287,57 @@ mod tests {
         solana_gossip::contact_info::ContactInfo,
         solana_leader_schedule::SlotLeader,
         solana_ledger::{
-            blockstore, create_new_tmp_ledger, genesis_utils::create_genesis_config_with_leader,
-            get_tmp_ledger_path_auto_delete,
+            blockstore, blockstore_options::AccessType, create_new_tmp_ledger,
+            genesis_utils::create_genesis_config_with_leader, get_tmp_ledger_path_auto_delete,
         },
         solana_poh_config::PohConfig,
         solana_sha256_hasher::hash,
         solana_vote_program::vote_state::{LandedVote, Lockout, VoteStateVersions},
         std::{fs::remove_dir_all, num::NonZeroU64, thread, time::Duration},
     };
+
+    #[test]
+    fn test_initialize_event_system() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+        let events_path = ledger_path.path().join("events");
+
+        // A fresh validator creates its event system without an existing directory.
+        drop(initialize_event_system(&blockstore).unwrap());
+        std::fs::create_dir_all(events_path.join("stale")).unwrap();
+        let stale_event = events_path.join("stale/event");
+        std::fs::write(&stale_event, b"stale").unwrap();
+
+        // Opening the ledger, including for maintenance, must not reset events.
+        drop(blockstore);
+        let blockstore = Blockstore::open_with_options(
+            ledger_path.path(),
+            BlockstoreOptions {
+                access_type: AccessType::PrimaryForMaintenance,
+                ..BlockstoreOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(stale_event.exists());
+        let reader = Blockstore::open_with_options(
+            ledger_path.path(),
+            BlockstoreOptions {
+                access_type: AccessType::ReadOnly,
+                ..BlockstoreOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            initialize_event_system(&reader),
+            Err(InitializeEventSystemError::PrimaryAccessRequired)
+        ));
+        assert!(stale_event.exists());
+
+        let _event_system = initialize_event_system(&blockstore).unwrap();
+        assert!(!stale_event.exists());
+        #[cfg(target_os = "linux")]
+        assert!(events_path.join("event-streams").is_dir());
+    }
 
     #[test]
     fn test_xdp_modules_validate_sender_positions_with_module_context() {
