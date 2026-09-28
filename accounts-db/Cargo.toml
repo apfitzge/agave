@@ -43,6 +43,7 @@ stable-abi = [
 
 [dependencies]
 agave-fs = { workspace = true }
+agave-transaction-view = { workspace = true }
 ahash = { workspace = true }
 blake3 = { workspace = true }
 bv = { workspace = true, features = ["serde"] }

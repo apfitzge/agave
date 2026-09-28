@@ -7042,6 +7042,7 @@ dependencies = [
  "agave-fs",
  "agave-logger",
  "agave-reserved-account-keys",
+ "agave-transaction-view",
  "ahash 0.8.12",
  "assert_matches",
  "blake3",

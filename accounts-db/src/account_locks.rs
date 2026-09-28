@@ -1,6 +1,7 @@
 #[cfg(feature = "dev-context-only-utils")]
 use qualifier_attr::qualifiers;
 use {
+    agave_transaction_view::transaction_version::TransactionVersion,
     ahash::{AHashMap, AHashSet},
     solana_message::AccountKeys,
     solana_pubkey::Pubkey,
@@ -11,6 +12,24 @@ use {
 /// Default maximum number of accounts a transaction may lock.
 /// The runtime configuration may override this limit.
 pub const DEFAULT_TX_ACCOUNT_LOCKS: usize = 64;
+
+/// Account lock limits selected by transaction format.
+#[derive(Clone, Copy)]
+pub struct TransactionAccountLockLimits {
+    pub legacy: usize,
+    pub v0: usize,
+    pub v1: usize,
+}
+
+impl TransactionAccountLockLimits {
+    pub fn for_version(self, version: TransactionVersion) -> usize {
+        match version {
+            TransactionVersion::V0 => self.v0,
+            TransactionVersion::V1 => self.v1,
+            TransactionVersion::Legacy => self.legacy,
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct AccountLocks {

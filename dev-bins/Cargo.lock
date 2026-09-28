@@ -5812,6 +5812,7 @@ name = "solana-accounts-db"
 version = "4.5.0-alpha.0"
 dependencies = [
  "agave-fs",
+ "agave-transaction-view",
  "ahash 0.8.12",
  "blake3",
  "bv",

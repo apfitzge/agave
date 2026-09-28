@@ -7,6 +7,7 @@ use {
     solana_measure::measure_us,
     solana_pubkey::Pubkey,
     solana_runtime_transaction::transaction_with_meta::TransactionWithMeta,
+    solana_transaction::versioned::TransactionVersion,
     std::{
         collections::{BTreeMap, HashMap},
         sync::{
@@ -222,10 +223,15 @@ impl PrioritizationFeeCache {
 
                 let transaction_configuration =
                     sanitized_transaction.transaction_configuration(&bank.feature_set);
-                let lock_result = validate_account_locks(
-                    sanitized_transaction.account_keys(),
-                    bank.get_transaction_account_lock_limit(),
-                );
+                let limits = bank.get_transaction_account_lock_limits();
+                let limit = match sanitized_transaction.version() {
+                    TransactionVersion::Legacy(_) => limits.legacy,
+                    TransactionVersion::Number(0) => limits.v0,
+                    TransactionVersion::Number(1) => limits.v1,
+                    _ => continue,
+                };
+                let lock_result =
+                    validate_account_locks(sanitized_transaction.account_keys(), limit);
 
                 if transaction_configuration.is_err() || lock_result.is_err() {
                     continue;

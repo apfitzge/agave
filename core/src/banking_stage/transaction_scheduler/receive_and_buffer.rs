@@ -20,7 +20,7 @@ use {
     },
     core::time::Duration,
     crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError},
-    solana_accounts_db::account_locks::validate_account_locks,
+    solana_accounts_db::account_locks::{TransactionAccountLockLimits, validate_account_locks},
     solana_address_lookup_table_interface::state::estimate_last_valid_slot,
     solana_clock::{Epoch, Slot},
     solana_message::v0::LoadedAddresses,
@@ -68,11 +68,11 @@ pub(crate) fn precheck_transaction(
     filter_keys: &HashSet<Pubkey>,
 ) -> PrecheckResult {
     let sanitize_config = sanitize_config();
-    let transaction_account_lock_limit = working_bank.get_transaction_account_lock_limit();
+    let transaction_account_lock_limits = working_bank.get_transaction_account_lock_limits();
     let (view, deactivation_slot) = translate_to_runtime_view(
         bytes,
         root_bank,
-        transaction_account_lock_limit,
+        transaction_account_lock_limits,
         &sanitize_config,
     )
     .map_err(IngressCheckError::PacketHandling)?;
@@ -120,14 +120,14 @@ pub(crate) fn precheck_transaction(
 pub(crate) fn translate_to_runtime_view<D: TransactionData>(
     data: D,
     bank: &Bank,
-    transaction_account_lock_limit: usize,
+    transaction_account_lock_limits: TransactionAccountLockLimits,
     sanitize_config: &SanitizeConfig,
 ) -> Result<(RuntimeTransaction<ResolvedTransactionView<D>>, u64), PacketHandlingError> {
     let Ok(view) = SanitizedTransactionView::try_new_sanitized(data, sanitize_config) else {
         return Err(PacketHandlingError::Sanitization);
     };
 
-    translate_sanitized_to_runtime_view(view, bank, transaction_account_lock_limit, None)
+    translate_sanitized_to_runtime_view(view, bank, transaction_account_lock_limits, None)
 }
 
 /// Load runtime metadata and addresses for an already sanitized transaction.
@@ -136,7 +136,7 @@ pub(crate) fn translate_to_runtime_view<D: TransactionData>(
 pub(crate) fn translate_sanitized_to_runtime_view<D: TransactionData>(
     view: SanitizedTransactionView<D>,
     bank: &Bank,
-    transaction_account_lock_limit: usize,
+    transaction_account_lock_limits: TransactionAccountLockLimits,
     preloaded_addresses: Option<(Option<LoadedAddresses>, Slot)>,
 ) -> Result<(RuntimeTransaction<ResolvedTransactionView<D>>, Slot), PacketHandlingError> {
     let Ok(view) = RuntimeTransaction::<SanitizedTransactionView<_>>::try_new(
@@ -151,6 +151,8 @@ pub(crate) fn translate_sanitized_to_runtime_view<D: TransactionData>(
         return Err(PacketHandlingError::Sanitization);
     }
 
+    let transaction_account_lock_limit =
+        transaction_account_lock_limits.for_version(view.version());
     if usize::from(view.total_num_accounts()) > transaction_account_lock_limit {
         return Err(PacketHandlingError::LockValidation);
     }
@@ -1437,7 +1439,8 @@ mod tests {
             .read()
             .unwrap()
             .root_bank()
-            .get_transaction_account_lock_limit();
+            .get_transaction_account_lock_limits()
+            .v0;
 
         // ALTs do not actually exist in the bank for this transaction - sanitization would cause failure if
         // lock validation was not done first.

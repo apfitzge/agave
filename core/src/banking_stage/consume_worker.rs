@@ -203,6 +203,7 @@ pub(crate) mod external {
             resolved_transaction_view::ResolvedTransactionView, sanitize::SanitizeConfig,
         },
         arrayvec::ArrayVec,
+        solana_accounts_db::account_locks::TransactionAccountLockLimits,
         solana_cost_model::cost_model::CostModel,
         solana_runtime::bank::Bank,
         solana_runtime_transaction::{
@@ -577,7 +578,7 @@ pub(crate) mod external {
             ArrayVec<MaxAge, MAX_TRANSACTIONS_PER_MESSAGE>,
         ) {
             let sanitize_config = sanitize_config();
-            let transaction_account_lock_limit = bank.get_transaction_account_lock_limit();
+            let transaction_account_lock_limits = bank.get_transaction_account_lock_limits();
 
             let mut translation_results = ArrayVec::new();
             let mut transactions = ArrayVec::new();
@@ -586,7 +587,7 @@ pub(crate) mod external {
                 match Self::translate_transaction(
                     transaction_ptr,
                     bank,
-                    transaction_account_lock_limit,
+                    transaction_account_lock_limits,
                     &sanitize_config,
                 ) {
                     Ok((tx, max_age)) => {
@@ -604,13 +605,13 @@ pub(crate) mod external {
         fn translate_transaction(
             transaction_ptr: TransactionPtr,
             bank: &Bank,
-            transaction_account_lock_limit: usize,
+            transaction_account_lock_limits: TransactionAccountLockLimits,
             sanitize_config: &SanitizeConfig,
         ) -> Result<(Tx, MaxAge), PacketHandlingError> {
             translate_to_runtime_view(
                 transaction_ptr,
                 bank,
-                transaction_account_lock_limit,
+                transaction_account_lock_limits,
                 sanitize_config,
             )
             .map(|(view, deactivation_slot)| {
@@ -979,7 +980,7 @@ pub(crate) mod external {
                     translate_to_runtime_view(
                         &simple_tx[..],
                         &bank,
-                        bank.get_transaction_account_lock_limit(),
+                        bank.get_transaction_account_lock_limits(),
                         &sanitize_config(),
                     )
                     .ok()
@@ -1081,7 +1082,7 @@ pub(crate) mod external {
             let tx = translate_to_runtime_view(
                 &simple_tx[..],
                 &bank,
-                bank.get_transaction_account_lock_limit(),
+                bank.get_transaction_account_lock_limits(),
                 &sanitize_config(),
             )
             .ok()
