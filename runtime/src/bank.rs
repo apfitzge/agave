@@ -105,7 +105,7 @@ use {
         Account, AccountSharedData, InheritableAccountFields, ReadableAccount, WritableAccount,
     },
     solana_accounts_db::{
-        account_locks::validate_account_locks,
+        account_locks::{DEFAULT_TX_ACCOUNT_LOCKS, validate_account_locks},
         account_storage_entry::AccountStorageEntry,
         accounts::{AccountAddressFilter, Accounts},
         accounts_db::{AccountsDb, AccountsDbConfig},
@@ -192,7 +192,7 @@ use {
     solana_sysvar_id::SysvarId,
     solana_transaction::{
         Transaction, TransactionVerificationMode,
-        sanitized::{MAX_TX_ACCOUNT_LOCKS, MessageHash, SanitizedTransaction},
+        sanitized::{MessageHash, SanitizedTransaction},
         versioned::VersionedTransaction,
     },
     solana_transaction_context::{
@@ -3844,13 +3844,8 @@ impl Bank {
 
     /// Get the max number of accounts that a transaction may lock in this block
     pub fn get_transaction_account_lock_limit(&self) -> usize {
-        if let Some(transaction_account_lock_limit) = self.transaction_account_lock_limit {
-            transaction_account_lock_limit
-        } else if self.feature_set.snapshot().increase_tx_account_lock_limit {
-            MAX_TX_ACCOUNT_LOCKS
-        } else {
-            64
-        }
+        self.transaction_account_lock_limit
+            .unwrap_or(DEFAULT_TX_ACCOUNT_LOCKS)
     }
 
     /// Prepare a transaction batch from a list of versioned transactions from
