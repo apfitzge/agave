@@ -13,7 +13,7 @@ use {
     protosol::protos::{BlockParseResult, FecSetParseResult, ShredParseContext, ShredParseEffects},
     solana_account::{AccountSharedData, state_traits::StateMutWincode as _},
     solana_accounts_db::{
-        account_locks::validate_account_locks,
+        account_locks::{DEFAULT_TX_ACCOUNT_LOCKS, validate_account_locks},
         accounts::Accounts,
         accounts_db::{ACCOUNTS_DB_CONFIG_FOR_TESTING, AccountsDb, AccountsDbConfig},
         ancestors::Ancestors,
@@ -42,7 +42,7 @@ use {
     solana_sdk_ids::sysvar,
     solana_streamer::evicting_sender::EvictingSender,
     solana_svm::conformance::fd_hash::fd_hash_or_zero,
-    solana_transaction::sanitized::{MAX_TX_ACCOUNT_LOCKS, MessageHash},
+    solana_transaction::sanitized::MessageHash,
     std::{
         borrow::Cow,
         cell::{Cell, RefCell},
@@ -227,7 +227,7 @@ pub fn execute_shred_parse(ctx: &ShredParseContext) -> ShredParseEffects {
         for tx in entries.iter().flat_map(|entry| &entry.transactions) {
             let bad_locks = validate_account_locks(
                 AccountKeys::new(tx.static_account_keys(), None),
-                MAX_TX_ACCOUNT_LOCKS,
+                DEFAULT_TX_ACCOUNT_LOCKS,
             )
             .is_err();
             let invalid_tx = match (*tx).clone().sanitize() {
