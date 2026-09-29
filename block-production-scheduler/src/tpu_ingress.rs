@@ -6,6 +6,7 @@ use {
     rts_alloc::Allocator,
 };
 
+const TPU_READABLE_TIMEOUT: Duration = Duration::from_millis(10);
 const MAX_TPU_PACKETS_PER_ITERATION: NonZeroUsize = NonZeroUsize::new(256).unwrap();
 const MAX_PACKETS_PER_CHECK_BATCH: usize = 16;
 const TPU_ACCEPTANCE_SLOT_WINDOW: u64 = 20;
@@ -27,7 +28,7 @@ impl Scheduler {
         if !accept_packets && self.outstanding_check_packets == 0 {
             let _ = self
                 .tpu_receiver
-                .wait_readable_timeout(Duration::from_millis(10));
+                .wait_readable_timeout(TPU_READABLE_TIMEOUT);
         }
         let Some(messages) = self
             .tpu_receiver
