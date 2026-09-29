@@ -71,7 +71,9 @@ fn should_accept_packets(state: &SchedulerState) -> bool {
         SchedulerState::NotLeader {
             current_slot,
             next_leader_slot,
-        } => next_leader_slot.saturating_sub(*current_slot) < TPU_ACCEPTANCE_SLOT_WINDOW,
+        } => next_leader_slot
+            .checked_sub(*current_slot)
+            .is_some_and(|offset| offset < TPU_ACCEPTANCE_SLOT_WINDOW),
     }
 }
 
@@ -238,9 +240,13 @@ mod tests {
             current_slot: 100,
             next_leader_slot: 100,
         }));
-        assert!(should_accept_packets(&SchedulerState::NotLeader {
+        assert!(!should_accept_packets(&SchedulerState::NotLeader {
             current_slot: 100,
             next_leader_slot: 99,
+        }));
+        assert!(!should_accept_packets(&SchedulerState::NotLeader {
+            current_slot: 100,
+            next_leader_slot: 4,
         }));
     }
 
