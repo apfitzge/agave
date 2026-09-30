@@ -5,7 +5,7 @@
 //! 1. Statically Loaded: after receiving `packet` from sigverify and deserializing
 //!    it into `solana_transaction::versioned::VersionedTransaction`, the runtime constructor
 //!    sanitizes it into `solana_transaction::versioned::sanitized::SanitizedVersionedTransaction`,
-//!    and extracts static transaction metadata.
+//!    validates protocol limits, and extracts static transaction metadata.
 //! 2. Dynamically Loaded: after successfully loaded account addresses from onchain
 //!    ALT, RuntimeTransaction<SanitizedMessage> transits into Dynamically Loaded state,
 //!    with its dynamic metadata loaded.
