@@ -20,13 +20,24 @@ use {
 };
 
 impl RuntimeTransaction<SanitizedVersionedTransaction> {
-    /// Sanitize and load static metadata from a versioned transaction.
+    /// Validate limits, sanitize, and load static metadata from a versioned transaction.
     pub fn try_from(
         transaction: VersionedTransaction,
         message_hash: MessageHash,
         is_simple_vote_tx: Option<bool>,
     ) -> Result<Self> {
+        let serialized_size = wincode::serialized_size(&transaction)
+            .map_err(|_| solana_transaction_error::TransactionError::SanitizeFailure)?;
         let sanitized_versioned_tx = SanitizedVersionedTransaction::try_from(transaction)?;
+        crate::transaction_limits::validate_transaction_limits(
+            &sanitized_versioned_tx,
+            serialized_size,
+        )?;
+        if let solana_message::VersionedMessage::V1(message) =
+            &sanitized_versioned_tx.get_message().message
+        {
+            crate::transaction_limits::validate_transaction_config(&message.config)?;
+        }
 
         let message_hash = match message_hash {
             MessageHash::Precomputed(hash) => hash,
