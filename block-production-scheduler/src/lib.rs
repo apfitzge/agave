@@ -28,13 +28,7 @@ use {
 };
 
 mod check_response;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "used by upcoming execution dispatch and response handling"
-    )
-)]
+mod execution_response;
 mod in_flight_tracker;
 mod progress_tracker;
 mod resolved_transaction;
@@ -98,6 +92,8 @@ struct Scheduler {
     cost_pacer: Option<CostPacer>,
     /// Estimated CUs dispatched in the current scheduling slot, used for pacing.
     scheduled_cost: u64,
+    /// Transactions held out of the priority queue until the next scheduling slot.
+    deferred_execution: Vec<usize>,
     execution_margin: Duration,
     allocator: Allocator,
     tpu_receiver: shaq::spsc::Consumer<TpuToPackMessage>,
@@ -139,6 +135,7 @@ impl Scheduler {
             scheduling_slot: None,
             cost_pacer: None,
             scheduled_cost: 0,
+            deferred_execution: Vec::with_capacity(transaction_state_capacity),
             execution_margin,
             allocator,
             tpu_receiver: tpu_to_pack,
@@ -160,6 +157,7 @@ impl Scheduler {
 
     fn run_iteration(&mut self) {
         self.handle_leader_progress();
+        self.handle_execution_worker_responses();
         self.handle_slot_change();
         self.handle_check_worker_responses();
         self.handle_tpu_ingress();
@@ -190,6 +188,9 @@ impl Scheduler {
 
         self.scheduling_slot = Some(slot);
         self.scheduled_cost = 0;
+        for id in self.deferred_execution.drain(..) {
+            self.transactions.requeue(id);
+        }
         self.cost_pacer = Some(CostPacer::new(
             remaining_cost_units,
             slot_start,
