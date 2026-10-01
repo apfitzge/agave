@@ -27,6 +27,9 @@ Release channels have their own copy of this changelog:
 
 #### Changes
 
+* Scheduler bindings are always enabled, allowing external schedulers to connect
+  without `--enable-scheduler-bindings`. The flag is deprecated and has no effect.
+
 ### CLI
 
 #### Breaking

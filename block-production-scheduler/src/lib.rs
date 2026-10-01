@@ -46,7 +46,7 @@ mod transaction_container;
 #[cfg(test)]
 mod tests;
 
-/// Configuration for a scheduler running in a thread or a separate process.
+/// Configuration for connecting a scheduler through a handshake socket.
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Path to Agave's scheduler handshake socket.
@@ -67,6 +67,23 @@ pub struct Config {
     pub progress_tracker_capacity: usize,
     /// Minimum scheduler-to-execution-worker queue capacity in messages.
     pub pack_to_worker_capacity: usize,
+    /// Minimum execution-worker-to-scheduler queue capacity in messages.
+    pub worker_to_pack_capacity: usize,
+    /// Minimum scheduler-to-check-worker queue capacity in messages.
+    pub pack_to_check_worker_capacity: usize,
+    /// Minimum check-worker-to-scheduler queue capacity in messages.
+    pub check_worker_to_pack_capacity: usize,
+    /// Scheduler behavior, shared with the in-process entrypoint.
+    pub scheduler: SchedulerConfig,
+}
+
+/// Scheduler behavior independent of how its session is established.
+#[derive(Debug, Clone)]
+pub struct SchedulerConfig {
+    /// Maximum number of checked transactions retained for scheduling.
+    pub transaction_state_capacity: usize,
+    /// Time before slot end by which pacing releases the full cost budget.
+    pub execution_margin: Duration,
     /// Outstanding estimated CU target per worker, including pending batches.
     /// The last assigned transaction may cross this target.
     pub max_cost_units_per_worker: u64,
@@ -74,16 +91,6 @@ pub struct Config {
     pub max_cost_units_per_batch: u64,
     /// Target serialized entry bytes per execution batch, including entry overhead.
     pub target_entry_bytes_per_batch: u64,
-    /// Minimum execution-worker-to-scheduler queue capacity in messages.
-    pub worker_to_pack_capacity: usize,
-    /// Minimum scheduler-to-check-worker queue capacity in messages.
-    pub pack_to_check_worker_capacity: usize,
-    /// Minimum check-worker-to-scheduler queue capacity in messages.
-    pub check_worker_to_pack_capacity: usize,
-    /// Maximum number of checked transactions retained for scheduling.
-    pub transaction_state_capacity: usize,
-    /// Time before slot end by which pacing releases the full cost budget.
-    pub execution_margin: Duration,
 }
 
 struct Scheduler {
@@ -213,7 +220,7 @@ impl Scheduler {
 ///
 /// If exit is already set, returns without connecting. Otherwise, attempts the handshake once
 /// and returns any error to the caller. Shared resources remain alive until the loop exits.
-/// The loop receives leader progress, dispatches TPU packets, and retains checked transactions.
+/// The loop receives leader progress, checks and schedules transactions, and handles completion.
 ///
 /// The exit flag cannot interrupt an in-progress handshake. The timeout has the syscall-level
 /// semantics of [`client::connect`], rather than imposing a deadline on the entire handshake.
@@ -237,8 +244,15 @@ pub fn run(config: Config, exit: &AtomicBool) -> Result<(), ClientHandshakeError
     };
     // Resolve the ledger symlink to the short socket path before connecting.
     let ipc_path = config.ipc_path.canonicalize()?;
+    let session = client::connect(ipc_path, logon, config.handshake_timeout)?;
+    run_session(session, config.scheduler, exit);
+    Ok(())
+}
+
+/// Runs the scheduler on the calling thread using an established local or external session.
+pub fn run_session(session: ClientSession, config: SchedulerConfig, exit: &AtomicBool) {
     let mut scheduler = Scheduler::new(
-        client::connect(ipc_path, logon, config.handshake_timeout)?,
+        session,
         config.transaction_state_capacity,
         config.execution_margin,
         config.max_cost_units_per_worker,
@@ -249,6 +263,4 @@ pub fn run(config: Config, exit: &AtomicBool) -> Result<(), ClientHandshakeError
     while !exit.load(Ordering::Relaxed) {
         scheduler.run_iteration();
     }
-
-    Ok(())
 }

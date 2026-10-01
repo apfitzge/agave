@@ -29,14 +29,16 @@ fn config(path: &Path) -> Config {
         tpu_to_pack_capacity: 16,
         progress_tracker_capacity: 32,
         pack_to_worker_capacity: 64,
-        max_cost_units_per_worker: 1_000_000,
-        max_cost_units_per_batch: 1_000_000,
-        target_entry_bytes_per_batch: 4_622,
         worker_to_pack_capacity: 128,
         pack_to_check_worker_capacity: 256,
         check_worker_to_pack_capacity: 512,
-        transaction_state_capacity: 512,
-        execution_margin: Duration::from_millis(10),
+        scheduler: SchedulerConfig {
+            transaction_state_capacity: 512,
+            execution_margin: Duration::from_millis(10),
+            max_cost_units_per_worker: 1_000_000,
+            max_cost_units_per_batch: 1_000_000,
+            target_entry_bytes_per_batch: 4_622,
+        },
     }
 }
 

@@ -856,7 +856,9 @@ pub fn test_app<'a>(version: &'a str, default_args: &'a DefaultTestArgs) -> App<
             Arg::with_name("enable_scheduler_bindings")
                 .long("enable-scheduler-bindings")
                 .takes_value(false)
-                .help("Enables external processes to connect and manage block production"),
+                .help(
+                    "Deprecated; scheduler bindings are always enabled. This flag has no effect.",
+                ),
         )
         .arg(
             Arg::with_name("alpenglow")
