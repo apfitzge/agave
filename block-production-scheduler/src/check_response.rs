@@ -84,6 +84,13 @@ impl Scheduler {
             if !response_is_valid(response) {
                 continue;
             }
+            if !has_sufficient_fee_payer_balance(
+                response.transaction_fee,
+                response.prioritization_fee,
+                response.fee_payer_balance,
+            ) {
+                continue;
+            }
             // SAFETY: the transaction belongs to this allocator.
             let Ok(transaction) = (unsafe {
                 ResolvedTransaction::try_new(
@@ -134,6 +141,16 @@ fn response_is_valid(response: &CheckResponse) -> bool {
         && response.scheduling_details_flags & scheduling_details_flags::FAILED == 0
 }
 
+fn has_sufficient_fee_payer_balance(
+    transaction_fee: u64,
+    prioritization_fee: u64,
+    balance: u64,
+) -> bool {
+    transaction_fee
+        .checked_add(prioritization_fee)
+        .is_some_and(|total_fee| total_fee <= balance)
+}
+
 fn calculate_priority(response: &CheckResponse, tpu_flags: u8) -> u64 {
     if tpu_flags & tpu_message_flags::IS_SIMPLE_VOTE != 0 {
         return u64::MAX;
@@ -168,6 +185,18 @@ mod tests {
         solana_svm_transaction::svm_message::SVMMessage,
         solana_transaction::versioned::VersionedTransaction,
     };
+
+    #[test]
+    fn fee_payer_balance_boundaries() {
+        assert!(has_sufficient_fee_payer_balance(0, 0, 0));
+        assert!(!has_sufficient_fee_payer_balance(100, 50, 149));
+        assert!(has_sufficient_fee_payer_balance(100, 50, 150));
+        assert!(has_sufficient_fee_payer_balance(100, 50, 151));
+        assert!(!has_sufficient_fee_payer_balance(100, 0, 0));
+        assert!(!has_sufficient_fee_payer_balance(0, 50, 49));
+        assert!(has_sufficient_fee_payer_balance(u64::MAX, 0, u64::MAX));
+        assert!(!has_sufficient_fee_payer_balance(u64::MAX, 1, u64::MAX));
+    }
 
     fn make_response(allocator: &Allocator) -> CheckResponse {
         let ptr = allocator.allocate(size_of::<Pubkey>() as u32).unwrap();
@@ -293,6 +322,72 @@ mod tests {
 
         assert_eq!(scheduler.outstanding_check_packets, 0);
         assert_eq!(scheduler.transactions.len(), 0);
+        assert_eq!(scheduler.allocator.outstanding_allocation_bytes(), 0);
+    }
+
+    #[test]
+    fn insufficient_balance_frees_allocations() {
+        for (transaction_fee, prioritization_fee, balance) in
+            [(100, 50, 149), (100, 0, 0), (u64::MAX, 1, u64::MAX)]
+        {
+            let (mut scheduler, _agave) = setup(2);
+            let mut response = make_response(&scheduler.allocator);
+            response.transaction_fee = transaction_fee;
+            response.prioritization_fee = prioritization_fee;
+            response.fee_payer_balance = balance;
+            let message = make_message(&mut scheduler, Some(response));
+            scheduler.handle_check_worker_response(message, &sanitize_config());
+
+            assert_eq!(scheduler.outstanding_check_packets, 0);
+            assert_eq!(scheduler.transactions.len(), 0);
+            assert_eq!(scheduler.allocator.outstanding_allocation_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn exact_balance_covers_fees() {
+        let (mut scheduler, _agave) = setup(2);
+        let mut response = make_response(&scheduler.allocator);
+        response.fee_payer_balance = 150;
+        let message = make_message(&mut scheduler, Some(response));
+        scheduler.handle_check_worker_response(message, &sanitize_config());
+
+        assert_eq!(scheduler.outstanding_check_packets, 0);
+        assert_eq!(scheduler.transactions.len(), 1);
+        let id = scheduler.transactions.pop_highest().unwrap();
+        let state = scheduler.transactions.remove(id).unwrap();
+        // SAFETY: removal returns exclusive ownership of the transaction's allocations.
+        unsafe { state.transaction.free(&scheduler.allocator) };
+        assert_eq!(scheduler.allocator.outstanding_allocation_bytes(), 0);
+    }
+
+    #[test]
+    fn insufficient_balance_does_not_evict() {
+        let (mut scheduler, _agave) = setup(2);
+        scheduler.transactions = TransactionContainer::with_capacity(1);
+        let response = make_response(&scheduler.allocator);
+        let message = make_message(&mut scheduler, Some(response));
+        scheduler.handle_check_worker_response(message, &sanitize_config());
+        let retained_bytes = scheduler.allocator.outstanding_allocation_bytes();
+
+        let mut response = make_response(&scheduler.allocator);
+        response.prioritization_fee = 100;
+        response.fee_payer_balance = 199;
+        response.estimated_cost_units = 1;
+        let message = make_message(&mut scheduler, Some(response));
+        scheduler.handle_check_worker_response(message, &sanitize_config());
+
+        assert_eq!(scheduler.outstanding_check_packets, 0);
+        assert_eq!(scheduler.transactions.len(), 1);
+        assert_eq!(
+            scheduler.allocator.outstanding_allocation_bytes(),
+            retained_bytes
+        );
+        let id = scheduler.transactions.pop_highest().unwrap();
+        let state = scheduler.transactions.remove(id).unwrap();
+        assert_eq!(state.cost, 99);
+        // SAFETY: removal returns exclusive ownership of the transaction's allocations.
+        unsafe { state.transaction.free(&scheduler.allocator) };
         assert_eq!(scheduler.allocator.outstanding_allocation_bytes(), 0);
     }
 
