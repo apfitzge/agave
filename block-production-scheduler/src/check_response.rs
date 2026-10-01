@@ -199,9 +199,12 @@ mod tests {
     }
 
     fn make_response(allocator: &Allocator) -> CheckResponse {
-        let ptr = allocator.allocate(size_of::<Pubkey>() as u32).unwrap();
-        // SAFETY: the allocation is aligned and sized for one pubkey.
-        unsafe { ptr.cast::<Pubkey>().write(Pubkey::from([3; 32])) };
+        let ptr = allocator.allocate(size_of::<[Pubkey; 2]>() as u32).unwrap();
+        // SAFETY: the allocation is aligned and sized for two pubkeys.
+        unsafe {
+            ptr.cast::<[Pubkey; 2]>()
+                .write([Pubkey::from([3; 32]), Pubkey::from([4; 32])])
+        };
         CheckResponse {
             parsing_and_sanitization_flags: 0,
             status_check_flags: status_check_flags::PERFORMED,
@@ -220,7 +223,7 @@ mod tests {
             resolved_pubkeys: SharablePubkeys {
                 // SAFETY: the pointer belongs to this allocator.
                 offset: unsafe { allocator.offset(ptr) },
-                num_pubkeys: 1,
+                num_pubkeys: 2,
             },
         }
     }
@@ -240,7 +243,7 @@ mod tests {
                 address_table_lookups: vec![v0::MessageAddressTableLookup {
                     account_key: Pubkey::from([2; 32]),
                     writable_indexes: vec![0],
-                    readonly_indexes: vec![],
+                    readonly_indexes: vec![1],
                 }],
                 ..Default::default()
             }),
@@ -310,6 +313,11 @@ mod tests {
             Some(&Pubkey::from([3; 32]))
         );
         assert!(state.transaction.view.is_writable(1));
+        assert_eq!(
+            state.transaction.view.account_keys().get(2),
+            Some(&Pubkey::from([4; 32]))
+        );
+        assert!(!state.transaction.view.is_writable(2));
     }
 
     #[test]

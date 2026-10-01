@@ -60,12 +60,14 @@ impl ResolvedTransaction {
         if num_writable > keys.len() {
             return Err(TransactionViewError::AddressLookupMismatch);
         }
+        let pubkeys = (!keys.is_empty()).then(|| {
+            let ptr = NonNull::from(keys).cast();
+            // SAFETY: the pointer is derived from the entire slice. The guard keeps it alive,
+            // and this alias is never freed separately from the owned pointer retained below.
+            unsafe { PubkeysPtr::from_raw_parts(ptr, keys.len()) }
+        });
         let addresses = ResolvedPubkeys {
-            pubkeys: keys.first().map(|first| {
-                // SAFETY: the guard keeps this initialized slice alive. This alias is never freed
-                // separately from the owned pointer retained below.
-                unsafe { PubkeysPtr::from_raw_parts(NonNull::from(first), keys.len()) }
-            }),
+            pubkeys,
             num_writable,
         };
         let view = ResolvedTransactionView::try_new_with_source(
