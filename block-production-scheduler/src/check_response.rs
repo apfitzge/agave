@@ -37,7 +37,7 @@ pub(super) struct TransactionState {
 impl Scheduler {
     pub(super) fn handle_check_worker_responses(&mut self) {
         let sanitize_config = sanitize_config();
-        let mut received_packets = 0usize;
+        let mut received_packets = 0;
         while received_packets < MAX_CHECK_RESPONSE_PACKETS_PER_ITERATION {
             let Some(message) = self.check_receiver.try_read() else {
                 break;
