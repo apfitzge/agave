@@ -140,7 +140,7 @@ dependencies = [
 [[package]]
 name = "agave-event-system"
 version = "0.2.0"
-source = "git+https://github.com/apfitzge/agave-sdk?rev=07043d54898450ca86a010947cb550896e5018ba#07043d54898450ca86a010947cb550896e5018ba"
+source = "git+https://github.com/apfitzge/agave-sdk?rev=a96e0041ae99f341f8487109739c064e80f3f4f8#a96e0041ae99f341f8487109739c064e80f3f4f8"
 dependencies = [
  "agave-event-system-derive",
  "getrandom 0.4.3",
@@ -155,7 +155,7 @@ dependencies = [
 [[package]]
 name = "agave-event-system-derive"
 version = "0.2.0"
-source = "git+https://github.com/apfitzge/agave-sdk?rev=07043d54898450ca86a010947cb550896e5018ba#07043d54898450ca86a010947cb550896e5018ba"
+source = "git+https://github.com/apfitzge/agave-sdk?rev=a96e0041ae99f341f8487109739c064e80f3f4f8#a96e0041ae99f341f8487109739c064e80f3f4f8"
 dependencies = [
  "proc-macro-crate 3.5.0",
  "proc-macro2",

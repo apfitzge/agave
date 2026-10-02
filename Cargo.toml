@@ -173,8 +173,8 @@ agave-banking-stage-ingress-types = { path = "banking-stage-ingress-types", vers
 agave-bls-cert-verify = { path = "bls-cert-verify", version = "=4.5.0-alpha.0", features = ["agave-unstable-api"] }
 agave-bls-sigverify = { path = "bls-sigverify", version = "=4.5.0-alpha.0", features = ["agave-unstable-api"] }
 agave-cpu-utils = { path = "cpu-utils", version = "=4.5.0-alpha.0", features = ["agave-unstable-api"] }
-agave-event-system = { git = "https://github.com/apfitzge/agave-sdk", rev = "07043d54898450ca86a010947cb550896e5018ba" }
-agave-event-system-derive = { git = "https://github.com/apfitzge/agave-sdk", rev = "07043d54898450ca86a010947cb550896e5018ba" }
+agave-event-system = { git = "https://github.com/apfitzge/agave-sdk", rev = "a96e0041ae99f341f8487109739c064e80f3f4f8" }
+agave-event-system-derive = { git = "https://github.com/apfitzge/agave-sdk", rev = "a96e0041ae99f341f8487109739c064e80f3f4f8" }
 agave-feature-set = { path = "feature-set", version = "=4.5.0-alpha.0", features = ["agave-unstable-api"] }
 agave-fs = { path = "fs", version = "=4.5.0-alpha.0", features = ["agave-unstable-api"] }
 agave-geyser-plugin-interface = "=5.0.0"
