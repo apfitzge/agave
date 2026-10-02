@@ -140,13 +140,13 @@ dependencies = [
 [[package]]
 name = "agave-event-system"
 version = "0.2.0"
-source = "git+https://github.com/anza-xyz/agave-sdk?rev=3cc0a44ee927c5037238a876ac8fd6d6c84deb9f#3cc0a44ee927c5037238a876ac8fd6d6c84deb9f"
+source = "git+https://github.com/apfitzge/agave-sdk?rev=07043d54898450ca86a010947cb550896e5018ba#07043d54898450ca86a010947cb550896e5018ba"
 dependencies = [
  "agave-event-system-derive",
  "getrandom 0.4.3",
  "libc",
  "nix",
- "shaq",
+ "shaq 4.4.0 (git+https://github.com/apfitzge/shaq.git?branch=variable-sized-payload-broadcast)",
  "thiserror 2.0.20",
  "wincode",
  "wincode-dynamic",
@@ -155,7 +155,7 @@ dependencies = [
 [[package]]
 name = "agave-event-system-derive"
 version = "0.2.0"
-source = "git+https://github.com/anza-xyz/agave-sdk?rev=3cc0a44ee927c5037238a876ac8fd6d6c84deb9f#3cc0a44ee927c5037238a876ac8fd6d6c84deb9f"
+source = "git+https://github.com/apfitzge/agave-sdk?rev=07043d54898450ca86a010947cb550896e5018ba#07043d54898450ca86a010947cb550896e5018ba"
 dependencies = [
  "proc-macro-crate 3.5.0",
  "proc-macro2",
@@ -347,7 +347,7 @@ dependencies = [
  "libc",
  "nix",
  "rts-alloc",
- "shaq",
+ "shaq 4.4.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "thiserror 2.0.20",
 ]
 
@@ -6294,7 +6294,7 @@ dependencies = [
  "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6677,6 +6677,15 @@ name = "shaq"
 version = "4.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2696ba36f1bbe6f719fbccf44344859cfbfba8ac4a198ac1de11491b417683a"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.0",
+]
+
+[[package]]
+name = "shaq"
+version = "4.4.0"
+source = "git+https://github.com/apfitzge/shaq.git?branch=variable-sized-payload-broadcast#be7ebfd6b61e9574a69ecb64faf404885e2844aa"
 dependencies = [
  "libc",
  "windows-sys 0.61.0",
@@ -8021,7 +8030,7 @@ dependencies = [
  "serde",
  "serde_bytes",
  "serial_test",
- "shaq",
+ "shaq 4.4.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "signal-hook",
  "slab",
  "smallvec",
