@@ -10221,6 +10221,7 @@ name = "solana-runtime"
 version = "4.5.0-alpha.0"
 dependencies = [
  "agave-bls-cert-verify",
+ "agave-event-system",
  "agave-feature-set",
  "agave-fs",
  "agave-logger",

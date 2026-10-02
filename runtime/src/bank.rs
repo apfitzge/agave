@@ -44,6 +44,7 @@ use {
         alpenglow_epoch_type::{AlpenglowEpochType, RewardEpochDelegatedStakes},
         bank::{
             entry_bytes_budget::EntryBytesBudget,
+            events::AccountEventPublishers,
             metrics::*,
             partitioned_epoch_rewards::{CachedVoteAccounts, EpochRewardStatus},
         },
@@ -243,6 +244,7 @@ pub mod bank_hash_details;
 pub mod builtins;
 mod check_transactions;
 pub mod entry_bytes_budget;
+pub mod events;
 mod fee_distribution;
 mod metrics;
 pub(crate) mod partitioned_epoch_rewards;
@@ -337,6 +339,9 @@ pub struct BankRc {
     pub(crate) parent: RwLock<Option<Arc<Bank>>>,
 
     pub(crate) bank_id_generator: Arc<AtomicU64>,
+
+    /// Shared by all forks, including banks created before events are initialized.
+    account_events: Arc<OnceLock<AccountEventPublishers>>,
 }
 
 impl BankRc {
@@ -346,6 +351,7 @@ impl BankRc {
             accounts: Arc::new(accounts),
             parent: RwLock::new(None),
             bank_id_generator: Arc::new(AtomicU64::new(0)),
+            account_events: Arc::default(),
         }
     }
 }
@@ -1486,6 +1492,7 @@ impl Bank {
                 accounts: Arc::new(Accounts::new(accounts_db)),
                 parent: RwLock::new(Some(Arc::clone(&parent))),
                 bank_id_generator: Arc::clone(&parent.rc.bank_id_generator),
+                account_events: Arc::clone(&parent.rc.account_events),
             }
         });
 
@@ -4545,6 +4552,19 @@ impl Bank {
         self.bank_hash_stats.accumulate(&stats);
     }
 
+    /// Initializes the transaction account stream once for this bank and its forks.
+    pub fn initialize_account_events(
+        &self,
+        event_system: &agave_event_system::EventSystem,
+    ) -> std::result::Result<(), agave_event_system::CreateStreamError> {
+        let publishers = AccountEventPublishers::new(event_system)?;
+        self.rc
+            .account_events
+            .set(publishers)
+            .expect("account events must only be initialized once");
+        Ok(())
+    }
+
     pub fn commit_transactions(
         &self,
         sanitized_txs: &[impl TransactionWithMeta],
@@ -4613,6 +4633,9 @@ impl Bank {
                 transactions.as_deref(),
                 &self.ancestors,
             );
+            if let Some(publishers) = self.rc.account_events.get() {
+                publishers.publish(self.slot(), self.bank_id(), &accounts_to_store);
+            }
         });
 
         // Cached vote and stake accounts are synchronized with accounts-db

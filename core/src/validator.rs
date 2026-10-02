@@ -988,6 +988,11 @@ impl Validator {
         .map_err(ValidatorError::Other)?;
 
         let event_system = initialize_event_system(&blockstore)?;
+        bank_forks
+            .read()
+            .unwrap()
+            .root_bank()
+            .initialize_account_events(&event_system)?;
 
         let migration_status = bank_forks.read().unwrap().migration_status();
 
