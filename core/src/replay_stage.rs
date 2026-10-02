@@ -5554,13 +5554,13 @@ impl ReplayStage {
                     }
                     progress.insert(slot, fork_progress);
                 }
-                let event = SlotEvent::Begin {
+                let parent = bank.parent_slot();
+                forks.insert(bank);
+                let _ = slot_event_publisher.publish(&SlotEvent::Begin {
                     timestamp_ns: monotonic_timestamp_ns(),
                     slot,
-                    parent: bank.parent_slot(),
-                };
-                forks.insert(bank);
-                let _ = slot_event_publisher.publish(&event);
+                    parent,
+                });
             }
         }
         generate_new_bank_forks_write_lock.stop();

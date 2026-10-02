@@ -6,11 +6,11 @@ use {
 pub const SLOT_EVENT_STREAM: StreamName = agave_event_system::stream_name!("replay.slot_event");
 
 /// Slot lifecycle events observed by replay.
-/// All timestamps are monotonic nanoseconds.
+/// All timestamps are monotonic nanoseconds sampled immediately before publishing.
 #[event]
 #[derive(Debug, PartialEq, Eq)]
 pub enum SlotEvent {
-    /// Replay is inserting a new bank for this slot and parent.
+    /// Replay inserted a new bank for this slot and parent.
     /// A slot may begin again after its previous bank is discarded and recreated.
     Begin {
         timestamp_ns: u64,
