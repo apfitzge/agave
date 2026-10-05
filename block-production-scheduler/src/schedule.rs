@@ -6,6 +6,7 @@ use {
     agave_scheduler_bindings::PackToExecutionWorkerMessage,
     agave_scheduler_handshake::ClientWorkerSession,
     agave_scheduling_utils::{
+        ENTRY_OVERHEAD_BYTES,
         thread_aware_account_locks::{MAX_THREADS, ThreadId, ThreadSet},
         transaction_priority_queue::TransactionPriorityId,
         transaction_ptr::TransactionPtrBatch,
@@ -15,8 +16,6 @@ use {
 };
 
 const MAX_TRANSACTIONS_PER_BATCH: usize = 16;
-// Same entry encoding as core's consumer: num_hashes (8), hash (32), transaction count (8).
-pub(super) const ENTRY_OVERHEAD_BYTES: u64 = 48;
 
 impl Scheduler {
     pub(super) fn schedule(&mut self, mut budget: u64) {
