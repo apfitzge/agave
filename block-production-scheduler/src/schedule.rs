@@ -36,6 +36,7 @@ impl Scheduler {
             return;
         }
         let mut batches = ExecutionBatches::new(
+            &mut allowed_workers,
             &self.allocator,
             &mut self.workers,
             &mut self.in_flight,
@@ -44,7 +45,6 @@ impl Scheduler {
             self.max_cost_units_per_worker,
             self.target_entry_bytes_per_batch,
         );
-        batches.allocate(&mut allowed_workers);
 
         // Most candidates may be blocked by account locks. Scan without modifying the queue,
         // collecting successful assignments in scratch. Dequeue only those IDs afterward,
@@ -197,7 +197,9 @@ struct ExecutionBatches<'a> {
 }
 
 impl<'a> ExecutionBatches<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
+        allowed_workers: &mut ThreadSet,
         allocator: &'a Allocator,
         workers: &'a mut [ClientWorkerSession],
         in_flight: &'a mut InFlightTracker,
@@ -206,8 +208,15 @@ impl<'a> ExecutionBatches<'a> {
         max_cost_units_per_worker: u64,
         target_entry_bytes_per_batch: u64,
     ) -> Self {
+        let mut pending = core::array::from_fn(|_| WorkerBatch::default());
+        for worker in allowed_workers.contained_threads_iter() {
+            pending[worker].batch = ExecutionBatch::allocate(allocator);
+            if pending[worker].batch.is_none() {
+                allowed_workers.remove(worker);
+            }
+        }
         Self {
-            pending: core::array::from_fn(|_| WorkerBatch::default()),
+            pending,
             allocator,
             workers,
             in_flight,
@@ -215,15 +224,6 @@ impl<'a> ExecutionBatches<'a> {
             max_cost_units_per_batch,
             max_cost_units_per_worker,
             target_entry_bytes_per_batch,
-        }
-    }
-
-    fn allocate(&mut self, allowed_workers: &mut ThreadSet) {
-        for worker in allowed_workers.contained_threads_iter() {
-            self.pending[worker].batch = ExecutionBatch::allocate(self.allocator);
-            if self.pending[worker].batch.is_none() {
-                allowed_workers.remove(worker);
-            }
         }
     }
 
