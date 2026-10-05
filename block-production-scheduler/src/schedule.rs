@@ -185,6 +185,7 @@ impl Drop for WorkerBatch<'_> {
 
 /// Builds and publishes execution batches during a single scheduling pass.
 struct ExecutionBatches<'a> {
+    // ThreadSet yields worker IDs below MAX_THREADS, so each ID indexes this array.
     pending: [WorkerBatch<'a>; MAX_THREADS],
     allocator: &'a Allocator,
     workers: &'a mut [ClientWorkerSession],
