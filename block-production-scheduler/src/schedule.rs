@@ -60,7 +60,7 @@ impl Scheduler {
                 writable.clone(),
                 readonly.clone(),
                 allowed_workers,
-                |eligible| select_worker(eligible, batches.in_flight, &batches),
+                |eligible| select_worker(eligible, &batches),
             ) else {
                 continue;
             };
@@ -112,15 +112,11 @@ fn allowed_workers(
     allowed_workers
 }
 
-fn select_worker(
-    eligible: ThreadSet,
-    in_flight: &InFlightTracker,
-    batches: &ExecutionBatches<'_>,
-) -> ThreadId {
+fn select_worker(eligible: ThreadSet, batches: &ExecutionBatches<'_>) -> ThreadId {
     eligible
         .contained_threads_iter()
         .min_by_key(|&worker| {
-            let load = in_flight.worker_load(worker);
+            let load = batches.in_flight.worker_load(worker);
             let (pending_cost, pending_transactions) = batches.pending_load(worker);
             (
                 load.cost_units.saturating_add(pending_cost),
