@@ -186,7 +186,7 @@ impl Drop for WorkerBatch<'_> {
 /// Builds and publishes execution batches during a single scheduling pass.
 struct ExecutionBatches<'a> {
     // ThreadSet yields worker IDs below MAX_THREADS, so each ID indexes this array.
-    pending: [WorkerBatch<'a>; MAX_THREADS],
+    pending_worker_batches: [WorkerBatch<'a>; MAX_THREADS],
     allocator: &'a Allocator,
     workers: &'a mut [ClientWorkerSession],
     in_flight: &'a mut InFlightTracker,
@@ -208,15 +208,15 @@ impl<'a> ExecutionBatches<'a> {
         max_cost_units_per_worker: u64,
         target_entry_bytes_per_batch: u64,
     ) -> Self {
-        let mut pending = core::array::from_fn(|_| WorkerBatch::default());
+        let mut pending_worker_batches = core::array::from_fn(|_| WorkerBatch::default());
         for worker in allowed_workers.contained_threads_iter() {
-            pending[worker].batch = ExecutionBatch::allocate(allocator);
-            if pending[worker].batch.is_none() {
+            pending_worker_batches[worker].batch = ExecutionBatch::allocate(allocator);
+            if pending_worker_batches[worker].batch.is_none() {
                 allowed_workers.remove(worker);
             }
         }
         Self {
-            pending,
+            pending_worker_batches,
             allocator,
             workers,
             in_flight,
@@ -228,19 +228,19 @@ impl<'a> ExecutionBatches<'a> {
     }
 
     fn pending_load(&self, worker: ThreadId) -> (u64, usize) {
-        let pending = &self.pending[worker];
+        let pending = &self.pending_worker_batches[worker];
         (pending.cost_units, pending.len())
     }
 
     fn should_send_before(&self, worker: ThreadId, transaction_bytes: u64) -> bool {
-        self.pending[worker]
+        self.pending_worker_batches[worker]
             .entry_bytes
             .saturating_add(transaction_bytes)
             > self.target_entry_bytes_per_batch
     }
 
     fn push(&mut self, worker: ThreadId, id: usize, transaction: &TransactionState) {
-        let pending = &mut self.pending[worker];
+        let pending = &mut self.pending_worker_batches[worker];
         let batch = pending.batch.as_mut().expect("batch has been prepared");
         // SAFETY: the scheduler retains this allocation until execution completes.
         let region = unsafe { transaction.transaction.to_region(self.allocator) };
@@ -251,7 +251,7 @@ impl<'a> ExecutionBatches<'a> {
     }
 
     fn should_send(&self, worker: ThreadId) -> bool {
-        let pending = &self.pending[worker];
+        let pending = &self.pending_worker_batches[worker];
         pending.len() == MAX_TRANSACTIONS_PER_BATCH
             || pending.cost_units >= self.max_cost_units_per_batch
             || pending.entry_bytes >= self.target_entry_bytes_per_batch
@@ -262,7 +262,7 @@ impl<'a> ExecutionBatches<'a> {
         let queue_at_capacity = load.batches >= self.workers[worker].pack_to_worker.capacity();
         let cost_at_capacity = load
             .cost_units
-            .saturating_add(self.pending[worker].cost_units)
+            .saturating_add(self.pending_worker_batches[worker].cost_units)
             >= self.max_cost_units_per_worker;
 
         queue_at_capacity || cost_at_capacity
@@ -270,7 +270,7 @@ impl<'a> ExecutionBatches<'a> {
 
     /// Publishes the current batch.
     fn send(&mut self, worker: ThreadId) {
-        let pending = &mut self.pending[worker];
+        let pending = &mut self.pending_worker_batches[worker];
         let Some(batch) = pending.batch.take() else {
             return;
         };
@@ -295,7 +295,7 @@ impl<'a> ExecutionBatches<'a> {
 
     fn send_all(&mut self, allowed_workers: &mut ThreadSet) {
         for worker in 0..self.workers.len() {
-            if self.pending[worker].len() == 0 {
+            if self.pending_worker_batches[worker].len() == 0 {
                 continue;
             }
             self.send(worker);
@@ -306,8 +306,8 @@ impl<'a> ExecutionBatches<'a> {
                 allowed_workers.remove(worker);
                 continue;
             }
-            self.pending[worker].batch = ExecutionBatch::allocate(self.allocator);
-            if self.pending[worker].batch.is_none() {
+            self.pending_worker_batches[worker].batch = ExecutionBatch::allocate(self.allocator);
+            if self.pending_worker_batches[worker].batch.is_none() {
                 allowed_workers.remove(worker);
             }
         }
