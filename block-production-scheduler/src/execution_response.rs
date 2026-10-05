@@ -61,7 +61,7 @@ impl Scheduler {
                 estimated_cost = estimated_cost.saturating_add(complete_transaction(
                     id,
                     worker,
-                    retryability(response),
+                    ExecutionResponseAction::from_response(response),
                     &mut self.transactions,
                     &mut self.account_locks,
                     &mut self.deferred_execution,
@@ -72,13 +72,12 @@ impl Scheduler {
             unsafe { responses.free(&self.allocator) };
         } else {
             // Unprocessed messages have an undefined response region.
-            let retry = (message.processed_code == processed_codes::MAX_WORKING_SLOT_EXCEEDED)
-                .then_some(true);
+            let action = ExecutionResponseAction::from_processed_code(message.processed_code);
             for (_, id) in batch.iter() {
                 estimated_cost = estimated_cost.saturating_add(complete_transaction(
                     id,
                     worker,
-                    retry,
+                    action,
                     &mut self.transactions,
                     &mut self.account_locks,
                     &mut self.deferred_execution,
@@ -100,7 +99,7 @@ impl Scheduler {
 fn complete_transaction(
     id: usize,
     worker: ThreadId,
-    retry: Option<bool>,
+    action: ExecutionResponseAction,
     transactions: &mut TransactionContainer<TransactionState>,
     account_locks: &mut ThreadAwareAccountLocks,
     deferred_execution: &mut Vec<usize>,
@@ -114,12 +113,12 @@ fn complete_transaction(
         transaction.transaction.readonly_accounts(),
         worker,
     );
-    match retry {
-        Some(true) => {
+    match action {
+        ExecutionResponseAction::RequeueInCurrentSlot => {
             transactions.requeue(id);
         }
-        Some(false) => deferred_execution.push(id),
-        None => {
+        ExecutionResponseAction::DeferToNextSlot => deferred_execution.push(id),
+        ExecutionResponseAction::Release => {
             let transaction = transactions.remove(id).unwrap();
             // SAFETY: the worker and scheduler have released all references to this transaction.
             unsafe { transaction.transaction.free(allocator) };
@@ -128,17 +127,33 @@ fn complete_transaction(
     cost
 }
 
-/// Some(true) retries immediately; Some(false) waits for the next slot; None is terminal.
-fn retryability(response: &ExecutionResponse) -> Option<bool> {
-    match response.not_included_reason {
-        not_included_reasons::BANK_NOT_AVAILABLE | not_included_reasons::ACCOUNT_IN_USE => {
-            Some(true)
+/// What happens to a transaction once its execution batch returns.
+#[derive(Clone, Copy)]
+enum ExecutionResponseAction {
+    RequeueInCurrentSlot,
+    DeferToNextSlot,
+    Release,
+}
+
+impl ExecutionResponseAction {
+    fn from_response(response: &ExecutionResponse) -> Self {
+        match response.not_included_reason {
+            not_included_reasons::BANK_NOT_AVAILABLE | not_included_reasons::ACCOUNT_IN_USE => {
+                Self::RequeueInCurrentSlot
+            }
+            not_included_reasons::WOULD_EXCEED_MAX_BLOCK_COST_LIMIT
+            | not_included_reasons::WOULD_EXCEED_MAX_VOTE_COST_LIMIT
+            | not_included_reasons::WOULD_EXCEED_MAX_ACCOUNT_COST_LIMIT
+            | not_included_reasons::WOULD_EXCEED_ACCOUNT_DATA_BLOCK_LIMIT => Self::DeferToNextSlot,
+            _ => Self::Release,
         }
-        not_included_reasons::WOULD_EXCEED_MAX_BLOCK_COST_LIMIT
-        | not_included_reasons::WOULD_EXCEED_MAX_VOTE_COST_LIMIT
-        | not_included_reasons::WOULD_EXCEED_MAX_ACCOUNT_COST_LIMIT
-        | not_included_reasons::WOULD_EXCEED_ACCOUNT_DATA_BLOCK_LIMIT => Some(false),
-        _ => None,
+    }
+
+    fn from_processed_code(code: u8) -> Self {
+        match code {
+            processed_codes::MAX_WORKING_SLOT_EXCEEDED => Self::RequeueInCurrentSlot,
+            _ => Self::Release,
+        }
     }
 }
 
