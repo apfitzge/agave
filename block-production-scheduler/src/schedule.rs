@@ -259,11 +259,13 @@ impl<'a> ExecutionBatches<'a> {
 
     fn worker_at_capacity(&self, worker: ThreadId) -> bool {
         let load = self.in_flight.worker_load(worker);
-        load.batches >= self.workers[worker].pack_to_worker.capacity()
-            || load
-                .cost_units
-                .saturating_add(self.pending[worker].cost_units)
-                >= self.max_cost_units_per_worker
+        let queue_at_capacity = load.batches >= self.workers[worker].pack_to_worker.capacity();
+        let cost_at_capacity = load
+            .cost_units
+            .saturating_add(self.pending[worker].cost_units)
+            >= self.max_cost_units_per_worker;
+
+        queue_at_capacity || cost_at_capacity
     }
 
     /// Publishes the current batch.
