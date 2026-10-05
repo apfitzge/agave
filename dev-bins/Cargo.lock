@@ -79,6 +79,7 @@ dependencies = [
  "solana-message",
  "solana-pubkey 4.4.0",
  "solana-runtime-transaction",
+ "solana-svm-transaction",
 ]
 
 [[package]]
