@@ -25,15 +25,13 @@ impl Scheduler {
         if budget == 0 {
             return;
         }
-        self.scheduling_scratch.reset(
+        self.scheduling_scratch.reset();
+        let scheduled = &mut self.scheduling_scratch.scheduled;
+        let mut allowed_workers = allowed_workers(
             &self.workers,
             &self.in_flight,
             self.max_cost_units_per_worker,
         );
-        let SchedulerScratch {
-            scheduled,
-            allowed_workers,
-        } = &mut self.scheduling_scratch;
         if allowed_workers.is_empty() {
             return;
         }
@@ -46,7 +44,7 @@ impl Scheduler {
             self.max_cost_units_per_worker,
             self.target_entry_bytes_per_batch,
         );
-        batches.allocate(allowed_workers);
+        batches.allocate(&mut allowed_workers);
 
         // Most candidates may be blocked by account locks. Scan without modifying the queue,
         // collecting successful assignments in scratch. Dequeue only those IDs afterward,
@@ -61,7 +59,7 @@ impl Scheduler {
             let Ok(worker) = self.account_locks.try_lock_accounts(
                 writable.clone(),
                 readonly.clone(),
-                *allowed_workers,
+                allowed_workers,
                 |eligible| select_worker(eligible, batches.in_flight, &batches),
             ) else {
                 continue;
@@ -69,7 +67,7 @@ impl Scheduler {
 
             let transaction_bytes = transaction.transaction.view.data().len() as u64;
             if batches.should_send_before(worker, transaction_bytes) {
-                batches.send_all(allowed_workers);
+                batches.send_all(&mut allowed_workers);
                 if !allowed_workers.contains(worker) {
                     self.account_locks
                         .unlock_accounts(writable, readonly, worker);
@@ -82,7 +80,7 @@ impl Scheduler {
             scheduled.push((id, worker));
             if batches.should_send(worker) {
                 // Match greedy: reaching a batch target sends all pending batches.
-                batches.send_all(allowed_workers);
+                batches.send_all(&mut allowed_workers);
             }
             if batches.worker_at_capacity(worker) {
                 allowed_workers.remove(worker);
@@ -95,6 +93,23 @@ impl Scheduler {
             self.transactions.get_mut(id.id).unwrap().execution_worker = Some(worker);
         }
     }
+}
+
+fn allowed_workers(
+    workers: &[ClientWorkerSession],
+    in_flight: &InFlightTracker,
+    max_cost_units_per_worker: u64,
+) -> ThreadSet {
+    let mut allowed_workers = ThreadSet::any(workers.len());
+    for (worker, session) in workers.iter().enumerate() {
+        let load = in_flight.worker_load(worker);
+        if load.batches >= session.pack_to_worker.capacity()
+            || load.cost_units >= max_cost_units_per_worker
+        {
+            allowed_workers.remove(worker);
+        }
+    }
+    allowed_workers
 }
 
 fn select_worker(
@@ -120,36 +135,19 @@ pub(super) type ExecutionBatch<'a> = TransactionPtrBatch<'a, usize, MAX_TRANSACT
 
 /// Temporary scheduling state, reused without allocating on each pass.
 pub(super) struct SchedulerScratch {
-    // Drained after scanning; capacity is retained for the next call.
+    /// Selected transaction IDs and worker assignments; capacity is retained across passes.
     scheduled: Vec<(TransactionPriorityId, ThreadId)>,
-    // Rebuilt from current worker load at the start of each call.
-    allowed_workers: ThreadSet,
 }
 
 impl SchedulerScratch {
     pub(super) fn new(transaction_capacity: usize) -> Self {
         Self {
             scheduled: Vec::with_capacity(transaction_capacity),
-            allowed_workers: ThreadSet::none(),
         }
     }
 
-    fn reset(
-        &mut self,
-        workers: &[ClientWorkerSession],
-        in_flight: &InFlightTracker,
-        max_cost_units: u64,
-    ) {
+    fn reset(&mut self) {
         self.scheduled.clear();
-        self.allowed_workers = ThreadSet::any(workers.len());
-        for (worker, session) in workers.iter().enumerate() {
-            let load = in_flight.worker_load(worker);
-            if load.batches >= session.pack_to_worker.capacity()
-                || load.cost_units >= max_cost_units
-            {
-                self.allowed_workers.remove(worker);
-            }
-        }
     }
 }
 
