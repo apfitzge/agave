@@ -7,7 +7,7 @@ use {
     agave_scheduler_handshake::ClientWorkerSession,
     agave_scheduling_utils::{
         ENTRY_OVERHEAD_BYTES,
-        thread_aware_account_locks::{MAX_THREADS, ThreadId, ThreadSet},
+        thread_aware_account_locks::{MAX_THREADS, ThreadAwareAccountLocks, ThreadId, ThreadSet},
         transaction_priority_queue::TransactionPriorityId,
         transaction_ptr::TransactionPtrBatch,
     },
@@ -54,37 +54,18 @@ impl Scheduler {
                 break;
             }
             let transaction = self.transactions.get(id.id).unwrap();
-            let writable = transaction.transaction.writable_accounts();
-            let readonly = transaction.transaction.readonly_accounts();
-            let Ok(worker) = self.account_locks.try_lock_accounts(
-                writable.clone(),
-                readonly.clone(),
-                allowed_workers,
-                |eligible| select_worker(eligible, &batches),
+            let Some(worker) = try_schedule_transaction(
+                id.id,
+                transaction,
+                &mut self.account_locks,
+                &mut batches,
+                &mut allowed_workers,
             ) else {
                 continue;
             };
-
-            let transaction_bytes = transaction.transaction.view.data().len() as u64;
-            if batches.should_send_before(worker, transaction_bytes) {
-                batches.send_all(&mut allowed_workers);
-                if !allowed_workers.contains(worker) {
-                    self.account_locks
-                        .unlock_accounts(writable, readonly, worker);
-                    continue;
-                }
-            }
-            batches.push(worker, id.id, transaction);
             self.scheduled_cost = self.scheduled_cost.saturating_add(transaction.cost);
             budget = budget.saturating_sub(transaction.cost);
             scheduled.push((id, worker));
-            if batches.should_send(worker) {
-                // Match greedy: reaching a batch target sends all pending batches.
-                batches.send_all(&mut allowed_workers);
-            }
-            if batches.worker_at_capacity(worker) {
-                allowed_workers.remove(worker);
-            }
         }
 
         batches.send_all(&mut ThreadSet::none());
@@ -93,6 +74,30 @@ impl Scheduler {
             self.transactions.get_mut(id.id).unwrap().execution_worker = Some(worker);
         }
     }
+}
+
+fn try_schedule_transaction(
+    id: usize,
+    transaction: &TransactionState,
+    account_locks: &mut ThreadAwareAccountLocks,
+    batches: &mut ExecutionBatches<'_>,
+    allowed_workers: &mut ThreadSet,
+) -> Option<ThreadId> {
+    let writable = transaction.transaction.writable_accounts();
+    let readonly = transaction.transaction.readonly_accounts();
+    let worker = account_locks
+        .try_lock_accounts(
+            writable.clone(),
+            readonly.clone(),
+            *allowed_workers,
+            |eligible| select_worker(eligible, batches),
+        )
+        .ok()?;
+    if !batches.try_push(worker, id, transaction, allowed_workers) {
+        account_locks.unlock_accounts(writable, readonly, worker);
+        return None;
+    }
+    Some(worker)
 }
 
 fn allowed_workers(
@@ -235,7 +240,21 @@ impl<'a> ExecutionBatches<'a> {
             > self.target_entry_bytes_per_batch
     }
 
-    fn push(&mut self, worker: ThreadId, id: usize, transaction: &TransactionState) {
+    /// Prepares and appends a transaction, returning false if the worker becomes unavailable.
+    fn try_push(
+        &mut self,
+        worker: ThreadId,
+        id: usize,
+        transaction: &TransactionState,
+        allowed_workers: &mut ThreadSet,
+    ) -> bool {
+        let transaction_bytes = transaction.transaction.view.data().len() as u64;
+        if self.should_send_before(worker, transaction_bytes) {
+            self.send_all(allowed_workers);
+        }
+        if !allowed_workers.contains(worker) {
+            return false;
+        }
         let pending = &mut self.pending_worker_batches[worker];
         let batch = pending.batch.as_mut().expect("batch has been prepared");
         // SAFETY: the scheduler retains this allocation until execution completes.
@@ -244,6 +263,15 @@ impl<'a> ExecutionBatches<'a> {
         unsafe { batch.try_push(region, id) }.expect("full batches are sent immediately");
         pending.cost_units = pending.cost_units.saturating_add(transaction.cost);
         pending.entry_bytes = pending.entry_bytes.saturating_add(u64::from(region.length));
+
+        if self.should_send(worker) {
+            // Match greedy: reaching a batch target sends all pending batches.
+            self.send_all(allowed_workers);
+        }
+        if self.worker_at_capacity(worker) {
+            allowed_workers.remove(worker);
+        }
+        true
     }
 
     fn should_send(&self, worker: ThreadId) -> bool {
@@ -513,6 +541,53 @@ mod tests {
         assert_batch(&mut scheduler, &mut agave, 1, &[fourth]);
         assert!(agave.workers[0].pack_to_worker.try_read().is_none());
         assert!(agave.workers[1].pack_to_worker.try_read().is_none());
+    }
+
+    #[test]
+    fn releases_locks_when_flushing_makes_worker_unavailable() {
+        let (mut scheduler, mut agave) = setup();
+        let queue_capacity = scheduler.workers[0].pack_to_worker.capacity();
+        // Leave room for two more outstanding batches before the worker becomes unavailable.
+        for _ in 0..queue_capacity - 2 {
+            scheduler.in_flight.track_batch(0, 0, 0);
+        }
+        let first = insert(&mut scheduler, 3, 1, &[1]);
+        let transaction_bytes = scheduler
+            .transactions
+            .get(first)
+            .unwrap()
+            .transaction
+            .view
+            .data()
+            .len() as u64;
+        scheduler.target_entry_bytes_per_batch = ENTRY_OVERHEAD_BYTES + transaction_bytes + 1;
+        let second = insert(&mut scheduler, 2, 1, &[1]);
+        let deferred = insert(&mut scheduler, 1, 1, &[1, 3]);
+
+        scheduler.schedule(1_000);
+
+        assert_eq!(scheduler.scheduled_cost, 2);
+        assert_eq!(scheduler.transactions.pop_highest(), Some(deferred));
+        assert_eq!(
+            scheduler
+                .transactions
+                .get(deferred)
+                .unwrap()
+                .execution_worker,
+            None
+        );
+        assert_batch(&mut scheduler, &mut agave, 0, &[first]);
+        assert_batch(&mut scheduler, &mut agave, 0, &[second]);
+        let account = Pubkey::from([3; 32]);
+        assert_eq!(
+            scheduler.account_locks.try_lock_accounts(
+                [&account].into_iter(),
+                core::iter::empty(),
+                ThreadSet::any(2),
+                |_| 1,
+            ),
+            Ok(1)
+        );
     }
 
     #[test]
