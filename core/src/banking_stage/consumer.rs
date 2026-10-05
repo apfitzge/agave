@@ -7,6 +7,7 @@ use {
         qos_service::QosService,
         scheduler_messages::MaxAge,
     },
+    agave_scheduling_utils::ENTRY_OVERHEAD_BYTES,
     solana_measure::measure_us,
     solana_poh::{
         poh_recorder::PohRecorderError,
@@ -33,8 +34,6 @@ use {
 
 /// Consumer will create chunks of transactions from buffer with up to this size.
 pub const TARGET_NUM_TRANSACTIONS_PER_BATCH: usize = 64;
-
-pub(crate) const ENTRY_OVERHEAD_BYTES: u64 = 48;
 
 const SERIALIZED_ENTRIES_OVERHEAD: u64 = ENTRY_OVERHEAD_BYTES + 8; // Vec<Entry> length
 
