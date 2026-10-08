@@ -82,6 +82,7 @@ dependencies = [
  "slab",
  "solana-clock",
  "solana-message",
+ "solana-metrics",
  "solana-pubkey 4.4.0",
  "solana-svm-transaction",
  "toml 1.1.7+spec-1.1.0",
