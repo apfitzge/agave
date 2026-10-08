@@ -25,6 +25,7 @@ agave-scheduler-handshake = { workspace = true }
 agave-scheduling-utils = { workspace = true }
 agave-transaction-view = { workspace = true }
 rts-alloc = { workspace = true }
+serde = { workspace = true }
 shaq = { workspace = true }
 slab = { workspace = true }
 solana-clock = { workspace = true }
@@ -32,6 +33,7 @@ solana-message = { workspace = true }
 solana-pubkey = { workspace = true, features = ["rand"] }
 solana-runtime-transaction = { workspace = true }
 solana-svm-transaction = { workspace = true }
+toml = { workspace = true }
 
 [dev-dependencies]
 solana-hash = { workspace = true }
