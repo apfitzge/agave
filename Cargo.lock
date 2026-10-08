@@ -89,6 +89,7 @@ dependencies = [
  "solana-clock",
  "solana-hash",
  "solana-message",
+ "solana-metrics",
  "solana-pubkey 4.4.0",
  "solana-runtime-transaction",
  "solana-signature",

@@ -60,6 +60,8 @@ impl Scheduler {
         };
         self.outstanding_check_packets = self.outstanding_check_packets.saturating_sub(batch.len());
         if message.processed_code != processed_codes::PROCESSED {
+            self.leader_slot_metrics.dropped =
+                self.leader_slot_metrics.dropped.saturating_add(batch.len());
             // SAFETY: the worker has released this batch. An unprocessed response has no
             // defined response region, so only the original allocations can be freed.
             unsafe { batch.free_with_transactions() };
@@ -75,6 +77,8 @@ impl Scheduler {
         let responses = unsafe {
             CheckResponsesPtr::from_transaction_response_region(&message.responses, &self.allocator)
         };
+        let mut buffered = 0usize;
+        let mut dropped = batch.len();
         for ((transaction, metadata), response) in batch.iter().zip(responses.iter()) {
             // SAFETY: the worker has finished using this exclusively owned transaction.
             let transaction = unsafe { OwnedTransactionPtr::new(transaction, &self.allocator) };
@@ -112,14 +116,25 @@ impl Scheduler {
                 cost: response.estimated_cost_units,
                 allocated_accounts_data_size: response.allocated_accounts_data_size,
             };
-            match self.transactions.insert(priority, transaction) {
+            let inserted = self.transactions.insert(priority, transaction);
+            if inserted.is_ok() {
+                buffered = buffered.saturating_add(1);
+            }
+            match inserted {
                 Ok((_, Some(transaction))) | Err(transaction) => {
                     // SAFETY: rejection or eviction returns exclusive ownership.
                     unsafe { transaction.transaction.free(&self.allocator) };
                 }
-                Ok((_, None)) => {}
+                Ok((_, None)) => {
+                    dropped = dropped
+                        .checked_sub(1)
+                        .expect("retained count exceeds batch length");
+                }
             }
         }
+        self.leader_slot_metrics.buffered =
+            self.leader_slot_metrics.buffered.saturating_add(buffered);
+        self.leader_slot_metrics.dropped = self.leader_slot_metrics.dropped.saturating_add(dropped);
         // SAFETY: each transaction has been retained or freed; only the container remains.
         unsafe { batch.free() };
         // SAFETY: all responses have been consumed and their nested allocations handled.
@@ -325,6 +340,7 @@ mod tests {
     #[test]
     fn rejected_response_frees_allocations() {
         let (mut scheduler, _agave) = setup(2);
+        scheduler.handle_leader_slot_metrics();
         let mut response = make_response(&scheduler.allocator);
         response.status_check_flags |= status_check_flags::ALREADY_PROCESSED;
         let message = make_message(&mut scheduler, Some(response));
@@ -333,6 +349,9 @@ mod tests {
         assert_eq!(scheduler.outstanding_check_packets, 0);
         assert_eq!(scheduler.transactions.len(), 0);
         assert_eq!(scheduler.allocator.outstanding_allocation_bytes(), 0);
+        let metrics = &scheduler.leader_slot_metrics;
+        assert_eq!(metrics.buffered, 0);
+        assert_eq!(metrics.dropped, 1);
     }
 
     #[test]
@@ -404,17 +423,20 @@ mod tests {
     #[test]
     fn unprocessed_message_frees_batch() {
         let (mut scheduler, _agave) = setup(2);
+        scheduler.handle_leader_slot_metrics();
         let message = make_message(&mut scheduler, None);
         scheduler.handle_check_worker_response(message, &sanitize_config());
 
         assert_eq!(scheduler.outstanding_check_packets, 0);
         assert_eq!(scheduler.transactions.len(), 0);
         assert_eq!(scheduler.allocator.outstanding_allocation_bytes(), 0);
+        assert_eq!(scheduler.leader_slot_metrics.dropped, 1);
     }
 
     #[test]
     fn eviction_and_rejection_do_not_leak() {
         let (mut scheduler, _agave) = setup(2);
+        scheduler.handle_leader_slot_metrics();
         scheduler.transactions = TransactionContainer::with_capacity(1);
         let response = make_response(&scheduler.allocator);
         let message = make_message(&mut scheduler, Some(response));
@@ -433,6 +455,9 @@ mod tests {
                 retained_bytes
             );
         }
+        let metrics = &scheduler.leader_slot_metrics;
+        assert_eq!(metrics.buffered, 2);
+        assert_eq!(metrics.dropped, 2);
     }
 
     #[test]
