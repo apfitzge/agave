@@ -21,6 +21,7 @@ use {
         sync::atomic::{AtomicBool, Ordering},
         time::Duration,
     },
+    log::{debug, info},
     rts_alloc::Allocator,
     solana_clock::Slot,
     solana_pubkey::{Pubkey, PubkeyHasherBuilder},
@@ -187,12 +188,15 @@ impl Scheduler {
 /// The exit flag cannot interrupt an in-progress handshake. The timeout has the syscall-level
 /// semantics of [`client::connect`], rather than imposing a deadline on the entire handshake.
 pub fn run(config: Config, exit: &AtomicBool) -> Result<(), ClientHandshakeError> {
+    info!("Waiting for Agave at {}", config.ipc_path.display());
     while !exit.load(Ordering::Relaxed) {
         if let Some(session) = try_connect(&config)? {
+            info!("Connected to Agave at {}", config.ipc_path.display());
             return run_session(session, config.scheduler, exit);
         }
         thread::sleep(CONNECTION_RETRY_INTERVAL);
     }
+    info!("Scheduler stopped while waiting for Agave");
     Ok(())
 }
 
@@ -202,6 +206,7 @@ pub fn run_session(
     config: SchedulerConfig,
     exit: &AtomicBool,
 ) -> Result<(), ClientHandshakeError> {
+    let worker_count = session.workers.len();
     let mut scheduler = Scheduler::new(
         session,
         config.transaction_state_capacity,
@@ -211,9 +216,11 @@ pub fn run_session(
         config.target_entry_bytes_per_batch,
     )?;
 
+    info!("Scheduler running with {worker_count} execution workers");
     while !exit.load(Ordering::Relaxed) {
         scheduler.run_iteration();
     }
+    info!("Scheduler stopped");
     Ok(())
 }
 
@@ -239,6 +246,7 @@ fn try_connect(config: &Config) -> Result<Option<ClientSession>, ClientHandshake
                 ErrorKind::NotFound | ErrorKind::ConnectionRefused
             ) =>
         {
+            debug!("Agave is not available yet: {error}");
             Ok(None)
         }
         Err(error) => Err(error),
