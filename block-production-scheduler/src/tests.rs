@@ -16,7 +16,7 @@ use {
     std::{io::ErrorKind, path::Path, sync::Arc, thread},
 };
 
-mod integration;
+mod scheduling_flows;
 
 fn config(path: &Path) -> Config {
     Config {
