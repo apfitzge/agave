@@ -163,7 +163,7 @@ impl Tpu {
         _generator_config: Option<GeneratorConfig>, /* vestigial code for replay invalidator */
         key_notifiers: Arc<RwLock<KeyUpdaters>>,
         banking_control_receiver: mpsc::Receiver<BankingControlMsg>,
-        scheduler_bindings: Option<(PathBuf, mpsc::Sender<BankingControlMsg>)>,
+        scheduler_bindings: (PathBuf, mpsc::Sender<BankingControlMsg>),
         cancel: CancellationToken,
         votor_event_sender: VotorEventSender,
     ) -> Self {
@@ -331,13 +331,16 @@ impl Tpu {
         );
 
         #[cfg(unix)]
-        let scheduler_bindings_ipc_socket_guard =
-            scheduler_bindings.map(|(path, banking_control_sender)| {
-                super::scheduler_bindings_server::spawn(&path, banking_control_sender)
-            });
+        let scheduler_bindings_ipc_socket_guard = {
+            let (path, banking_control_sender) = scheduler_bindings;
+            Some(super::scheduler_bindings_server::spawn(
+                &path,
+                banking_control_sender,
+            ))
+        };
         #[cfg(not(unix))]
         let scheduler_bindings_ipc_socket_guard = {
-            assert!(scheduler_bindings.is_none());
+            let _ = scheduler_bindings;
             None
         };
 
