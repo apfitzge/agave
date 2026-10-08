@@ -27,6 +27,13 @@ pub(crate) enum SchedulerState {
 }
 
 impl SchedulerState {
+    pub(crate) fn leader_slot(&self) -> Option<Slot> {
+        match self {
+            Self::NotLeader { .. } => None,
+            Self::LeaderStarting { slot } | Self::LeaderReady { slot, .. } => Some(*slot),
+        }
+    }
+
     pub(crate) fn new() -> Self {
         Self::NotLeader {
             current_slot: 0,
