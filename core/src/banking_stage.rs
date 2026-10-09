@@ -739,7 +739,9 @@ mod external {
                     Builder::new()
                         .name(format!("solECoWorker{id:02}"))
                         .spawn(move || {
-                            if let Err(err) = consume_worker.run(pack_to_worker, worker_to_pack) {
+                            if let Err(err) =
+                                consume_worker.run_execution_worker(pack_to_worker, worker_to_pack)
+                            {
                                 error!("External consume worker error; err={err}");
                             }
                         })

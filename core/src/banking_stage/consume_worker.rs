@@ -256,7 +256,7 @@ pub(crate) mod external {
             self.metrics.clone()
         }
 
-        pub fn run(
+        pub fn run_execution_worker(
             mut self,
             mut receiver: shaq::spsc::Consumer<PackToExecutionWorkerMessage>,
             mut sender: shaq::spsc::Producer<ExecutionWorkerToPackMessage>,
@@ -267,7 +267,11 @@ pub(crate) mod external {
             let mut sleep_duration = STARTING_SLEEP_DURATION;
 
             while !self.exit.load(Ordering::Relaxed) {
-                match self.iterate(&mut receiver, &mut sender, &mut should_drain_executes)? {
+                match self.iterate_execution(
+                    &mut receiver,
+                    &mut sender,
+                    &mut should_drain_executes,
+                )? {
                     IterationResult::ProcessedMessage => {
                         did_work = true;
                     }
@@ -287,7 +291,7 @@ pub(crate) mod external {
             Ok(())
         }
 
-        fn iterate(
+        fn iterate_execution(
             &mut self,
             receiver: &mut shaq::spsc::Consumer<PackToExecutionWorkerMessage>,
             sender: &mut shaq::spsc::Producer<ExecutionWorkerToPackMessage>,
@@ -303,7 +307,8 @@ pub(crate) mod external {
             *should_drain_executes = false;
             for message in messages {
                 // If the bank is unavailable, drain executes for the remainder of the batch.
-                let (drain, response) = self.process_message(&message, *should_drain_executes)?;
+                let (drain, response) =
+                    self.process_message(&message, *should_drain_executes, false)?;
                 *should_drain_executes |= drain;
                 sender
                     .try_write(response)
@@ -318,6 +323,7 @@ pub(crate) mod external {
             &mut self,
             message: &PackToExecutionWorkerMessage,
             should_drain_executes: bool,
+            simulate: bool,
         ) -> MessageResult {
             if !Self::validate_message(message) {
                 return Ok((
@@ -334,7 +340,7 @@ pub(crate) mod external {
                 .num_messages_processed
                 .fetch_add(1, Ordering::Relaxed);
 
-            self.execute_batch(message, should_drain_executes)
+            self.execute_batch(message, should_drain_executes, simulate)
         }
 
         /// Return whether to drain the rest of the batch and the response message.
@@ -342,6 +348,7 @@ pub(crate) mod external {
             &mut self,
             message: &PackToExecutionWorkerMessage,
             should_drain_executes: bool,
+            simulate: bool,
         ) -> MessageResult {
             if should_drain_executes {
                 return self
@@ -389,7 +396,7 @@ pub(crate) mod external {
 
             // Enforce all or nothing on translation_results.
             let execution_flags = ExecutionFlags {
-                simulate: false,
+                simulate,
                 drop_on_failure: message.flags & execution_message_flags::DROP_ON_FAILURE != 0,
                 all_or_nothing: message.flags & execution_message_flags::ALL_OR_NOTHING != 0,
             };
@@ -671,6 +678,51 @@ pub(crate) mod external {
                 _ => not_included_reasons::SANITIZE_FAILURE,
             }
         }
+
+        #[expect(dead_code)]
+        pub fn run_simulation_worker(
+            mut self,
+            receiver: shaq::mpmc::Consumer<PackToExecutionWorkerMessage>,
+            sender: shaq::mpmc::Producer<ExecutionWorkerToPackMessage>,
+        ) -> Result<(), ExternalConsumeWorkerError> {
+            while !self.exit.load(Ordering::Relaxed) {
+                if !self.iterate_simulation(&receiver, &sender)? {
+                    std::thread::yield_now();
+                }
+            }
+            Ok(())
+        }
+
+        fn iterate_simulation(
+            &mut self,
+            receiver: &shaq::mpmc::Consumer<PackToExecutionWorkerMessage>,
+            sender: &shaq::mpmc::Producer<ExecutionWorkerToPackMessage>,
+        ) -> Result<bool, ExternalConsumeWorkerError> {
+            self.allocator.clean_remote_frees();
+            let Some(message) = receiver.try_read() else {
+                return Ok(false);
+            };
+            let (_, response) = self.process_message(&message, false, true)?;
+            self.send_simulation_response(sender, response);
+            Ok(true)
+        }
+
+        fn send_simulation_response(
+            &self,
+            sender: &shaq::mpmc::Producer<ExecutionWorkerToPackMessage>,
+            mut response: ExecutionWorkerToPackMessage,
+        ) {
+            loop {
+                match sender.try_write(response) {
+                    Ok(()) => return,
+                    Err(unsent) => response = unsent,
+                }
+                if self.exit.load(Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::yield_now();
+            }
+        }
     }
 
     #[cfg(test)]
@@ -740,7 +792,7 @@ pub(crate) mod external {
             }
 
             fn iterate(&mut self) -> Result<(), ExternalConsumeWorkerError> {
-                let result = self.worker.iterate(
+                let result = self.worker.iterate_execution(
                     &mut self.receiver,
                     &mut self.sender,
                     &mut self.should_drain_executes,
@@ -1385,6 +1437,104 @@ pub(crate) mod external {
             assert!(responses[0].cost_units > 0);
             assert!(responses[0].fee_payer_balance > 0);
             assert_eq!(test_frame.bank.get_balance(&recipient), 1);
+
+            test_frame.free_batch(batch);
+        }
+
+        #[test]
+        fn test_simulation_workers_handle_mpmc_backpressure_without_committing() {
+            let mut test_frame = setup_external_test_frame();
+            test_frame.enable_execution();
+
+            let recipient = Pubkey::new_unique();
+            let batch = test_frame.allocate_batch(&[wincode::serialize(&transfer(
+                &test_frame.mint_keypair,
+                &recipient,
+                1,
+                test_frame.bank.confirmed_last_blockhash(),
+            ))
+            .unwrap()]);
+
+            let (request_sender, request_receiver) = shaq::mpmc::pair(16).unwrap();
+            let (response_sender, response_receiver) = shaq::mpmc::pair(1).unwrap();
+            let make_worker = || {
+                let (record_sender, _record_receiver) = record_channels(false);
+                let (replay_vote_sender, _replay_vote_receiver) = bounded(1024);
+                ExternalWorker::new(
+                    Arc::new(AtomicBool::new(false)),
+                    Consumer::new(
+                        Committer::new(None, replay_vote_sender, None),
+                        TransactionRecorder::new(record_sender),
+                        None,
+                    ),
+                    rts_alloc::Allocator::join_from_existing(&test_frame.allocator).unwrap(),
+                    test_frame.shared_leader_state.clone(),
+                )
+            };
+            let mut first_worker = make_worker();
+            let mut second_worker = make_worker();
+            let second_metrics = second_worker.metrics_handle();
+            let second_receiver = request_receiver.clone();
+            let second_sender = response_sender.clone();
+
+            assert!(
+                !first_worker
+                    .iterate_simulation(&request_receiver, &response_sender)
+                    .unwrap()
+            );
+            for _ in 0..2 {
+                request_sender
+                    .try_write(PackToExecutionWorkerMessage {
+                        flags: 0,
+                        max_working_slot: test_frame.bank.slot(),
+                        batch: batch.region,
+                    })
+                    .unwrap();
+            }
+            assert!(
+                first_worker
+                    .iterate_simulation(&request_receiver, &response_sender)
+                    .unwrap()
+            );
+            let (done_sender, done_receiver) = bounded(1);
+            let second_thread = std::thread::spawn(move || {
+                done_sender
+                    .send(second_worker.iterate_simulation(&second_receiver, &second_sender))
+                    .unwrap();
+            });
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while second_metrics
+                .count_metrics
+                .num_messages_processed
+                .load(Ordering::Relaxed)
+                == 0
+            {
+                assert!(Instant::now() < deadline, "second worker did not start");
+                std::thread::yield_now();
+            }
+            assert!(
+                done_receiver
+                    .recv_timeout(Duration::from_millis(10))
+                    .is_err()
+            );
+            let first_response = response_receiver.try_read().unwrap();
+            assert!(
+                done_receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .unwrap()
+            );
+            second_thread.join().unwrap();
+            let second_response = response_receiver.try_read().unwrap();
+
+            for response in [first_response, second_response] {
+                assert_eq!(response.processed_code, processed_codes::PROCESSED);
+                let responses = test_frame.execution_responses(&response.responses);
+                assert_eq!(responses.len(), 1);
+                assert_eq!(responses[0].not_included_reason, not_included_reasons::NONE);
+                assert!(responses[0].cost_units > 0);
+            }
+            assert_eq!(test_frame.bank.get_balance(&recipient), 0);
 
             test_frame.free_batch(batch);
         }
