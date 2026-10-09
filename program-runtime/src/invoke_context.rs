@@ -2121,6 +2121,51 @@ mod tests {
     }
 
     #[test]
+    fn test_instruction_account_index_after_255_references() {
+        let payer = Pubkey::new_unique();
+        let other_account = Pubkey::new_unique();
+        let program_id = Pubkey::new_unique();
+        let mut instruction_accounts = vec![0; 256];
+        instruction_accounts.push(1);
+        let message = new_sanitized_message(Message::new_with_compiled_instructions(
+            1,
+            0,
+            2,
+            vec![payer, other_account, program_id],
+            Hash::default(),
+            vec![solana_message::compiled_instruction::CompiledInstruction {
+                program_id_index: 2,
+                accounts: instruction_accounts,
+                data: vec![],
+            }],
+        ));
+        let accounts = vec![
+            (payer, AccountSharedData::default()),
+            (other_account, AccountSharedData::default()),
+            (program_id, create_loadable_account_for_test("noop")),
+        ];
+        with_mock_invoke_context!(invoke_context, transaction_context, accounts);
+        invoke_context
+            .prepare_top_level_instructions(&message)
+            .unwrap();
+
+        let instruction_context = invoke_context
+            .transaction_context
+            .get_next_instruction_context()
+            .unwrap();
+        assert_eq!(
+            instruction_context.get_index_of_instruction_account_in_transaction(256),
+            Ok(1),
+        );
+        // This currently returns 255: the absent-account sentinel is mistaken
+        // for the first occurrence of account 1 after 256 earlier references.
+        assert_eq!(
+            instruction_context.get_index_of_account_in_instruction(1),
+            Ok(256),
+        );
+    }
+
+    #[test]
     fn test_process_message_readonly_handling() {
         #[derive(wincode::SchemaRead, wincode::SchemaWrite)]
         enum MockSystemInstruction {
