@@ -732,7 +732,6 @@ mod external {
                         self.transaction_recorder.clone(),
                         self.log_messages_bytes_limit,
                     ),
-                    worker_to_pack,
                     allocator,
                     self.poh_recorder.read().unwrap().shared_leader_state(),
                 );
@@ -742,7 +741,7 @@ mod external {
                     Builder::new()
                         .name(format!("solECoWorker{id:02}"))
                         .spawn(move || {
-                            if let Err(err) = consume_worker.run(pack_to_worker) {
+                            if let Err(err) = consume_worker.run(pack_to_worker, worker_to_pack) {
                                 error!("External consume worker error; err={err}");
                             }
                         })
