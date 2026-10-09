@@ -125,6 +125,7 @@ impl<Tx: TransactionWithMeta> ConsumeWorker<Tx> {
             &work.transactions,
             &work.max_ages,
             &ExecutionFlags {
+                simulate: false,
                 drop_on_failure: false,
                 all_or_nothing: false,
             },
@@ -383,6 +384,7 @@ pub(crate) mod external {
 
             // Enforce all or nothing on translation_results.
             let execution_flags = ExecutionFlags {
+                simulate: false,
                 drop_on_failure: message.flags & execution_message_flags::DROP_ON_FAILURE != 0,
                 all_or_nothing: message.flags & execution_message_flags::ALL_OR_NOTHING != 0,
             };
@@ -961,6 +963,7 @@ pub(crate) mod external {
             assert!(ExternalWorker::validate_message_flags(
                 execution_message_flags::DROP_ON_FAILURE | execution_message_flags::ALL_OR_NOTHING
             ));
+            assert!(!ExternalWorker::validate_message_flags(1 << 2));
             assert!(!ExternalWorker::validate_message_flags(1 << 15));
         }
 
@@ -988,6 +991,7 @@ pub(crate) mod external {
                 })
                 .collect::<Vec<_>>();
             let execution_flags = ExecutionFlags {
+                simulate: false,
                 drop_on_failure: false,
                 all_or_nothing: false,
             };
@@ -1090,6 +1094,7 @@ pub(crate) mod external {
             let commit_details =
                 CommitTransactionDetails::NotCommitted(TransactionError::CommitCancelled);
             let execution_flags = ExecutionFlags {
+                simulate: false,
                 drop_on_failure: false,
                 all_or_nothing,
             };
