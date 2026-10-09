@@ -558,7 +558,6 @@ impl BankingStage {
         for (index, work_receiver) in work_receivers.into_iter().enumerate() {
             let id = index as u32;
             let consume_worker = ConsumeWorker::new(
-                id,
                 exit.clone(),
                 work_receiver,
                 Consumer::new(
@@ -725,7 +724,6 @@ mod external {
             {
                 let id = index as u32;
                 let consume_worker = ExternalWorker::new(
-                    id,
                     self.worker_exit_signal.clone(),
                     Consumer::new(
                         self.committer.clone(),

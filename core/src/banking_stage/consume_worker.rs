@@ -46,7 +46,6 @@ pub(crate) struct ConsumeWorker<Tx> {
 
 impl<Tx: TransactionWithMeta> ConsumeWorker<Tx> {
     pub fn new(
-        id: u32,
         exit: Arc<AtomicBool>,
         consume_receiver: Receiver<ConsumeWork<Tx>>,
         consumer: Consumer,
@@ -59,7 +58,7 @@ impl<Tx: TransactionWithMeta> ConsumeWorker<Tx> {
             consumer,
             consumed_sender,
             shared_leader_state,
-            metrics: Arc::new(ConsumeWorkerMetrics::new(id)),
+            metrics: Arc::new(ConsumeWorkerMetrics::new()),
         }
     }
 
@@ -239,7 +238,6 @@ pub(crate) mod external {
 
     impl ExternalWorker {
         pub fn new(
-            id: u32,
             exit: Arc<AtomicBool>,
             transaction_consumer: Consumer,
             allocator: rts_alloc::Allocator,
@@ -250,7 +248,7 @@ pub(crate) mod external {
                 transaction_consumer,
                 allocator,
                 shared_leader_state,
-                metrics: Arc::new(ConsumeWorkerMetrics::new(id)),
+                metrics: Arc::new(ConsumeWorkerMetrics::new()),
             }
         }
 
@@ -891,7 +889,6 @@ pub(crate) mod external {
             let exit = Arc::new(AtomicBool::new(false));
 
             let worker = ExternalWorker::new(
-                0,
                 exit.clone(),
                 consumer,
                 agave_worker.allocator,
@@ -1571,7 +1568,6 @@ fn backoff(idle_duration: Duration, sleep_duration: &Duration) -> Duration {
 /// since the consume worker thread is sleeping unless there is work to be
 /// done.
 pub(crate) struct ConsumeWorkerMetrics {
-    id: String,
     interval: AtomicInterval,
     has_data: AtomicBool,
 
@@ -1582,20 +1578,19 @@ pub(crate) struct ConsumeWorkerMetrics {
 
 impl ConsumeWorkerMetrics {
     /// Report and reset metrics iff the interval has elapsed and the worker did some work.
-    pub fn maybe_report_and_reset(&self) {
+    pub fn maybe_report_and_reset(&self, id: &str) {
         const REPORT_INTERVAL_MS: u64 = 20;
         if self.interval.should_update(REPORT_INTERVAL_MS)
             && self.has_data.swap(false, Ordering::Relaxed)
         {
-            self.count_metrics.report_and_reset(&self.id);
-            self.timing_metrics.report_and_reset(&self.id);
-            self.error_metrics.report_and_reset(&self.id);
+            self.count_metrics.report_and_reset(id);
+            self.timing_metrics.report_and_reset(id);
+            self.error_metrics.report_and_reset(id);
         }
     }
 
-    fn new(id: u32) -> Self {
+    fn new() -> Self {
         Self {
-            id: id.to_string(),
             interval: AtomicInterval::default(),
             has_data: AtomicBool::new(false),
             count_metrics: ConsumeWorkerCountMetrics::default(),
@@ -2152,7 +2147,6 @@ mod tests {
         let (consume_sender, consume_receiver) = bounded(1024);
         let (consumed_sender, consumed_receiver) = bounded(1024);
         let worker = ConsumeWorker::new(
-            0,
             Arc::new(AtomicBool::new(false)),
             consume_receiver,
             consumer,
