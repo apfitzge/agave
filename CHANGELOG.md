@@ -109,6 +109,8 @@ Release channels have their own copy of this changelog:
   the ledger, and an existing one can be deleted.
 * The TPU vote QUIC server has been removed; the node no longer advertises a `tpu_vote` QUIC
   address in gossip. Votes are received over UDP `tpu_vote` and gossip.
+* Scheduler bindings are always enabled, allowing external schedulers to connect
+  without `--enable-scheduler-bindings`. The flag is deprecated and has no effect.
 
 #### Deprecations
 

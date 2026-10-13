@@ -14,6 +14,7 @@ use {
             ForwardAddressGetter, ForwardingClientConfig, SpawnForwardingStageResult,
             spawn_forwarding_stage,
         },
+        scheduler_bindings_server::BindingsGuard,
         sigverify_stage::SigVerifyStage,
         staked_nodes_updater_service::StakedNodesUpdaterService,
         tpu_entry_notifier::TpuEntryNotifier,
@@ -84,6 +85,7 @@ pub struct Tpu {
     fetch_stage: FetchStage,
     sigverify_stage: SigVerifyStage,
     banking_stage: BankingStageHandle,
+    scheduler_bindings_ipc_socket_guard: Option<BindingsGuard>,
     forwarding_stage: JoinHandle<()>,
     broadcast_stage: BroadcastStage,
     tpu_quic_t: thread::JoinHandle<()>,
@@ -132,7 +134,7 @@ impl Tpu {
         _generator_config: Option<GeneratorConfig>, /* vestigial code for replay invalidator */
         key_notifiers: Arc<RwLock<KeyUpdaters>>,
         banking_control_receiver: mpsc::Receiver<BankingControlMsg>,
-        scheduler_bindings: Option<(PathBuf, mpsc::Sender<BankingControlMsg>)>,
+        scheduler_bindings: (PathBuf, mpsc::Sender<BankingControlMsg>),
         cancel: CancellationToken,
         votor_event_sender: VotorEventSender,
     ) -> Self {
@@ -252,11 +254,18 @@ impl Tpu {
         );
 
         #[cfg(unix)]
-        if let Some((path, banking_control_sender)) = scheduler_bindings {
-            super::scheduler_bindings_server::spawn(&path, banking_control_sender);
-        }
+        let scheduler_bindings_ipc_socket_guard = {
+            let (path, banking_control_sender) = scheduler_bindings;
+            Some(super::scheduler_bindings_server::spawn(
+                &path,
+                banking_control_sender,
+            ))
+        };
         #[cfg(not(unix))]
-        assert!(scheduler_bindings.is_none());
+        let scheduler_bindings_ipc_socket_guard = {
+            let _ = scheduler_bindings;
+            None
+        };
 
         let SpawnForwardingStageResult {
             join_handle: forwarding_stage,
@@ -308,6 +317,7 @@ impl Tpu {
             fetch_stage,
             sigverify_stage,
             banking_stage,
+            scheduler_bindings_ipc_socket_guard,
             forwarding_stage,
             broadcast_stage,
             tpu_quic_t,
@@ -320,6 +330,7 @@ impl Tpu {
 
     pub fn join(self) -> thread::Result<()> {
         drop(self.vote_packet_sender);
+        drop(self.scheduler_bindings_ipc_socket_guard);
         let results = vec![
             self.fetch_stage.join(),
             self.sigverify_stage.join(),
