@@ -48,6 +48,8 @@ Release channels have their own copy of this changelog:
 * The default full snapshot interval is now 200,000 slots.
 * XDP interface, address, and transmitter setup failures now report startup errors instead of
   panicking.
+* Scheduler bindings are always enabled, allowing external schedulers to connect
+  without `--enable-scheduler-bindings`. The flag is deprecated and has no effect.
 
 #### Deprecations
 
