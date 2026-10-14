@@ -719,6 +719,9 @@ pub struct Validator {
     pub cluster_info: Arc<ClusterInfo>,
     pub bank_forks: Arc<RwLock<BankForks>>,
     pub blockstore: Arc<Blockstore>,
+    /// Keep the event directory alive even when no admin RPC metadata or event
+    /// producers retain a handle yet.
+    _event_system: EventSystem,
     geyser_plugin_service: Option<GeyserPluginService>,
     /// Held for the lifetime of the validator so the dispatch thread keeps
     /// running. `None` when no loaded plugin opted into contact info
@@ -1884,7 +1887,7 @@ impl Validator {
         }
 
         *admin_rpc_service_post_init.write().unwrap() = Some(AdminRpcRequestMetadataPostInit {
-            event_system,
+            event_system: event_system.clone(),
             bank_forks: bank_forks.clone(),
             cluster_info: cluster_info.clone(),
             vote_account: *vote_account,
@@ -1925,6 +1928,7 @@ impl Validator {
             cluster_info,
             bank_forks,
             blockstore,
+            _event_system: event_system,
             geyser_plugin_service,
             _contact_info_notifier: contact_info_notifier,
             blockstore_metric_report_service,
