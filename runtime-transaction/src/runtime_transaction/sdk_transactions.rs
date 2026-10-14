@@ -9,7 +9,7 @@ use {
     },
     solana_message::{AddressLoader, TransactionSignatureDetails},
     solana_pubkey::Pubkey,
-    solana_svm_transaction::instruction::SVMInstruction,
+    solana_svm_transaction::{instruction::SVMInstruction, svm_message::SVMMessage},
     solana_transaction::{
         sanitized::{MessageHash, SanitizedTransaction},
         simple_vote_transaction_checker::is_simple_vote_transaction,
@@ -137,6 +137,9 @@ impl RuntimeTransaction<SanitizedTransaction> {
             is_simple_vote_tx,
             address_loader,
             reserved_account_keys,
+        )?;
+        crate::transaction_limits::validate_unique_account_keys(
+            sanitized_transaction.account_keys().iter(),
         )?;
 
         let tx = Self {
@@ -429,7 +432,7 @@ mod tests {
 
     #[test]
     fn test_simd_406_instruction_accounts_limit() {
-        let account_keys = vec![Pubkey::new_unique(); 3];
+        let account_keys = (0..3).map(|_| Pubkey::new_unique()).collect::<Vec<_>>();
         let header = MessageHeader {
             num_required_signatures: 1,
             num_readonly_signed_accounts: 0,

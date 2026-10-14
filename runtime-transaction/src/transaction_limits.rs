@@ -7,16 +7,29 @@ use {
     },
     solana_compute_budget::compute_budget_limits::{MAX_HEAP_FRAME_BYTES, MIN_HEAP_FRAME_BYTES},
     solana_message::v1,
+    solana_pubkey::Pubkey,
     solana_svm_transaction::svm_transaction::SVMStaticTransaction,
     solana_transaction::versioned::TransactionVersion,
     solana_transaction_context::{MAX_ACCOUNTS_PER_INSTRUCTION, MAX_INSTRUCTION_TRACE_LENGTH},
     solana_transaction_error::{TransactionError, TransactionResult},
+    std::collections::HashSet,
 };
 
 /// Maximum serialized transaction size for legacy and v0 transactions, in bytes.
 const MAX_LEGACY_AND_V0_TRANSACTION_SIZE: usize = 1232;
 const MAX_V1_SIGNATURES: usize = 12;
 const MAX_V1_ACCOUNTS: usize = 64;
+
+pub(crate) fn validate_unique_account_keys<'a>(
+    account_keys: impl IntoIterator<Item = &'a Pubkey>,
+) -> TransactionResult<()> {
+    let mut seen = HashSet::new();
+    if account_keys.into_iter().any(|key| !seen.insert(key)) {
+        Err(TransactionError::AccountLoadedTwice)
+    } else {
+        Ok(())
+    }
+}
 
 pub(crate) fn validate_transaction_limits(
     transaction: &impl SVMStaticTransaction,
@@ -83,16 +96,19 @@ mod tests {
         super::*,
         crate::{runtime_transaction::RuntimeTransaction, sanitize_config::sanitize_config},
         agave_transaction_view::{
+            resolved_transaction_view::ResolvedTransactionView,
             transaction_version::TransactionVersion, transaction_view::SanitizedTransactionView,
         },
         solana_hash::Hash,
         solana_message::{
-            Message, MessageHeader, VersionedMessage, compiled_instruction::CompiledInstruction, v0,
+            Message, MessageHeader, SimpleAddressLoader, VersionedMessage,
+            compiled_instruction::CompiledInstruction,
+            v0::{self, LoadedAddresses, MessageAddressTableLookup},
         },
         solana_pubkey::Pubkey,
         solana_signature::Signature,
         solana_transaction::{
-            sanitized::MessageHash,
+            sanitized::{MessageHash, SanitizedTransaction},
             versioned::{VersionedTransaction, sanitized::SanitizedVersionedTransaction},
         },
     };
@@ -152,6 +168,121 @@ mod tests {
         assert_eq!(
             result.err(),
             (!valid).then_some(TransactionError::SanitizeFailure)
+        );
+    }
+
+    #[test]
+    fn test_duplicate_static_accounts_rejected_by_resolved_constructors() {
+        for version in [
+            TransactionVersion::Legacy,
+            TransactionVersion::V0,
+            TransactionVersion::V1,
+        ] {
+            let mut tx = transaction(version, vec![]);
+            match &mut tx.message {
+                VersionedMessage::Legacy(message) => {
+                    message.account_keys[1] = message.account_keys[0]
+                }
+                VersionedMessage::V0(message) => message.account_keys[1] = message.account_keys[0],
+                VersionedMessage::V1(message) => message.account_keys[1] = message.account_keys[0],
+            }
+
+            let bytes = wincode::serialize(&tx).unwrap();
+            if !matches!(version, TransactionVersion::V1) {
+                // The currently pinned SDK still rejects duplicate V1 keys during sanitization.
+                let static_tx = RuntimeTransaction::<SanitizedVersionedTransaction>::try_from(
+                    tx,
+                    MessageHash::Compute,
+                    None,
+                )
+                .unwrap();
+                let address_loader = if matches!(version, TransactionVersion::V0) {
+                    SimpleAddressLoader::Enabled(LoadedAddresses::default())
+                } else {
+                    SimpleAddressLoader::Disabled
+                };
+                assert_eq!(
+                    RuntimeTransaction::<SanitizedTransaction>::try_from(
+                        static_tx,
+                        address_loader,
+                        &HashSet::new(),
+                    )
+                    .err(),
+                    Some(TransactionError::AccountLoadedTwice),
+                );
+            }
+
+            let view = SanitizedTransactionView::try_new_sanitized(&bytes[..], &sanitize_config())
+                .unwrap();
+            let static_tx = RuntimeTransaction::<SanitizedTransactionView<_>>::try_new(
+                view,
+                MessageHash::Compute,
+                None,
+            )
+            .unwrap();
+            let loaded_addresses =
+                matches!(version, TransactionVersion::V0).then(LoadedAddresses::default);
+            assert_eq!(
+                RuntimeTransaction::<ResolvedTransactionView<_>>::try_new(
+                    static_tx,
+                    loaded_addresses,
+                    &HashSet::new(),
+                )
+                .err(),
+                Some(TransactionError::AccountLoadedTwice),
+            );
+        }
+    }
+
+    #[test]
+    fn test_duplicate_loaded_account_rejected_by_resolved_constructors() {
+        let mut tx = transaction(TransactionVersion::V0, vec![]);
+        let VersionedMessage::V0(message) = &mut tx.message else {
+            unreachable!();
+        };
+        let duplicate_key = message.account_keys[0];
+        message.address_table_lookups = vec![MessageAddressTableLookup {
+            account_key: Pubkey::new_unique(),
+            writable_indexes: vec![],
+            readonly_indexes: vec![0],
+        }];
+        let loaded_addresses = LoadedAddresses {
+            writable: vec![],
+            readonly: vec![duplicate_key],
+        };
+        let bytes = wincode::serialize(&tx).unwrap();
+        let sdk_tx = RuntimeTransaction::<SanitizedVersionedTransaction>::try_from(
+            tx,
+            MessageHash::Compute,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            RuntimeTransaction::<SanitizedTransaction>::try_from(
+                sdk_tx,
+                SimpleAddressLoader::Enabled(loaded_addresses.clone()),
+                &HashSet::new(),
+            )
+            .err(),
+            Some(TransactionError::AccountLoadedTwice),
+        );
+
+        let view =
+            SanitizedTransactionView::try_new_sanitized(&bytes[..], &sanitize_config()).unwrap();
+        let static_tx = RuntimeTransaction::<SanitizedTransactionView<_>>::try_new(
+            view,
+            MessageHash::Compute,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            RuntimeTransaction::<ResolvedTransactionView<_>>::try_new(
+                static_tx,
+                Some(loaded_addresses),
+                &HashSet::new(),
+            )
+            .err(),
+            Some(TransactionError::AccountLoadedTwice),
         );
     }
 
