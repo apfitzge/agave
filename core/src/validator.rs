@@ -3341,10 +3341,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(matches!(
+        assert_matches!(
             initialize_event_system(&reader),
             Err(InitializeEventSystemError::PrimaryAccessRequired)
-        ));
+        );
         assert!(stale_event.exists());
 
         let _event_system = initialize_event_system(&blockstore).unwrap();
