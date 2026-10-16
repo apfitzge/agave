@@ -679,7 +679,6 @@ pub(crate) mod external {
             }
         }
 
-        #[expect(dead_code)]
         pub fn run_simulation_worker(
             mut self,
             receiver: shaq::mpmc::Consumer<PackToExecutionWorkerMessage>,
