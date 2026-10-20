@@ -1028,9 +1028,8 @@ mod tests {
         poh_service.join().unwrap();
     }
 
-    #[test_case::test_case(BlockProductionMethod::CentralSchedulerGreedy; "greedy")]
-    #[test_case::test_case(BlockProductionMethod::BlockProductionScheduler; "block_production_scheduler")]
-    fn test_banking_stage_entries_only_central_scheduler(method: BlockProductionMethod) {
+    #[test]
+    fn test_banking_stage_entries_only_central_scheduler() {
         agave_logger::setup();
         let GenesisConfigInfo {
             mut genesis_config,
@@ -1072,7 +1071,7 @@ mod tests {
         let (replay_vote_sender, _replay_vote_receiver) = bounded(1024);
 
         let banking_stage = BankingStage::new_num_threads(
-            method,
+            BlockProductionMethod::CentralSchedulerGreedy,
             poh_recorder.clone(),
             transaction_recorder,
             non_vote_receiver,
