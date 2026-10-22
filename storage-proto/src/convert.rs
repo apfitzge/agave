@@ -131,7 +131,8 @@ impl From<Reward> for generated::Reward {
                 Some(RewardType::Voting) => generated::RewardType::Voting,
                 Some(RewardType::DeactivatedStake) => generated::RewardType::DeactivatedStake,
                 Some(RewardType::VATDebit) => generated::RewardType::VatDebit,
-                _ => generated::RewardType::Unspecified,
+                Some(RewardType::BlockRevenueSharing) => generated::RewardType::BlockRevenueSharing,
+                Some(_) => generated::RewardType::Unspecified,
             } as i32,
             commission: reward.commission.map(|c| c.to_string()).unwrap_or_default(),
             commission_bps: reward
@@ -156,6 +157,7 @@ impl From<generated::Reward> for Reward {
                 4 => Some(RewardType::Voting),
                 5 => Some(RewardType::DeactivatedStake),
                 6 => Some(RewardType::VATDebit),
+                7 => Some(RewardType::BlockRevenueSharing),
                 _ => None,
             },
             commission: reward.commission.parse::<u8>().ok(),
@@ -1441,6 +1443,14 @@ mod test {
 
         reward.reward_type = Some(RewardType::VATDebit);
         let gen_reward: generated::Reward = reward.clone().into();
+        assert_eq!(reward, gen_reward.into());
+
+        reward.reward_type = Some(RewardType::BlockRevenueSharing);
+        let gen_reward: generated::Reward = reward.clone().into();
+        assert_eq!(
+            gen_reward.reward_type,
+            generated::RewardType::BlockRevenueSharing as i32
+        );
         assert_eq!(reward, gen_reward.into());
     }
 
