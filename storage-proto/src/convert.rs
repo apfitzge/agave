@@ -131,6 +131,7 @@ impl From<Reward> for generated::Reward {
                 Some(RewardType::Voting) => generated::RewardType::Voting,
                 Some(RewardType::DeactivatedStake) => generated::RewardType::DeactivatedStake,
                 Some(RewardType::VATDebit) => generated::RewardType::VatDebit,
+                _ => generated::RewardType::Unspecified,
             } as i32,
             commission: reward.commission.map(|c| c.to_string()).unwrap_or_default(),
             commission_bps: reward
