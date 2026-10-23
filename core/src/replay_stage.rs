@@ -120,6 +120,7 @@ use {
 };
 
 mod dead_slots;
+pub mod events;
 mod update_parent;
 
 use {
