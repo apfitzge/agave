@@ -40,6 +40,7 @@ impl Scheduler {
             let Some(message) = self.check_receiver.try_read() else {
                 break;
             };
+            self.outstanding_check_batches = self.outstanding_check_batches.wrapping_sub(1);
             received_packets =
                 received_packets.saturating_add(usize::from(message.batch.num_transactions));
             self.handle_check_worker_response(message);
@@ -288,6 +289,7 @@ mod tests {
         .unwrap();
         scheduler.outstanding_check_packets =
             scheduler.outstanding_check_packets.checked_add(1).unwrap();
+        scheduler.outstanding_check_batches = scheduler.outstanding_check_batches.wrapping_add(1);
         CheckWorkerToPackMessage {
             batch: batch.to_sharable_transaction_batch_region(),
             processed_code: if response.is_some() {
