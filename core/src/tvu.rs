@@ -33,6 +33,7 @@ use {
         pubkeys::VerifiedVotorSlotsMessage,
         rewards::RewardInput,
     },
+    agave_event_system::EventSystem,
     agave_jemalloc::jemalloc::Arena,
     agave_votor::{
         event::{LatestSwitchRequest, LeaderWindowInfo, VotorEventReceiver, VotorEventSender},
@@ -263,6 +264,7 @@ impl Tvu {
         vote_connection_cache: Arc<ConnectionCache>,
         votor_init: AlpenglowInitializationState,
         reward_aggregates_sender: Sender<RewardInput>,
+        event_system: &EventSystem,
     ) -> Result<Self, String> {
         let migration_status = bank_forks.read().unwrap().migration_status();
 
@@ -648,7 +650,12 @@ impl Tvu {
 
         let drop_bank_service = DropBankService::new(drop_bank_receiver);
 
-        let replay_stage = ReplayStage::new(replay_stage_config, replay_senders, replay_receivers)?;
+        let replay_stage = ReplayStage::new(
+            replay_stage_config,
+            replay_senders,
+            replay_receivers,
+            event_system,
+        )?;
 
         let blockstore_cleanup_service = BlockstoreCleanupService::new(
             blockstore.clone(),
@@ -944,6 +951,7 @@ pub mod tests {
                 bank_forks_controller_receiver,
             },
             reward_vote_aggregates_sender,
+            &EventSystem::stub(),
         )
         .expect("assume success");
         exit.store(true, Ordering::Relaxed);

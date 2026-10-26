@@ -515,6 +515,7 @@ fn test_child_slots_of_same_parent() {
             transaction_status_sender: None,
             migration_status: &MigrationStatus::default(),
             my_pubkey: &Pubkey::default(),
+            slot_event_publisher: &mut Publisher::stub(),
         },
         &mut progress,
         &mut replay_timing,
@@ -549,6 +550,7 @@ fn test_child_slots_of_same_parent() {
             transaction_status_sender: None,
             migration_status: &MigrationStatus::default(),
             my_pubkey: &Pubkey::default(),
+            slot_event_publisher: &mut Publisher::stub(),
         },
         &mut progress,
         &mut replay_timing,
@@ -3274,6 +3276,7 @@ fn test_purge_unconfirmed_duplicate_slots_and_reattach() {
             transaction_status_sender: None,
             migration_status: &MigrationStatus::default(),
             my_pubkey: &Pubkey::default(),
+            slot_event_publisher: &mut Publisher::stub(),
         },
         &mut progress,
         &mut replay_timing,
@@ -3309,6 +3312,7 @@ fn test_purge_unconfirmed_duplicate_slots_and_reattach() {
             transaction_status_sender: None,
             migration_status: &MigrationStatus::default(),
             my_pubkey: &Pubkey::default(),
+            slot_event_publisher: &mut Publisher::stub(),
         },
         &mut progress,
         &mut replay_timing,
@@ -3345,6 +3349,7 @@ fn test_purge_unconfirmed_duplicate_slots_and_reattach() {
             transaction_status_sender: None,
             migration_status: &MigrationStatus::default(),
             my_pubkey: &Pubkey::default(),
+            slot_event_publisher: &mut Publisher::stub(),
         },
         &mut progress,
         &mut replay_timing,
@@ -3380,6 +3385,7 @@ fn test_purge_unconfirmed_duplicate_slots_and_reattach() {
             transaction_status_sender: None,
             migration_status: &MigrationStatus::default(),
             my_pubkey: &Pubkey::default(),
+            slot_event_publisher: &mut Publisher::stub(),
         },
         &mut progress,
         &mut replay_timing,
@@ -3554,6 +3560,7 @@ fn test_headerless_update_parent(transaction_status_disconnected: bool) {
             transaction_status_sender: Some(&transaction_status_sender),
             migration_status: &migration_status,
             my_pubkey: &my_pubkey,
+            slot_event_publisher: &mut Publisher::stub(),
         },
         &mut progress,
         &mut replay_timing,
@@ -4240,6 +4247,7 @@ fn test_replay_own_update_full() {
             transaction_status_sender: None,
             migration_status: &migration_status,
             my_pubkey: &my_pubkey,
+            slot_event_publisher: &mut Publisher::stub(),
         },
         &mut progress,
         &mut replay_timing,
@@ -6382,6 +6390,7 @@ fn test_dumped_slot_not_causing_panic() {
             &banking_tracer,
             has_new_vote_been_rooted,
             &MigrationStatus::default(),
+            &mut Publisher::stub(),
         )
         .is_none()
     );
@@ -7065,6 +7074,7 @@ fn test_skip_leader_slot_for_existing_slot() {
             &banking_tracer,
             has_new_vote_been_rooted,
             &MigrationStatus::default(),
+            &mut Publisher::stub(),
         )
         .is_none()
     );
@@ -7096,6 +7106,7 @@ fn test_skip_leader_slot_for_existing_slot() {
             &banking_tracer,
             has_new_vote_been_rooted,
             &MigrationStatus::default(),
+            &mut Publisher::stub(),
         )
         .is_some()
     );

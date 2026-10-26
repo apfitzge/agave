@@ -28,9 +28,15 @@ use {
                 AncestorDuplicateSlotsReceiver, DumpedSlotsSender, PopularPrunedForksReceiver,
             },
         },
+        replay_stage::events::SlotEvent,
         unfrozen_gossip_verified_vote_hashes::UnfrozenGossipVerifiedVoteHashes,
         voting_service::VoteOp,
         window_service::DuplicateSlotReceiver,
+    },
+    agave_event_system::{
+        EventSystem, StreamConfig,
+        event_metadata::{cached_thread_and_process_id, monotonic_timestamp_ns},
+        publisher::Publisher,
     },
     agave_jemalloc::jemalloc::Arena,
     agave_votor::{
@@ -351,6 +357,8 @@ struct NewBankForksContext<'a> {
     migration_status: &'a MigrationStatus,
     /// This validator's identity, used to leave live own-leader banks to BCL.
     my_pubkey: &'a Pubkey,
+    /// Publisher for banks inserted by replay.
+    slot_event_publisher: &'a mut Publisher<SlotEvent>,
 }
 
 struct LastVoteRefreshTime {
@@ -763,6 +771,7 @@ impl ReplayStage {
         config: ReplayStageConfig,
         senders: ReplaySenders,
         receivers: ReplayReceivers,
+        event_system: &EventSystem,
     ) -> Result<Self, String> {
         let ReplayStageConfig {
             vote_account,
@@ -829,6 +838,17 @@ impl ReplayStage {
 
         trace!("replay stage");
 
+        let slot_event_factory = event_system
+            .create_stream::<SlotEvent>(
+                events::SLOT_EVENT_STREAM,
+                StreamConfig {
+                    capacity: 1024,
+                    publisher_slots: 1,
+                    subscriber_slots: 8,
+                },
+            )
+            .map_err(|err| format!("Failed to create replay slot-event stream: {err}"))?;
+
         // Start the replay stage loop
         let migration_status = bank_forks.read().unwrap().migration_status();
         let mut identity_keypair = cluster_info.keypair().clone();
@@ -842,6 +862,9 @@ impl ReplayStage {
         *replay_highest_frozen.highest_frozen_slot.lock().unwrap() = highest_frozen_slot;
 
         let run_replay = move || {
+            let mut slot_event_publisher = slot_event_factory
+                .try_create_publisher()
+                .expect("fresh replay stream has one publisher slot");
             if let Some(arena) = replay_arena {
                 arena
                     .bind_current_thread_permanently()
@@ -991,6 +1014,7 @@ impl ReplayStage {
                         &my_pubkey,
                         &mut progress,
                         &mut async_verification_freelist,
+                        &mut slot_event_publisher,
                     ),
                     Err(TryRecvError::Disconnected)
                 ) {
@@ -1025,6 +1049,7 @@ impl ReplayStage {
                         transaction_status_sender: transaction_status_sender.as_ref(),
                         migration_status: migration_status.as_ref(),
                         my_pubkey: &my_pubkey,
+                        slot_event_publisher: &mut slot_event_publisher,
                     },
                     &mut progress,
                     &mut replay_timing,
@@ -1594,6 +1619,7 @@ impl ReplayStage {
                             &banking_tracer,
                             has_new_vote_been_rooted,
                             migration_status.as_ref(),
+                            &mut slot_event_publisher,
                         )
                     {
                         Self::log_leader_change(
@@ -1649,6 +1675,7 @@ impl ReplayStage {
                                     &process_bank_forks_context,
                                     &mut progress,
                                     &mut async_verification_freelist,
+                                    &mut slot_event_publisher,
                                 );
                             }
                         },
@@ -3035,6 +3062,7 @@ impl ReplayStage {
         banking_tracer: &Arc<BankingTracer>,
         has_new_vote_been_rooted: bool,
         migration_status: &MigrationStatus,
+        slot_event_publisher: &mut Publisher<SlotEvent>,
     ) -> Option<Slot> {
         assert!(!migration_status.is_alpenglow_enabled());
         // all the individual calls to poh_recorder.read() are designed to
@@ -3148,11 +3176,21 @@ impl ReplayStage {
             // new()-ing of its child bank
             banking_tracer.hash_event(parent.slot(), &parent.last_blockhash(), &parent.hash());
 
+            let bank_id = tpu_bank.bank_id().into();
             update_bank_forks_and_poh_recorder_for_new_tpu_bank(
                 bank_forks,
                 poh_controller,
                 tpu_bank,
             );
+            let (tid, pid) = cached_thread_and_process_id();
+            let _ = slot_event_publisher.publish(&SlotEvent::Begin {
+                pid,
+                tid,
+                timestamp_ns: monotonic_timestamp_ns(),
+                slot: poh_slot,
+                parent: parent_slot,
+                bank_id,
+            });
             Some(poh_slot)
         } else {
             error!("{my_pubkey} No next leader found");
@@ -5335,6 +5373,7 @@ impl ReplayStage {
         my_pubkey: &Pubkey,
         progress: &mut ProgressMap,
         async_verification_freelist: &mut Vec<AsyncVerificationProgress>,
+        slot_event_publisher: &mut Publisher<SlotEvent>,
     ) -> Result<(), TryRecvError> {
         if let Some(command) = bank_forks_controller_receiver.take_set_root_command() {
             Self::process_set_root_command(command, context, my_pubkey, progress);
@@ -5347,6 +5386,7 @@ impl ReplayStage {
                 context,
                 progress,
                 async_verification_freelist,
+                slot_event_publisher,
             );
         }
     }
@@ -5400,6 +5440,7 @@ impl ReplayStage {
         context: &ProcessBankForksContext,
         progress: &mut ProgressMap,
         async_verification_freelist: &mut Vec<AsyncVerificationProgress>,
+        slot_event_publisher: &mut Publisher<SlotEvent>,
     ) {
         debug_assert!(
             context
@@ -5442,6 +5483,18 @@ impl ReplayStage {
                     }
                 };
 
+                if let Some(bank) = bank.as_ref() {
+                    let (tid, pid) = cached_thread_and_process_id();
+                    let _ = slot_event_publisher.publish(&SlotEvent::Begin {
+                        pid,
+                        tid,
+                        timestamp_ns: monotonic_timestamp_ns(),
+                        slot: bank.slot(),
+                        parent: bank.parent_slot(),
+                        bank_id: bank.bank_id().into(),
+                    });
+                }
+
                 response_sender.send(bank).unwrap_or_else(|_| {
                     warn!("bank forks controller insert-bank response receiver dropped")
                 });
@@ -5480,6 +5533,7 @@ impl ReplayStage {
             transaction_status_sender,
             migration_status,
             my_pubkey,
+            slot_event_publisher,
         } = ctx;
 
         // Find the next slot that chains to the old slot
@@ -5636,7 +5690,17 @@ impl ReplayStage {
                     }
                     progress.insert(slot, fork_progress);
                 }
+                let (tid, pid) = cached_thread_and_process_id();
+                let event = SlotEvent::Begin {
+                    pid,
+                    tid,
+                    timestamp_ns: monotonic_timestamp_ns(),
+                    slot,
+                    parent: bank.parent_slot(),
+                    bank_id: bank.bank_id().into(),
+                };
                 forks.insert(bank);
+                let _ = slot_event_publisher.publish(&event);
             }
         }
         generate_new_bank_forks_write_lock.stop();
