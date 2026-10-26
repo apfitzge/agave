@@ -98,7 +98,7 @@ pub(crate) fn set_root(
 ///
 /// Votor does not need the progress map or other tower bft structures, so it will not use the callback.
 #[allow(clippy::too_many_arguments)]
-pub fn check_and_handle_new_root<CB>(
+pub fn check_and_handle_new_root<CB, RB>(
     parent_slot: Slot,
     new_root: Slot,
     snapshot_controller: Option<&SnapshotController>,
@@ -110,9 +110,11 @@ pub fn check_and_handle_new_root<CB>(
     bank_forks: &RwLock<BankForks>,
     rpc_subscriptions: Option<&RpcSubscriptions>,
     my_pubkey: &Pubkey,
+    on_removed_banks: RB,
     callback: CB,
 ) where
     CB: FnOnce(&BankForks),
+    RB: FnOnce(&[BankWithScheduler]),
 {
     // get the root bank before squash
     let root_bank = bank_forks
@@ -150,6 +152,7 @@ pub fn check_and_handle_new_root<CB>(
         snapshot_controller,
         highest_super_majority_root,
         drop_bank_sender,
+        on_removed_banks,
         callback,
     );
     blockstore.slots_stats.mark_rooted(new_root);
@@ -194,17 +197,20 @@ pub fn check_and_handle_new_root<CB>(
 /// - Quiesce and synchronously purge banks orphaned by the new root
 /// - Prune the program cache
 /// - Prune bank forks and drop the removed banks
+/// - Call `on_removed_banks` after releasing the BankForks write lock and before dropping banks
 /// - Calls the callback for use in replay stage and tests
-pub fn set_bank_forks_root<CB>(
+pub fn set_bank_forks_root<CB, RB>(
     my_pubkey: &Pubkey,
     new_root: Slot,
     bank_forks: &RwLock<BankForks>,
     snapshot_controller: Option<&SnapshotController>,
     highest_super_majority_root: Option<Slot>,
     drop_bank_sender: &Sender<Vec<BankWithScheduler>>,
+    on_removed_banks: RB,
     callback: CB,
 ) where
     CB: FnOnce(&BankForks),
+    RB: FnOnce(&[BankWithScheduler]),
 {
     let banks_to_remove: Vec<_> = {
         let bank_forks = bank_forks.read().unwrap();
@@ -255,6 +261,7 @@ pub fn set_bank_forks_root<CB>(
         snapshot_controller,
         highest_super_majority_root,
     );
+    on_removed_banks(&removed_banks);
 
     if let Err(channel_name) = nonblocking_send(
         my_pubkey,

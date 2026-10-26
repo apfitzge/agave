@@ -654,6 +654,7 @@ fn test_handle_new_root() {
         &mut Vec::new(),
         &drop_bank_sender,
         &mut tbft_structs,
+        &mut Publisher::stub(),
     );
     assert_eq!(bank_forks.read().unwrap().root(), root);
     assert_eq!(progress.len(), 1);
@@ -721,6 +722,7 @@ fn test_process_set_root_command_requires_matching_frozen_bank() {
         &context,
         &my_pubkey,
         &mut vote_simulator.progress,
+        &mut Publisher::stub(),
     );
     assert_eq!(bank_forks.read().unwrap().root(), 0);
     assert!(!blockstore.is_root(2));
@@ -733,6 +735,7 @@ fn test_process_set_root_command_requires_matching_frozen_bank() {
         &context,
         &my_pubkey,
         &mut vote_simulator.progress,
+        &mut Publisher::stub(),
     );
     assert_eq!(bank_forks.read().unwrap().root(), 0);
     assert!(!blockstore.is_root(1));
@@ -752,6 +755,7 @@ fn test_process_set_root_command_requires_matching_frozen_bank() {
         &context,
         &my_pubkey,
         &mut vote_simulator.progress,
+        &mut Publisher::stub(),
     );
     assert_eq!(bank_forks.read().unwrap().root(), 0);
     assert!(!blockstore.is_root(2));
@@ -767,6 +771,7 @@ fn test_process_set_root_command_requires_matching_frozen_bank() {
         &context,
         &my_pubkey,
         &mut vote_simulator.progress,
+        &mut Publisher::stub(),
     );
     assert_eq!(bank_forks.read().unwrap().root(), 1);
     assert!(blockstore.is_root(1));
@@ -834,6 +839,7 @@ fn test_handle_new_root_ahead_of_highest_super_majority_root() {
         &mut Vec::new(),
         &drop_bank_sender,
         &mut tbft_structs,
+        &mut Publisher::stub(),
     );
     assert_eq!(bank_forks.read().unwrap().root(), root);
     assert!(bank_forks.read().unwrap().get(confirmed_root).is_some());
@@ -2890,7 +2896,15 @@ fn test_clear_slots_clears_status_cache_for_removed_bank() {
     assert!(bank_forks.read().unwrap().get(1).is_none());
     assert!(bank1.get_signature_status(&transfer_signature).is_some());
 
-    ReplayStage::clear_slots([1], &bank_forks, &mut progress, &mut Vec::new(), None).unwrap();
+    ReplayStage::clear_slots(
+        [1],
+        &bank_forks,
+        &mut progress,
+        &mut Vec::new(),
+        None,
+        &mut Publisher::stub(),
+    )
+    .unwrap();
 
     assert!(bank1.get_signature_status(&transfer_signature).is_none());
 }
@@ -2930,6 +2944,7 @@ fn test_clear_slots_propagates_transaction_status_disconnect() {
                 &mut progress,
                 &mut Vec::new(),
                 Some((&transaction_status_sender, source, purge_input)),
+                &mut Publisher::stub(),
             ),
             Err(ReplayStageError::PurgeTransactionHistory { slot: 1, .. })
         );
@@ -3006,6 +3021,7 @@ fn test_switch_bank_purges_cleared_descendants() {
         &mut progress,
         &mut Vec::new(),
         Some(&transaction_status_sender),
+        &mut Publisher::stub(),
     )
     .unwrap();
 
@@ -3023,6 +3039,7 @@ fn test_switch_bank_purges_cleared_descendants() {
         &mut progress,
         &mut Vec::new(),
         Some(&transaction_status_sender),
+        &mut Publisher::stub(),
     )
     .unwrap();
 
@@ -3108,6 +3125,7 @@ fn test_purge_unconfirmed_duplicate_slot() {
         &root_bank,
         &bank_forks,
         &blockstore,
+        &mut Publisher::stub(),
     );
     for i in 5..=7 {
         assert!(bank_forks.read().unwrap().get(i).is_none());
@@ -3148,6 +3166,7 @@ fn test_purge_unconfirmed_duplicate_slot() {
         &root_bank,
         &bank_forks,
         &blockstore,
+        &mut Publisher::stub(),
     );
     for i in 4..=6 {
         assert!(bank_forks.read().unwrap().get(i).is_none());
@@ -3171,6 +3190,7 @@ fn test_purge_unconfirmed_duplicate_slot() {
         &root_bank,
         &bank_forks,
         &blockstore,
+        &mut Publisher::stub(),
     );
     for i in 1..=6 {
         assert!(bank_forks.read().unwrap().get(i).is_none());
@@ -3238,6 +3258,7 @@ fn test_purge_unconfirmed_duplicate_slots_and_reattach() {
         &root_bank,
         &bank_forks,
         &blockstore,
+        &mut Publisher::stub(),
     );
     for slot in &[3, 5, 6, 7] {
         assert!(bank_forks.read().unwrap().get(*slot).is_none());
@@ -3464,6 +3485,7 @@ fn test_update_parent_restart() {
         &post_migration_status_for_tests(),
         Some(&entry_notification_sender),
         Some(&transaction_status_sender),
+        &mut Publisher::stub(),
     )
     .unwrap();
 
@@ -3640,6 +3662,7 @@ fn test_update_parent_tower_gated() {
         &MigrationStatus::default(),
         None,
         None,
+        &mut Publisher::stub(),
     )
     .unwrap();
 
@@ -3687,6 +3710,7 @@ fn test_update_parent_interrupt_ignores_non_first_leader_window_slot() {
         &post_migration_status_for_tests(),
         None,
         None,
+        &mut Publisher::stub(),
     )
     .unwrap();
 
@@ -3737,6 +3761,7 @@ fn test_update_parent_keeps_hard() {
         &post_migration_status_for_tests(),
         None,
         None,
+        &mut Publisher::stub(),
     )
     .unwrap();
 
@@ -3953,6 +3978,7 @@ fn test_spurious_update_parent_boundary(replayed_shreds: u64, should_be_hard: bo
         &migration_status,
         None,
         None,
+        &mut Publisher::stub(),
     )
     .unwrap();
 
@@ -4066,6 +4092,7 @@ fn test_soft_dead_restarts() {
         &post_migration_status_for_tests(),
         None,
         Some(&transaction_status_sender),
+        &mut Publisher::stub(),
     )
     .unwrap();
 
@@ -4116,6 +4143,7 @@ fn test_full_soft_dead_hardens() {
         &post_migration_status_for_tests(),
         None,
         None,
+        &mut Publisher::stub(),
     )
     .unwrap();
 
@@ -4846,6 +4874,7 @@ fn test_dump_then_repair_correct_slots() {
         &dumped_slots_sender,
         &Pubkey::new_unique(),
         leader_schedule_cache,
+        &mut Publisher::stub(),
     );
     assert_eq!(should_be_dumped, dumped_slots_receiver.recv().ok().unwrap());
 
@@ -4965,6 +4994,7 @@ fn setup_vote_then_rollback(
         &dumped_slots_sender,
         &Pubkey::new_unique(),
         leader_schedule_cache,
+        &mut Publisher::stub(),
     );
 
     // Check everything was purged properly
@@ -6359,6 +6389,7 @@ fn test_dumped_slot_not_causing_panic() {
         &dumped_slots_sender,
         my_pubkey,
         &leader_schedule_cache,
+        &mut Publisher::stub(),
     );
     assert_eq!(
         dumped_slots_receiver.recv_timeout(Duration::from_secs(1)),
@@ -6445,6 +6476,7 @@ fn test_dump_own_slots_fails() {
         &dumped_slots_sender,
         my_pubkey,
         leader_schedule_cache,
+        &mut Publisher::stub(),
     );
 }
 

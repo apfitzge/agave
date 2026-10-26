@@ -1,5 +1,9 @@
 use {
-    agave_event_system::{event, stream_name::StreamName},
+    agave_event_system::{
+        event,
+        event_metadata::{cached_thread_and_process_id, monotonic_timestamp_ns},
+        stream_name::StreamName,
+    },
     solana_clock::{BankId, Slot},
 };
 
@@ -28,4 +32,25 @@ pub enum SlotEvent {
         slot: Slot,
         bank_id: BankId,
     },
+    /// The bank was removed from BankForks, but may still have other owners.
+    Removed {
+        pid: i32,
+        tid: i32,
+        timestamp_ns: u64,
+        slot: Slot,
+        bank_id: BankId,
+    },
+}
+
+impl SlotEvent {
+    pub(crate) fn removed(slot: Slot, bank_id: BankId) -> Self {
+        let (tid, pid) = cached_thread_and_process_id();
+        Self::Removed {
+            pid,
+            tid,
+            timestamp_ns: monotonic_timestamp_ns(),
+            slot,
+            bank_id,
+        }
+    }
 }
