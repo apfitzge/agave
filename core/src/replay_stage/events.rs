@@ -24,13 +24,14 @@ pub enum SlotEvent {
         parent: Slot,
         bank_id: BankId,
     },
-    /// Replay execution and verification succeeded, and the bank is frozen.
-    ExecutionComplete {
+    /// Execution stopped for this bank; `succeeded` records replay and verification success.
+    ExecutionFinished {
         pid: i32,
         tid: i32,
         timestamp_ns: u64,
         slot: Slot,
         bank_id: BankId,
+        succeeded: bool,
     },
     /// The bank was removed from BankForks, but may still have other owners.
     Removed {
@@ -51,6 +52,18 @@ pub enum SlotEvent {
 }
 
 impl SlotEvent {
+    pub(crate) fn execution_finished(slot: Slot, bank_id: BankId, succeeded: bool) -> Self {
+        let (tid, pid) = cached_thread_and_process_id();
+        Self::ExecutionFinished {
+            pid,
+            tid,
+            timestamp_ns: monotonic_timestamp_ns(),
+            slot,
+            bank_id,
+            succeeded,
+        }
+    }
+
     pub(crate) fn rooted(slot: Slot, bank_id: BankId) -> Self {
         let (tid, pid) = cached_thread_and_process_id();
         Self::Rooted {

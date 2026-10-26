@@ -4199,6 +4199,11 @@ impl ReplayStage {
                                 tbft_structs.as_deref_mut(),
                             ),
                         );
+                        let _ = slot_event_publisher.publish(&SlotEvent::execution_finished(
+                            bank_slot,
+                            bank.bank_id().into(),
+                            false,
+                        ));
 
                         // don't try to run the below logic to check if the bank is completed
                         continue;
@@ -4231,6 +4236,11 @@ impl ReplayStage {
                                 tbft_structs.as_deref_mut(),
                             ),
                         );
+                        let _ = slot_event_publisher.publish(&SlotEvent::execution_finished(
+                            bank_slot,
+                            bank.bank_id().into(),
+                            false,
+                        ));
                         // don't try to run the remaining normal processing for the completed bank
                         continue;
                     }
@@ -4299,18 +4309,20 @@ impl ReplayStage {
                             tbft_structs.as_deref_mut(),
                         ),
                     );
+                    let _ = slot_event_publisher.publish(&SlotEvent::execution_finished(
+                        bank_slot,
+                        bank.bank_id().into(),
+                        false,
+                    ));
 
                     continue;
                 }
 
-                let (tid, pid) = cached_thread_and_process_id();
-                let _ = slot_event_publisher.publish(&SlotEvent::ExecutionComplete {
-                    pid,
-                    tid,
-                    timestamp_ns: monotonic_timestamp_ns(),
-                    slot: bank_slot,
-                    bank_id: bank.bank_id().into(),
-                });
+                let _ = slot_event_publisher.publish(&SlotEvent::execution_finished(
+                    bank_slot,
+                    bank.bank_id().into(),
+                    true,
+                ));
 
                 let r_replay_stats = completed_replay.replay_stats.read().unwrap();
                 let r_replay_progress = completed_replay.replay_progress.read().unwrap();

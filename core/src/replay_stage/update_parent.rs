@@ -435,6 +435,11 @@ pub(super) fn handle_abandoned_bank(
             progress,
             &mut dead_slot_context,
         );
+        let _ = slot_event_publisher.publish(&SlotEvent::execution_finished(
+            bank_slot,
+            bank.bank_id().into(),
+            false,
+        ));
         return Ok(());
     }
 
