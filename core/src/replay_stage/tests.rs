@@ -1244,6 +1244,7 @@ fn do_test_dead_slot_on_complete_bank(failure: CompleteBankFailure) {
         None,
         &[replay_result],
         &my_pubkey,
+        &mut Publisher::stub(),
     )
     .unwrap();
 
@@ -1400,6 +1401,7 @@ fn test_cmr_mismatch_hard_dead() {
         None,
         &[replay_result],
         &Pubkey::new_unique(),
+        &mut Publisher::stub(),
     )
     .unwrap();
 
@@ -1480,6 +1482,7 @@ fn test_alpenglow_migration_transition_does_not_mark_bank_dead() {
         None,
         &[replay_result],
         &Pubkey::new_unique(),
+        &mut Publisher::stub(),
     )
     .unwrap();
 
@@ -1546,6 +1549,7 @@ fn test_abandon_invalidates() {
         None,
         &[replay_result],
         &Pubkey::new_unique(),
+        &mut Publisher::stub(),
     )
     .unwrap();
 

@@ -20,4 +20,12 @@ pub enum SlotEvent {
         parent: Slot,
         bank_id: BankId,
     },
+    /// Replay execution and verification succeeded, and the bank is frozen.
+    ExecutionComplete {
+        pid: i32,
+        tid: i32,
+        timestamp_ns: u64,
+        slot: Slot,
+        bank_id: BankId,
+    },
 }
