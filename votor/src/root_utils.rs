@@ -14,7 +14,7 @@ use {
         rpc_subscriptions::RpcSubscriptions,
     },
     solana_runtime::{
-        bank_forks::BankForks, bank_forks_controller::BankForksController,
+        bank::Bank, bank_forks::BankForks, bank_forks_controller::BankForksController,
         installed_scheduler_pool::BankWithScheduler, snapshot_controller::SnapshotController,
     },
     solana_time_utils::timestamp,
@@ -97,6 +97,7 @@ pub(crate) fn set_root(
 /// ReplayStage::handle_new_root           -> root_utils::set_bank_forks_root(callback) -> callback()
 ///
 /// Votor does not need the progress map or other tower bft structures, so it will not use the callback.
+/// Returns the existing ancestor vector with the new root bank appended.
 #[allow(clippy::too_many_arguments)]
 pub fn check_and_handle_new_root<CB, RB>(
     parent_slot: Slot,
@@ -112,7 +113,8 @@ pub fn check_and_handle_new_root<CB, RB>(
     my_pubkey: &Pubkey,
     on_removed_banks: RB,
     callback: CB,
-) where
+) -> Vec<Arc<Bank>>
+where
     CB: FnOnce(&BankForks),
     RB: FnOnce(&[BankWithScheduler]),
 {
@@ -191,6 +193,7 @@ pub fn check_and_handle_new_root<CB, RB>(
         }
     }
     info!("{my_pubkey}: new root {new_root}");
+    rooted_banks
 }
 
 /// Sets the bank forks root:

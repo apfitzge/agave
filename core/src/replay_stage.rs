@@ -5314,7 +5314,7 @@ impl ReplayStage {
                     tbft_structs,
                 )
             },
-        )
+        );
     }
 
     // To avoid code duplication and keep compatibility with alpenglow, we add this
@@ -5466,7 +5466,8 @@ impl ReplayStage {
         }
 
         let new_root = command.new_root.slot;
-        root_utils::check_and_handle_new_root(
+        let old_root = context.bank_forks.read().unwrap().root();
+        let rooted_banks = root_utils::check_and_handle_new_root(
             new_root,
             new_root,
             context.snapshot_controller.as_deref(),
@@ -5481,6 +5482,14 @@ impl ReplayStage {
             |removed_banks| Self::publish_removed_banks(slot_event_publisher, removed_banks),
             |bank_forks| progress.handle_new_root(bank_forks),
         );
+
+        let (new_root_bank, ancestors) = rooted_banks.split_last().unwrap();
+        for bank in ancestors.iter().rev().chain(std::iter::once(new_root_bank)) {
+            if bank.slot() > old_root {
+                let _ = slot_event_publisher
+                    .publish(&SlotEvent::rooted(bank.slot(), bank.bank_id().into()));
+            }
+        }
 
         // Publish the root only after its root markers are written and bank
         // forks is rooted, so commitment cache readers never see a root the

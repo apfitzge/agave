@@ -40,9 +40,28 @@ pub enum SlotEvent {
         slot: Slot,
         bank_id: BankId,
     },
+    /// Replay applied a BankForks root that includes this bank.
+    Rooted {
+        pid: i32,
+        tid: i32,
+        timestamp_ns: u64,
+        slot: Slot,
+        bank_id: BankId,
+    },
 }
 
 impl SlotEvent {
+    pub(crate) fn rooted(slot: Slot, bank_id: BankId) -> Self {
+        let (tid, pid) = cached_thread_and_process_id();
+        Self::Rooted {
+            pid,
+            tid,
+            timestamp_ns: monotonic_timestamp_ns(),
+            slot,
+            bank_id,
+        }
+    }
+
     pub(crate) fn removed(slot: Slot, bank_id: BankId) -> Self {
         let (tid, pid) = cached_thread_and_process_id();
         Self::Removed {
