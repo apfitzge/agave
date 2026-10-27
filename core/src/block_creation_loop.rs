@@ -70,17 +70,6 @@ use {
 pub(crate) mod rewards;
 mod stats;
 
-// Empirically derived value estimating the time to
-// - drain and record the final batch of transactions,
-// - produce the block footer,
-// - produce the 'alpentick',
-// - freeze the bank,
-// - shred the final batches of the block,
-// - broadcast.
-// Recording stops this much before the slot timeout so block completion has time to finish before
-// the leader window deadline.
-const TIME_TO_COMPLETE_BLOCK_BROADCAST: Duration = Duration::from_millis(6);
-
 /// Source of a leader-window notification consumed by BCL.
 enum ParentSource {
     /// Parent from ParentReady event for this leader window is already known.
@@ -459,11 +448,10 @@ fn reset_poh_recorder(bank: &Arc<Bank>, ctx: &LeaderContext) {
         .reset(bank.clone(), next_leader_slot);
 }
 
-/// Returns the elapsed leader-window time at which `slot` must be completed.
+/// Returns the elapsed leader-window time at which recording stops for `slot`.
 fn block_timeout(bank: &Bank, slot: Slot) -> Duration {
     Duration::from_nanos_u128(bank.ns_per_slot_at_slot(slot))
         .saturating_mul((leader_slot_index(slot) as u32).saturating_add(1))
-        .saturating_sub(TIME_TO_COMPLETE_BLOCK_BROADCAST)
 }
 
 /// Select the freshest leader-window notification within one source.
