@@ -149,7 +149,7 @@ impl Drop for CheckBatch<'_> {
 mod tests {
     use {
         super::*,
-        crate::tests::{setup, setup_with_check_capacities},
+        crate::tests::{setup, setup_with_capacities},
         agave_scheduler_bindings::{
             CheckResponseRegion, CheckWorkerToPackMessage, SharableTransactionRegion,
             TpuToPackMessage, processed_codes,
@@ -216,7 +216,7 @@ mod tests {
 
     #[test]
     fn ingress_drops_packets_when_check_response_capacity_is_full() {
-        let (mut scheduler, mut agave) = setup_with_check_capacities(4, 2, 1);
+        let (mut scheduler, mut agave) = setup_with_capacities(4, 2, 1, 2, 2);
         enqueue(&scheduler, &mut agave, 3 * MAX_PACKETS_PER_CHECK_BATCH);
 
         scheduler.handle_tpu_ingress();
@@ -343,7 +343,7 @@ mod tests {
         const UNSENT_PACKETS: usize = 2 * MAX_PACKETS_PER_CHECK_BATCH + 1;
         const TOTAL_PACKETS: usize = EXPECTED_SENT_PACKETS + UNSENT_PACKETS;
 
-        let (mut scheduler, mut agave) = setup_with_check_capacities(AVAILABLE_BATCH_SLOTS, 8, 1);
+        let (mut scheduler, mut agave) = setup_with_capacities(AVAILABLE_BATCH_SLOTS, 8, 1, 2, 2);
         scheduler.handle_leader_slot_metrics();
         let placeholder = PackToCheckWorkerMessage {
             batch: agave_scheduler_bindings::SharableTransactionBatchRegion {
