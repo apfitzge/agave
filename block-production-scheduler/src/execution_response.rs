@@ -59,8 +59,10 @@ impl Scheduler {
                 let action = ExecutionResponseAction::from_response(response);
                 if response.not_included_reason == not_included_reasons::NONE {
                     actual_cost = actual_cost.saturating_add(response.cost_units);
-                    self.leader_slot_metrics.completed =
-                        self.leader_slot_metrics.completed.saturating_add(1);
+                    self.leader_slot_metrics.completed_transactions = self
+                        .leader_slot_metrics
+                        .completed_transactions
+                        .saturating_add(1);
                 } else if matches!(action, ExecutionResponseAction::Release) {
                     dropped = dropped.saturating_add(1);
                 }
@@ -96,7 +98,10 @@ impl Scheduler {
         }
         self.in_flight
             .complete_batch(worker, batch.len(), estimated_cost);
-        self.leader_slot_metrics.dropped = self.leader_slot_metrics.dropped.saturating_add(dropped);
+        self.leader_slot_metrics.dropped_transactions = self
+            .leader_slot_metrics
+            .dropped_transactions
+            .saturating_add(dropped);
         self.scheduled_cost = self
             .scheduled_cost
             .saturating_sub(estimated_cost)

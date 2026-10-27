@@ -67,13 +67,13 @@ impl Scheduler {
             sent_packets = sent_packets.saturating_add(count);
         }
         transactions.for_each(drop);
-        self.leader_slot_metrics.received = self
+        self.leader_slot_metrics.received_packets = self
             .leader_slot_metrics
-            .received
+            .received_packets
             .saturating_add(messages.len());
-        self.leader_slot_metrics.dropped = self
+        self.leader_slot_metrics.dropped_transactions = self
             .leader_slot_metrics
-            .dropped
+            .dropped_transactions
             .saturating_add(messages.len().saturating_sub(sent_packets));
     }
 }
@@ -254,14 +254,14 @@ mod tests {
         );
         assert_eq!(scheduler.allocator.outstanding_allocation_bytes(), 0);
         assert_eq!(scheduler.leader_slot_metrics.slot, None);
-        assert_eq!(scheduler.leader_slot_metrics.received, 3);
-        assert_eq!(scheduler.leader_slot_metrics.dropped, 3);
+        assert_eq!(scheduler.leader_slot_metrics.received_packets, 3);
+        assert_eq!(scheduler.leader_slot_metrics.dropped_transactions, 3);
 
         scheduler.state = SchedulerState::LeaderStarting { slot: 100 };
         scheduler.handle_leader_slot_metrics();
         assert_eq!(scheduler.leader_slot_metrics.slot, Some(100));
-        assert_eq!(scheduler.leader_slot_metrics.received, 0);
-        assert_eq!(scheduler.leader_slot_metrics.dropped, 0);
+        assert_eq!(scheduler.leader_slot_metrics.received_packets, 0);
+        assert_eq!(scheduler.leader_slot_metrics.dropped_transactions, 0);
     }
 
     #[test]
@@ -292,9 +292,9 @@ mod tests {
         scheduler.handle_tpu_ingress();
         assert_eq!(scheduler.outstanding_check_packets, EXPECTED_SENT_PACKETS);
         let metrics = &scheduler.leader_slot_metrics;
-        assert_eq!(metrics.received, TOTAL_PACKETS);
-        assert_eq!(metrics.buffered, 0);
-        assert_eq!(metrics.dropped, UNSENT_PACKETS);
+        assert_eq!(metrics.received_packets, TOTAL_PACKETS);
+        assert_eq!(metrics.buffered_transactions, 0);
+        assert_eq!(metrics.dropped_transactions, UNSENT_PACKETS);
         while let Some(message) = agave.check_workers[0].pack_to_check_worker.try_read() {
             if message != placeholder {
                 // SAFETY: this test owns each dequeued ingress batch; placeholders have no allocation.

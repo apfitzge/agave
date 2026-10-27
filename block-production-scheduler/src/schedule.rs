@@ -69,9 +69,9 @@ impl Scheduler {
         }
 
         batches.send_all(&mut ThreadSet::none());
-        self.leader_slot_metrics.scheduled = self
+        self.leader_slot_metrics.scheduled_transactions = self
             .leader_slot_metrics
-            .scheduled
+            .scheduled_transactions
             .saturating_add(scheduled.len());
         for (id, worker) in scheduled.drain(..) {
             self.transactions.dequeue(&id);

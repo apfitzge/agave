@@ -53,8 +53,10 @@ impl Scheduler {
         };
         self.outstanding_check_packets = self.outstanding_check_packets.saturating_sub(batch.len());
         if message.processed_code != processed_codes::PROCESSED {
-            self.leader_slot_metrics.dropped =
-                self.leader_slot_metrics.dropped.saturating_add(batch.len());
+            self.leader_slot_metrics.dropped_transactions = self
+                .leader_slot_metrics
+                .dropped_transactions
+                .saturating_add(batch.len());
             // SAFETY: the worker has released this batch. An unprocessed response has no
             // defined response region, so only the original allocations can be freed.
             unsafe { batch.free_with_transactions() };
@@ -124,9 +126,14 @@ impl Scheduler {
                 }
             }
         }
-        self.leader_slot_metrics.buffered =
-            self.leader_slot_metrics.buffered.saturating_add(buffered);
-        self.leader_slot_metrics.dropped = self.leader_slot_metrics.dropped.saturating_add(dropped);
+        self.leader_slot_metrics.buffered_transactions = self
+            .leader_slot_metrics
+            .buffered_transactions
+            .saturating_add(buffered);
+        self.leader_slot_metrics.dropped_transactions = self
+            .leader_slot_metrics
+            .dropped_transactions
+            .saturating_add(dropped);
         // SAFETY: each transaction has been retained or freed; only the container remains.
         unsafe { batch.free() };
         // SAFETY: all responses have been consumed and their nested allocations handled.
@@ -342,8 +349,8 @@ mod tests {
         assert_eq!(scheduler.transactions.len(), 0);
         assert_eq!(scheduler.allocator.outstanding_allocation_bytes(), 0);
         let metrics = &scheduler.leader_slot_metrics;
-        assert_eq!(metrics.buffered, 0);
-        assert_eq!(metrics.dropped, 1);
+        assert_eq!(metrics.buffered_transactions, 0);
+        assert_eq!(metrics.dropped_transactions, 1);
     }
 
     #[test]
@@ -422,7 +429,7 @@ mod tests {
         assert_eq!(scheduler.outstanding_check_packets, 0);
         assert_eq!(scheduler.transactions.len(), 0);
         assert_eq!(scheduler.allocator.outstanding_allocation_bytes(), 0);
-        assert_eq!(scheduler.leader_slot_metrics.dropped, 1);
+        assert_eq!(scheduler.leader_slot_metrics.dropped_transactions, 1);
     }
 
     #[test]
@@ -448,8 +455,8 @@ mod tests {
             );
         }
         let metrics = &scheduler.leader_slot_metrics;
-        assert_eq!(metrics.buffered, 2);
-        assert_eq!(metrics.dropped, 2);
+        assert_eq!(metrics.buffered_transactions, 2);
+        assert_eq!(metrics.dropped_transactions, 2);
     }
 
     #[test]

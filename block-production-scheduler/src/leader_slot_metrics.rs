@@ -7,15 +7,15 @@ pub(super) struct LeaderSlotMetrics {
     /// Checked transactions retained in the container, plus packets awaiting checks at slot entry.
     pub(super) starting_transactions: usize,
     /// TPU packets dequeued during the slot, before checks or capacity rejection.
-    pub(super) received: usize,
+    pub(super) received_packets: usize,
     /// Checked transactions accepted into the container, including replacements of evicted entries.
-    pub(super) buffered: usize,
+    pub(super) buffered_transactions: usize,
     /// Transactions discarded at ingress, during checks, by eviction, or after execution rejection.
-    pub(super) dropped: usize,
+    pub(super) dropped_transactions: usize,
     /// Dispatch attempts, including retries.
-    pub(super) scheduled: usize,
+    pub(super) scheduled_transactions: usize,
     /// Transactions reported as included by execution workers.
-    pub(super) completed: usize,
+    pub(super) completed_transactions: usize,
 }
 
 impl LeaderSlotMetrics {
@@ -27,11 +27,11 @@ impl LeaderSlotMetrics {
             "block-production-scheduler-leader-slot",
             ("slot", slot, i64),
             ("starting_transactions", self.starting_transactions, i64),
-            ("received", self.received, i64),
-            ("buffered", self.buffered, i64),
-            ("dropped", self.dropped, i64),
-            ("scheduled", self.scheduled, i64),
-            ("completed", self.completed, i64),
+            ("received_packets", self.received_packets, i64),
+            ("buffered_transactions", self.buffered_transactions, i64),
+            ("dropped_transactions", self.dropped_transactions, i64),
+            ("scheduled_transactions", self.scheduled_transactions, i64),
+            ("completed_transactions", self.completed_transactions, i64),
         );
     }
 }
