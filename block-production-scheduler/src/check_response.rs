@@ -40,7 +40,10 @@ impl Scheduler {
             let Some(message) = self.check_receiver.try_read() else {
                 break;
             };
-            self.outstanding_check_batches = self.outstanding_check_batches.wrapping_sub(1);
+            self.outstanding_check_batches = self
+                .outstanding_check_batches
+                .checked_sub(1)
+                .expect("check response must have an outstanding batch");
             received_packets =
                 received_packets.saturating_add(usize::from(message.batch.num_transactions));
             self.handle_check_worker_response(message);
