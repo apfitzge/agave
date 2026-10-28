@@ -77,6 +77,7 @@ pub struct FeatureSnapshot {
     pub early_instruction_trace_overflow_detection: bool,
     pub unbound_loader_v3_instruction_data: bool,
     pub pass_input_metadata_in_vm_r3_r5: bool,
+    pub increase_tx_v1_account_lock_limit: bool,
 }
 
 impl From<&AHashMap<Pubkey, u64>> for FeatureSnapshot {
@@ -175,6 +176,7 @@ impl From<&AHashMap<Pubkey, u64>> for FeatureSnapshot {
             ),
             unbound_loader_v3_instruction_data: is_active(&unbound_loader_v3_instruction_data::ID),
             pass_input_metadata_in_vm_r3_r5: is_active(&pass_input_metadata_in_vm_r3_r5::ID),
+            increase_tx_v1_account_lock_limit: is_active(&increase_tx_v1_account_lock_limit::ID),
         }
     }
 }
@@ -1536,6 +1538,10 @@ pub mod pass_input_metadata_in_vm_r3_r5 {
     solana_pubkey::declare_id!("r3r5hXFhEZLB2VCDXmUysuDZj4oMbtW8JRVUqvQSgqE");
 }
 
+pub mod increase_tx_v1_account_lock_limit {
+    solana_pubkey::declare_id!("8ZVMrzG6pPBREHMbHNyrErKJsXA7b1vg9e1iycSooCeY");
+}
+
 pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::new(|| {
     [
         (secp256k1_program_enabled::id(), "secp256k1 program"),
@@ -2637,6 +2643,10 @@ pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::n
         (
             pass_input_metadata_in_vm_r3_r5::id(),
             "SIMD-0683: Pass ABIv1 input metadata via registers r3-r5",
+        ),
+        (
+            increase_tx_v1_account_lock_limit::id(),
+            "Increase transaction v1 account lock limit to 96",
         ),
         /*************** ADD NEW FEATURES HERE ***************/
         /***** ADD NEW FEATURE BOOL TO `FeatureSnapshot` *****/
