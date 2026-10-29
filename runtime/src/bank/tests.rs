@@ -5122,8 +5122,33 @@ fn test_transaction_account_lock_limit(feature_active: bool, configured_limit: O
     assert_eq!(limits.v1, expected_v1_limit);
 }
 
-#[test_matrix([65, 96, 97])]
-fn test_tx_v1_account_lock_limit_activation(account_locks: usize) {
+#[test_case(
+    65,
+    Ok(vec![Err(TransactionError::TooManyAccountLocks)]),
+    Ok(vec![Ok(())]),
+    1_000_000;
+    "above_previous_limit"
+)]
+#[test_case(
+    96,
+    Ok(vec![Err(TransactionError::TooManyAccountLocks)]),
+    Ok(vec![Ok(())]),
+    1_000_000;
+    "at_new_limit"
+)]
+#[test_case(
+    97,
+    Err(TransactionError::SanitizeFailure),
+    Err(TransactionError::SanitizeFailure),
+    0;
+    "above_new_limit"
+)]
+fn test_tx_v1_account_lock_limit_activation(
+    account_locks: usize,
+    expected_before_activation: Result<Vec<Result<()>>>,
+    expected_after_activation: Result<Vec<Result<()>>>,
+    expected_recipient_balance: u64,
+) {
     let feature_id = feature_set::increase_tx_v1_account_lock_limit::id();
     let (mut genesis_config, mint_keypair) = create_genesis_config(100_000_000);
     genesis_config.accounts.remove(&feature_id).unwrap();
@@ -5131,7 +5156,7 @@ fn test_tx_v1_account_lock_limit_activation(account_locks: usize) {
     assert!(!bank.feature_set.is_active(&feature_id));
 
     let recipient = Pubkey::new_unique();
-    let lamports = bank.get_minimum_balance_for_rent_exemption(0);
+    let lamports = 1_000_000;
     let mut instruction =
         system_instruction::transfer(&mint_keypair.pubkey(), &recipient, lamports);
     // The payer, recipient, and system program already account for three locks.
@@ -5163,11 +5188,7 @@ fn test_tx_v1_account_lock_limit_activation(account_locks: usize) {
 
     assert_eq!(
         bank.try_process_entry_transactions([tx.clone()]),
-        if account_locks <= 96 {
-            Ok(vec![Err(TransactionError::TooManyAccountLocks)])
-        } else {
-            Err(TransactionError::SanitizeFailure)
-        }
+        expected_before_activation
     );
     assert_eq!(bank.get_balance(&recipient), 0);
 
@@ -5183,14 +5204,11 @@ fn test_tx_v1_account_lock_limit_activation(account_locks: usize) {
     assert!(bank.feature_set.is_active(&feature_id));
 
     // Retry the identical signed transaction after activation at the epoch boundary.
-    let result = bank.try_process_entry_transactions([tx]);
-    if account_locks <= 96 {
-        assert_eq!(result, Ok(vec![Ok(())]));
-        assert_eq!(bank.get_balance(&recipient), lamports);
-    } else {
-        assert_eq!(result, Err(TransactionError::SanitizeFailure));
-        assert_eq!(bank.get_balance(&recipient), 0);
-    }
+    assert_eq!(
+        bank.try_process_entry_transactions([tx]),
+        expected_after_activation
+    );
+    assert_eq!(bank.get_balance(&recipient), expected_recipient_balance);
 }
 
 #[test]
