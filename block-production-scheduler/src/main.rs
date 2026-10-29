@@ -19,6 +19,8 @@ use {
     },
 };
 
+const LOG_ROTATION_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
 #[cfg(not(any(target_env = "msvc", target_os = "freebsd")))]
 #[global_allocator]
 static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
@@ -100,7 +102,7 @@ fn start_log_rotation(log_file: PathBuf, exit: Arc<AtomicBool>) -> io::Result<()
                     info!("Received SIGUSR1, reopening {}", log_file.display());
                     agave_logger::redirect_stderr(&log_file);
                 }
-                thread::sleep(Duration::from_secs(1));
+                thread::sleep(LOG_ROTATION_POLL_INTERVAL);
             }
         })?;
     Ok(())
