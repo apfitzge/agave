@@ -80,6 +80,12 @@ impl Scheduler {
             unsafe { responses.free(&self.allocator) };
         } else {
             // Unprocessed messages have an undefined response region.
+            if message.processed_code == processed_codes::MAX_WORKING_SLOT_EXCEEDED {
+                // All in-flight batches belong to scheduling_slot, which cannot advance
+                // until they drain. Stop scheduling even if progress still marks it ready.
+                // Keeping scheduling_slot prevents stale snapshots from reseeding the pacer.
+                self.cost_pacer = None;
+            }
             let action = ExecutionResponseAction::from_processed_code(message.processed_code);
             if matches!(action, ExecutionResponseAction::Release) {
                 dropped = dropped.saturating_add(batch.len());
