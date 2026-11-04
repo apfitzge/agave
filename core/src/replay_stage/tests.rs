@@ -25,6 +25,7 @@ use {
     solana_accounts_db::accounts_db::{ACCOUNTS_DB_CONFIG_FOR_TESTING, AccountsDbConfig},
     solana_bls_signatures::{BLS_SIGNATURE_AFFINE_SIZE, Signature as BLSSignature},
     solana_client::connection_cache::ConnectionCache,
+    solana_cost_model::transaction_cost::TrackedCost,
     solana_entry::{
         block_component::{
             BlockComponent, BlockFooterV1, BlockHeaderV1, UpdateParentV1, VersionedBlockMarker,
@@ -67,19 +68,25 @@ use {
             GenesisConfigInfo, ValidatorVoteKeypairs, bootstrap_validator_stake_lamports,
             create_genesis_config_with_tower_leader,
         },
+        installed_scheduler_pool::SchedulingContext,
         transaction_execution::{
             TransactionHistoryPurgeInput, TransactionHistoryPurgeSource, TransactionStatusMessage,
         },
     },
+    solana_runtime_transaction::runtime_transaction::ReplayTransaction,
     solana_sha256_hasher::hash,
     solana_shred_version::compute_shred_version,
     solana_signature::Signature,
     solana_svm_timings::ExecuteTimings,
     solana_system_transaction as system_transaction,
     solana_tpu_client::tpu_client::{DEFAULT_TPU_CONNECTION_POOL_SIZE, DEFAULT_VOTE_USE_QUIC},
-    solana_transaction_error::TransactionError,
+    solana_transaction_error::{TransactionError, TransactionResult},
     solana_transaction_status::VersionedTransactionWithStatusMeta,
-    solana_unified_scheduler_pool::DefaultSchedulerPool,
+    solana_unified_scheduler_logic::{OrderedTaskId, Task},
+    solana_unified_scheduler_pool::{
+        DefaultSchedulerPool, DefaultTaskHandler, HandlerContext, PooledScheduler, SchedulerPool,
+        TaskHandler,
+    },
     solana_vote::vote_transaction,
     solana_vote_program::vote_state::{
         self, TowerSync, VoteStateV4, VoteStateVersions, handler::VoteStateHandler,
@@ -88,7 +95,10 @@ use {
         assert_matches,
         fs::remove_dir_all,
         iter,
-        sync::{Arc, Barrier, Mutex, RwLock, atomic::AtomicU64},
+        sync::{
+            Arc, Barrier, Mutex, RwLock,
+            atomic::{AtomicU64, AtomicUsize},
+        },
     },
     tempfile::tempdir,
     test_case::test_case,
@@ -7352,4 +7362,146 @@ fn test_process_duplicate_confirmed_slots(same_batch: bool) {
         &ancestor_hashes_replay_update_sender,
         &mut PurgeRepairSlotCounter::default(),
     );
+}
+
+#[test]
+fn test_finalized_skipped_replay_stops_without_dead_mark() {
+    static HANDLED_TASKS: AtomicUsize = AtomicUsize::new(0);
+    const NUM_TXS: usize = 50;
+
+    // Executes every transaction slowly, like a block crafted to be expensive to replay.
+    #[derive(Debug)]
+    struct StallingHandler;
+    impl TaskHandler for StallingHandler {
+        fn handle(
+            timings: &mut ExecuteTimings,
+            scheduling_context: &SchedulingContext,
+            task: &Task,
+            handler_context: &HandlerContext,
+        ) -> TransactionResult<TrackedCost> {
+            HANDLED_TASKS.fetch_add(1, Ordering::Relaxed);
+            std::thread::sleep(Duration::from_millis(100));
+            DefaultTaskHandler::handle(timings, scheduling_context, task, handler_context)
+        }
+    }
+
+    let ReplayBlockstoreComponents {
+        blockstore,
+        vote_simulator,
+        ..
+    } = replay_blockstore_components(Some(tr(0)), 1, None);
+    let VoteSimulator {
+        bank_forks,
+        mut progress,
+        validator_keypairs,
+        ..
+    } = vote_simulator;
+    let funded_keypair = validator_keypairs
+        .values()
+        .next()
+        .unwrap()
+        .node_keypair
+        .insecure_clone();
+
+    let slot = 1;
+    let bank = {
+        let bank0 = bank_forks.read().unwrap().get(0).unwrap();
+        bank_forks
+            .write()
+            .unwrap()
+            .install_scheduler_pool(
+                SchedulerPool::<PooledScheduler<StallingHandler>, _>::new_for_verification(
+                    None, None, None, None, None,
+                ),
+            );
+        let bank = Bank::new_from_parent(bank0, SlotLeader::default(), slot);
+        bank_forks.write().unwrap().insert(bank)
+    };
+    progress.insert(
+        slot,
+        ForkProgress::new(bank.last_blockhash(), None, None, 0, 0, None),
+    );
+    {
+        let entries = make_complete_slot_entries(&bank, vec![]);
+        let shreds = entries_to_test_shreds(&entries, slot, bank.parent_slot(), true, 0);
+        blockstore.insert_shreds(shreds, false).unwrap();
+    }
+
+    // Transfers from the same payer conflict, so they are executed one after the other.
+    let txs = (0..NUM_TXS).map(|task_id| {
+        let tx = system_transaction::transfer(
+            &funded_keypair,
+            &Pubkey::new_unique(),
+            1,
+            bank.last_blockhash(),
+        );
+        (ReplayTransaction::from(tx), task_id as OrderedTaskId)
+    });
+    bank.schedule_transaction_executions(txs).unwrap();
+
+    // Replay waits for the scheduler, like it does at the block footer.
+    let replay_wait = {
+        let bank = bank.clone_with_scheduler();
+        std::thread::spawn(move || bank.wait_for_completed_scheduler())
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while HANDLED_TASKS.load(Ordering::Relaxed) == 0 {
+        assert!(Instant::now() < deadline, "scheduler did not start");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    // Votor proves that the finalized chain skips this slot.
+    bank.request_replay_cancel();
+
+    // Cancelling unblocks replay before the remaining transactions execute.
+    let (result, _timings) = replay_wait.join().unwrap().unwrap();
+    assert_eq!(result, Err(TransactionError::CommitCancelled));
+    assert!(HANDLED_TASKS.load(Ordering::Relaxed) < NUM_TXS);
+
+    // The replay error for the cancelled bank doesn't mark the slot dead.
+    let (replay_vote_sender, replay_vote_receiver) = bounded(1024);
+    let process_active_banks_context = ProcessActiveBanksContext::new_for_tests(
+        bank_forks.clone(),
+        blockstore.clone(),
+        replay_vote_sender,
+    );
+    let replay_result = ReplaySlotFromBlockstore {
+        is_slot_dead: false,
+        bank_slot: slot,
+        replay_result: Some(Err(BlockstoreProcessorError::InvalidTransaction(
+            TransactionError::CommitCancelled,
+        ))),
+    };
+    let new_frozen_slots = ReplayStage::process_replay_results(
+        &process_active_banks_context,
+        &mut progress,
+        &mut Vec::new(),
+        &mut LatestValidatorVotesForFrozenBanks::default(),
+        &mut DuplicateSlotsToRepair::default(),
+        &mut PurgeRepairSlotCounter::default(),
+        None,
+        &[replay_result],
+        &Pubkey::new_unique(),
+    )
+    .unwrap();
+    assert!(new_frozen_slots.is_empty());
+    assert_eq!(progress.dead_reason(slot), None);
+    assert!(!blockstore.is_dead(slot));
+    assert!(replay_vote_receiver.try_recv().is_err());
+    assert!(bank_forks.read().unwrap().get(slot).is_some());
+
+    // The retained bank prevents recreation and is excluded from subsequent replay iterations.
+    let mut replay_result = ReplaySlotFromBlockstore::new(slot);
+    assert!(
+        ReplayStage::prepare_active_bank_for_replay(
+            &process_active_banks_context,
+            &mut progress,
+            &mut Vec::new(),
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            &mut replay_result,
+        )
+        .is_none()
+    );
+    assert!(!replay_result.is_slot_dead);
 }
