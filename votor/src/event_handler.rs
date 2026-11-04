@@ -2072,6 +2072,121 @@ mod tests {
         test_context.check_no_vote_or_commitment();
     }
 
+    fn store_finalized_parent(ctx: &SharedContext, block: Block, parent: Block) {
+        use solana_ledger::{blockstore::SlotMeta, blockstore_meta::BlockLocation};
+
+        ctx.blockstore
+            .put_meta(
+                block.slot,
+                &SlotMeta {
+                    slot: block.slot,
+                    parent_slot: Some(parent.slot),
+                    parent_block_id: parent.block_id.to_hash(),
+                    ..SlotMeta::default()
+                },
+            )
+            .unwrap();
+        ctx.blockstore
+            .set_double_merkle_root(
+                block.slot,
+                BlockLocation::Original,
+                block.block_id.to_hash(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn test_finalized_skipped_replay_only_cancels_proven_gaps() {
+        let mut ctx = setup();
+        let root = ctx.bank_forks.read().unwrap().root_bank();
+        let banks = (1..=7)
+            .map(|slot| {
+                let bank = Bank::new_from_parent(root.clone(), SlotLeader::new_unique(), slot);
+                let bank = if slot == 3 {
+                    bank.mark_leader_bank()
+                } else {
+                    bank
+                };
+                if slot == 4 {
+                    bank.freeze();
+                }
+                ctx.bank_forks
+                    .write()
+                    .unwrap()
+                    .insert(bank)
+                    .clone_without_scheduler()
+            })
+            .collect::<Vec<_>>();
+        let block0 = Block {
+            slot: 0,
+            block_id: BlockId::default(),
+        };
+        let block2 = Block::new_unique(2);
+        let block6 = Block::new_unique(6);
+        store_finalized_parent(&ctx.shared_context, block6, block2);
+        store_finalized_parent(&ctx.shared_context, block2, block0);
+
+        // A local skip vote does not cancel execution, even with the block's ancestry available.
+        ctx.send_timeout_event(1);
+        assert!(banks.iter().all(|bank| !bank.is_replay_cancel_requested()));
+
+        // Finality of 6 proves gaps (0, 2) and (2, 6). Keep chain members, leader banks,
+        // frozen banks, and banks above the finalization untouched.
+        ctx.send_finalized_event(block6, false);
+        for bank in &banks {
+            let cancelled = matches!(bank.slot(), 1 | 5);
+            assert_eq!(
+                bank.is_replay_cancel_requested(),
+                cancelled,
+                "slot {}",
+                bank.slot()
+            );
+            assert_eq!(bank.try_enter_transaction_execution().is_none(), cancelled);
+            assert!(!ctx.shared_context.blockstore.is_dead(bank.slot()));
+        }
+    }
+
+    #[test]
+    fn test_finalized_skipped_replay_retries_missing_ancestry_and_new_banks() {
+        let mut ctx = setup();
+        let root = ctx.bank_forks.read().unwrap().root_bank();
+        let bank = ctx
+            .bank_forks
+            .write()
+            .unwrap()
+            .insert(Bank::new_from_parent(
+                root.clone(),
+                SlotLeader::new_unique(),
+                1,
+            ))
+            .clone_without_scheduler();
+        let block0 = Block {
+            slot: 0,
+            block_id: BlockId::default(),
+        };
+        let block2 = Block::new_unique(2);
+        let block4 = Block::new_unique(4);
+        store_finalized_parent(&ctx.shared_context, block4, block2);
+        // Slot metadata for another block in slot 2 must not be used as ancestry proof.
+        store_finalized_parent(&ctx.shared_context, Block::new_unique(2), block0);
+        ctx.send_finalized_event(block4, false);
+        assert!(!bank.is_replay_cancel_requested());
+
+        store_finalized_parent(&ctx.shared_context, block2, block0);
+        ctx.send_standstill_event(4);
+        assert!(bank.is_replay_cancel_requested());
+
+        // Replay may have inserted a bank after the finalization event's bank lookup.
+        let late_bank = ctx
+            .bank_forks
+            .write()
+            .unwrap()
+            .insert(Bank::new_from_parent(root, SlotLeader::new_unique(), 3))
+            .clone_without_scheduler();
+        ctx.send_standstill_event(4);
+        assert!(late_bank.is_replay_cancel_requested());
+    }
+
     #[test]
     fn test_received_produce_window() {
         let mut test_context = setup();
