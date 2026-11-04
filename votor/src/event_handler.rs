@@ -170,7 +170,10 @@ impl EventHandler {
                     recv(event_receiver) -> msg => {
                         msg
                     },
-                    default(Duration::from_secs(1))  => continue
+                    default(Duration::from_secs(1)) => {
+                        Self::cancel_finalized_skipped_replay(&ctx, &local_context.finalized_blocks);
+                        continue;
+                    }
                 };
                 let event = event
                     .map_err(|_| EventLoopError::ChannelDisconnected("votor_event_receiver"))?;
@@ -560,6 +563,7 @@ impl EventHandler {
                         );
                     }
                 }
+                Self::cancel_finalized_skipped_replay(ctx, &local_context.finalized_blocks);
                 // certs refresh happens in ConsensusPoolService
                 Self::refresh_votes(
                     &local_context.my_pubkey,
@@ -961,6 +965,7 @@ impl EventHandler {
         received_shred: &mut BTreeSet<Slot>,
         stats: &mut EventHandlerStats,
     ) {
+        Self::cancel_finalized_skipped_replay(ctx, finalized_blocks);
         let bank_forks_r = ctx.bank_forks.read().unwrap();
         let old_root = bank_forks_r.root().max(vctx.vote_history.root());
         let Some((new_root, bank_hash)) = finalized_blocks
@@ -1014,6 +1019,67 @@ impl EventHandler {
             received_shred,
         );
         stats.set_root(new_root.slot);
+    }
+
+    /// Stops replay only for slots strictly between a finalized block and its parent (or
+    /// between two of its ancestors). These slots cannot occur on the finalized chain.
+    /// Missing ancestry is left alone and retried as repair supplies it.
+    fn cancel_finalized_skipped_replay(ctx: &SharedContext, finalized_blocks: &BTreeSet<Block>) {
+        let banks: Vec<_> = ctx
+            .bank_forks
+            .read()
+            .unwrap()
+            .banks()
+            .values()
+            .filter(|bank| {
+                !bank.is_frozen()
+                    && bank.should_replay_from_blockstore()
+                    && !bank.is_replay_cancel_requested()
+            })
+            .map(|bank| bank.clone_without_scheduler())
+            .collect();
+        for bank in banks {
+            if finalized_blocks
+                .iter()
+                .rev()
+                .any(|&block| Self::finalized_block_skips_slot(ctx, block, bank.slot()))
+            {
+                info!(
+                    "Cancelling replay of finalized skipped slot {}",
+                    bank.slot()
+                );
+                bank.request_replay_cancel();
+            }
+        }
+    }
+
+    /// A parent link crossing `slot` proves exclusion. Missing ancestry proves nothing;
+    /// the caller retries after repair. Follow block IDs so alternate blocks cannot supply proof.
+    fn finalized_block_skips_slot(ctx: &SharedContext, mut block: Block, slot: Slot) -> bool {
+        while block.slot > slot {
+            let meta = match ctx
+                .blockstore
+                .get_slot_meta_for_block_id(block.slot, block.block_id.to_hash())
+            {
+                Ok(Some((meta, _))) => meta,
+                Ok(None) => return false,
+                Err(err) => {
+                    warn!("Unable to read ancestry of finalized {block:?}: {err}");
+                    return false;
+                }
+            };
+            let Some(parent_slot) = meta.parent_slot.filter(|&parent| parent < block.slot) else {
+                return false;
+            };
+            if parent_slot < slot {
+                return true;
+            }
+            block = Block {
+                slot: parent_slot,
+                block_id: BlockId::from(meta.parent_block_id),
+            };
+        }
+        false
     }
 
     pub(crate) fn join(self) -> thread::Result<()> {

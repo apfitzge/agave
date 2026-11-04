@@ -224,7 +224,7 @@ use {
             Arc, LazyLock, LockResult, Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard,
             Weak,
             atomic::{
-                AtomicBool, AtomicI64, AtomicU64,
+                AtomicBool, AtomicI64, AtomicU8, AtomicU64,
                 Ordering::{AcqRel, Acquire, Relaxed, Release},
             },
         },
@@ -1040,7 +1040,13 @@ pub struct Bank {
 #[derive(Default)]
 struct TransactionExecutionGate {
     lock: RwLock<()>,
-    quiesce_requested: AtomicBool,
+    /// Reasons execution is closed. Bits are only set, never cleared.
+    state: AtomicU8,
+}
+
+impl TransactionExecutionGate {
+    const QUIESCE_REQUESTED: u8 = 1 << 0;
+    const REPLAY_CANCEL_REQUESTED: u8 = 1 << 1;
 }
 
 /// Proof that transaction execution has been admitted for a specific [`Bank`].
@@ -2411,17 +2417,14 @@ impl Bank {
         self.hash.read().unwrap()
     }
 
-    /// Acquires permission to execute transactions unless this Bank is being quiesced.
+    /// Acquires permission to execute transactions unless this Bank is being quiesced or its
+    /// replay was cancelled before freezing started.
     pub fn try_enter_transaction_execution(&self) -> Option<TxExecutionGuard<'_>> {
         // If quiesce has been requested, don't allow new transaction execution to start.
         // We do this before grabbing the lock to prevent some starvation scenario where
         // bank can't be retired because scheduler keeps scheduling and we hold the read
         // lock forever.
-        if self
-            .transaction_execution_gate
-            .quiesce_requested
-            .load(Acquire)
-        {
+        if self.is_transaction_execution_closed() {
             return None;
         }
         let lock_guard = self.transaction_execution_gate.lock.read().unwrap();
@@ -2429,11 +2432,7 @@ impl Bank {
         // We check the quiesce requested flag again after acquiring the lock to ensure
         // that we don't allow new transaction execution to start if quiesce was requested
         // while we were waiting for the lock.
-        if self
-            .transaction_execution_gate
-            .quiesce_requested
-            .load(Acquire)
-        {
+        if self.is_transaction_execution_closed() {
             None
         } else {
             Some(TxExecutionGuard {
@@ -2451,12 +2450,46 @@ impl Bank {
         drop(self.hash.write().unwrap());
     }
 
+    fn is_transaction_execution_closed(&self) -> bool {
+        let state = self.transaction_execution_gate.state.load(Acquire);
+        if state & TransactionExecutionGate::QUIESCE_REQUESTED != 0 {
+            // The bank is being retired, so execution stays closed even after freezing.
+            return true;
+        }
+        if state & TransactionExecutionGate::REPLAY_CANCEL_REQUESTED == 0 {
+            // Normal execution needs only the gate state; avoid loading freeze_started here.
+            return false;
+        }
+
+        // Cancellation can race with replay completing and freezing the bank. Once freezing
+        // starts, replay execution is over: leave the gate open for simulations and child banks.
+        !self.freeze_started()
+    }
+
+    /// Rejects subsequent replay execution without waiting for admitted work to finish.
+    ///
+    /// Used when finality proves this slot was skipped. A rejected batch returns
+    /// `CommitCancelled`, aborting the scheduler and releasing replay's wait for execution.
+    /// Already admitted execution finishes normally. Once freezing starts, replay cancellation
+    /// has no effect, so a cancellation racing with completion cannot close a frozen bank's gate.
+    pub fn request_replay_cancel(&self) {
+        self.transaction_execution_gate
+            .state
+            .fetch_or(TransactionExecutionGate::REPLAY_CANCEL_REQUESTED, Release);
+    }
+
+    pub fn is_replay_cancel_requested(&self) -> bool {
+        self.transaction_execution_gate.state.load(Acquire)
+            & TransactionExecutionGate::REPLAY_CANCEL_REQUESTED
+            != 0
+    }
+
     /// Rejects new transaction execution and waits for admitted execution and commits to finish.
     pub fn quiesce_transaction_execution(&self) {
         // Signal no new work should be started
         self.transaction_execution_gate
-            .quiesce_requested
-            .store(true, Release);
+            .state
+            .fetch_or(TransactionExecutionGate::QUIESCE_REQUESTED, Release);
         // Quiesce execute and load
         drop(self.transaction_execution_gate.lock.write().unwrap());
         // Quiesce record and commit
