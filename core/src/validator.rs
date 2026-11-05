@@ -1170,6 +1170,7 @@ impl Validator {
             Some(replay_vote_sender.clone()),
             prioritization_fee_cache.clone(),
             execution_arenas.clone(),
+            blockstore.get_new_shred_signal(0),
         );
         bank_forks
             .write()

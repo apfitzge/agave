@@ -120,6 +120,8 @@ pub struct SchedulerPool<S: SpawnableScheduler<TH>, TH: TaskHandler> {
     common_handler_context: CommonHandlerContext,
     block_verification_handler_count: CountOrDefault,
     handler_thread_arenas: Option<Arc<ArenaGroup>>,
+    /// Wakes replay after a scheduler publishes its session result.
+    replay_wakeup_sender: Option<Sender<bool>>,
     // weak_self could be elided by changing InstalledScheduler::take_scheduler()'s receiver to
     // Arc<Self> from &Self, because SchedulerPool is used as in the form of Arc<SchedulerPool>
     // almost always. But, this would cause wasted and noisy Arc::clone()'s at every call sites.
@@ -225,6 +227,7 @@ where
         replay_vote_sender: Option<ReplayVoteSender>,
         prioritization_fee_cache: Option<Arc<PrioritizationFeeCache>>,
         handler_thread_arenas: Option<Arc<ArenaGroup>>,
+        replay_wakeup_sender: Option<Sender<bool>>,
     ) -> Arc<Self> {
         Self::do_new(
             block_verification_handler_count,
@@ -237,6 +240,7 @@ where
             DEFAULT_MAX_POOLING_DURATION,
             DEFAULT_MAX_USAGE_QUEUE_COUNT,
             DEFAULT_TIMEOUT_DURATION,
+            replay_wakeup_sender,
         )
     }
 
@@ -255,6 +259,7 @@ where
             replay_vote_sender,
             prioritization_fee_cache,
             None,
+            None,
         )
     }
 
@@ -270,6 +275,7 @@ where
         max_pooling_duration: Duration,
         max_usage_queue_count: usize,
         timeout_duration: Duration,
+        replay_wakeup_sender: Option<Sender<bool>>,
     ) -> Arc<Self> {
         let cleaner_interval = handler_thread_arenas
             .as_ref()
@@ -437,6 +443,7 @@ where
             },
             block_verification_handler_count,
             handler_thread_arenas,
+            replay_wakeup_sender,
             weak_self: weak_self.clone(),
             next_scheduler_id: AtomicSchedulerId::default(),
             max_usage_queue_count,
@@ -1545,6 +1552,7 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
             let handler_context = handler_context.clone_for_scheduler_thread();
             let handler_timings = handler_timings.clone();
             let session_result_sender = self.session_result_sender.clone();
+            let replay_wakeup_sender = self.pool.replay_wakeup_sender.clone();
             // Taking new_task_receiver here is important to ensure there's a single receiver. In
             // this way, the replay stage will get .send() failures reliably, after this scheduler
             // thread died along with the single receiver.
@@ -1689,6 +1697,11 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                     session_result_sender
                         .send(result_with_timings)
                         .expect("always outlived receiver");
+                    // Publish the result before waking replay. A full channel already has a
+                    // pending wakeup; a disconnected channel means replay has shut down.
+                    if let Some(sender) = &replay_wakeup_sender {
+                        let _ = sender.try_send(true);
+                    }
 
                     state_machine.reinitialize();
                     assert!(mem::replace(&mut session_ending, false));
@@ -1779,6 +1792,9 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                 session_result_sender
                     .send(result_with_timings)
                     .expect("always outlived receiver");
+                if let Some(sender) = &replay_wakeup_sender {
+                    let _ = sender.try_send(true);
+                }
 
                 // Next, drop `new_task_receiver`. After that, the paired singleton
                 // `new_task_sender` will start to error when called by external threads, resulting
@@ -2259,6 +2275,7 @@ mod tests {
                 max_pooling_duration,
                 max_usage_queue_count,
                 timeout_duration,
+                None,
             )
         }
 
@@ -2277,6 +2294,7 @@ mod tests {
                 transaction_status_sender,
                 replay_vote_sender,
                 prioritization_fee_cache,
+                None,
                 None,
             )
         }
@@ -2457,6 +2475,7 @@ mod tests {
             None,
             None,
             Some(Arc::new(arenas)),
+            None,
         );
         let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(10_000);
         let bank = Bank::new_for_tests(&genesis_config);
@@ -2921,6 +2940,76 @@ mod tests {
         ) -> Result<TrackedCost> {
             Err(TransactionError::AccountNotFound)
         }
+    }
+
+    #[test_case(false; "success")]
+    #[test_case(true; "abort")]
+    fn test_scheduler_completion_wakes_replay(abort: bool) {
+        #[derive(Debug)]
+        struct Handler;
+        impl TaskHandler for Handler {
+            fn handle(
+                _timings: &mut ExecuteTimings,
+                _context: &SchedulingContext,
+                task: &Task,
+                _handler_context: &HandlerContext,
+            ) -> Result<TrackedCost> {
+                if task.task_id() == 1 {
+                    Err(TransactionError::CommitCancelled)
+                } else {
+                    Ok(TrackedCost::default())
+                }
+            }
+        }
+        let GenesisConfigInfo {
+            genesis_config,
+            mint_keypair,
+            ..
+        } = create_genesis_config(10_000);
+        let (bank, _forks) = setup_dummy_fork_graph(Bank::new_for_tests(&genesis_config));
+        let (wakeup_sender, wakeup_receiver) = crossbeam_channel::bounded(1);
+        let pool = SchedulerPool::<PooledScheduler<Handler>, _>::new(
+            Some(1),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(wakeup_sender),
+        );
+        let mut scheduler = pool.do_take_scheduler(SchedulingContext::new(bank));
+        let tx = ReplayTransaction::from(system_transaction::transfer(
+            &mint_keypair,
+            &Pubkey::new_unique(),
+            1,
+            genesis_config.hash(),
+        ));
+        scheduler.schedule_execution(tx, u128::from(abort)).unwrap();
+        scheduler.inner.thread_manager.do_end_session(true);
+
+        // Replay can sleep on its existing signal channel; the result must already be
+        // published when the wakeup arrives, even when the session aborted.
+        assert_eq!(
+            wakeup_receiver.recv_timeout(Duration::from_secs(5)),
+            Ok(true)
+        );
+        assert!(
+            !scheduler
+                .inner
+                .thread_manager
+                .session_result_receiver
+                .is_empty()
+        );
+        let ((result, _), scheduler) = Box::new(scheduler).wait_for_termination(false);
+        assert_eq!(
+            result,
+            if abort {
+                Err(TransactionError::CommitCancelled)
+            } else {
+                Ok(())
+            }
+        );
+        scheduler.return_to_pool();
     }
 
     #[test]
@@ -3705,7 +3794,7 @@ mod tests {
         let bank = Bank::new_for_tests(&genesis_config);
         let (bank, _bank_forks) = setup_dummy_fork_graph(bank);
         let pool = SchedulerPool::<PooledScheduler<StallingHandler>, _>::new(
-            None, None, None, None, None, None,
+            None, None, None, None, None, None, None,
         );
 
         // This variable tracks the cumulative count of transactions since genesis, which is
