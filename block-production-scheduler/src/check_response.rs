@@ -5,7 +5,7 @@ use {
         tpu_ingress::{RawCheckBatch, TpuTransactionMeta},
     },
     agave_scheduler_bindings::{
-        CheckWorkerToPackMessage, processed_codes, tpu_message_flags,
+        CheckWorkerToPackMessage, processed_codes,
         worker_message_types::{
             CheckResponse, age_nonce_check_flags, fee_payer_balance_flags,
             parsing_and_sanitization_flags, resolve_flags, scheduling_details_flags,
@@ -118,7 +118,7 @@ impl Scheduler {
                 unsafe { transaction.free(&self.allocator) };
                 continue;
             }
-            let priority = calculate_priority(response, metadata.flags);
+            let priority = calculate_priority(response);
             let nonce_address = transaction.view.get_durable_nonce(true);
             if nonce_address
                 .is_some_and(|address| self.transactions.should_drop_nonce(address, priority))
@@ -203,10 +203,7 @@ fn has_sufficient_fee_payer_balance(
         .is_some_and(|total_fee| total_fee <= balance)
 }
 
-fn calculate_priority(response: &CheckResponse, tpu_flags: u8) -> u64 {
-    if tpu_flags & tpu_message_flags::IS_SIMPLE_VOTE != 0 {
-        return u64::MAX;
-    }
+fn calculate_priority(response: &CheckResponse) -> u64 {
     let reward = response.prioritization_fee.saturating_add(
         response.transaction_fee.saturating_sub(
             response
