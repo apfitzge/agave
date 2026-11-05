@@ -3180,6 +3180,7 @@ impl ReplayStage {
             Some(&process_active_banks_context.replay_vote_sender),
             Some(finalization_cert_sender),
             false,
+            /* wait_for_execution */ false,
             process_active_banks_context.migration_status.as_ref(),
         )?;
         let tx_count_after = w_replay_progress.num_txs;

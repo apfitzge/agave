@@ -78,6 +78,7 @@ use {
             Arc, OnceLock, RwLock,
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
+        task::Poll,
         thread,
         time::{Duration, Instant},
     },
@@ -628,6 +629,7 @@ fn confirm_full_slot(
         replay_vote_sender,
         None,
         opts.allow_dead_slots,
+        /* wait_for_execution */ true,
         migration_status,
     )?;
 
@@ -952,6 +954,8 @@ pub struct ConfirmationProgress {
     pub num_shreds: u64,
     pub num_entries: usize,
     pub num_txs: usize,
+    /// The footer has requested scheduler completion; retries only need to poll it.
+    footer_execution_requested: bool,
     async_verification: Option<AsyncVerificationProgress>,
 }
 
@@ -1411,6 +1415,7 @@ impl AsyncVerificationProgress {
     }
 }
 
+/// When execution waiting is disabled, a pending footer is retried at the same shred offset.
 #[allow(clippy::too_many_arguments)]
 pub fn confirm_slot(
     blockstore: &Blockstore,
@@ -1424,6 +1429,7 @@ pub fn confirm_slot(
     replay_vote_sender: Option<&ReplayVoteSender>,
     finalization_cert_sender: Option<&Sender<SmallVec<[Certificate; 2]>>>,
     allow_dead_slots: bool,
+    wait_for_execution: bool,
     migration_status: &MigrationStatus,
 ) -> result::Result<(), BlockstoreProcessorError> {
     let slot = bank.slot();
@@ -1515,6 +1521,23 @@ pub fn confirm_slot(
                 let block_footer = match &marker {
                     VersionedBlockMarker::V1(marker) => marker.as_block_footer().cloned(),
                 };
+                if block_footer.is_some() && !wait_for_execution {
+                    // Retry this footer on the execution wakeup without advancing progress or
+                    // changing footer state. Other replay banks and commands can proceed.
+                    if !progress.footer_execution_requested {
+                        if bank.try_request_scheduler_termination().is_pending() {
+                            return Ok(());
+                        }
+                        progress.footer_execution_requested = true;
+                    }
+                    let Poll::Ready(completed) = bank.try_wait_for_completed_scheduler() else {
+                        return Ok(());
+                    };
+                    if let Some((result, timings)) = completed {
+                        timing.batch_execute.totals.accumulate(&timings);
+                        result?;
+                    }
+                }
                 if let Some(parent_bank) = bank.parent() {
                     let allow_initial_update_parent =
                         replay_starts_at_update_parent && marker.is_update_parent();
@@ -5772,6 +5795,7 @@ pub mod tests {
     }
 
     fn confirm_slot_with_block_markers_common(
+        slot: Slot,
         footer_before_alpentick: bool,
         mut genesis_config: GenesisConfig,
     ) -> (
@@ -5810,7 +5834,7 @@ pub mod tests {
         });
         let footer_component = BlockComponent::new_block_marker(footer);
 
-        let shredder = Shredder::new(1, 0, 0, 0).unwrap();
+        let shredder = Shredder::new(slot, 0, 0, 0).unwrap();
         let mut next_shred_index = 0u32;
 
         let header_shreds: Vec<Shred> = shredder
@@ -5907,11 +5931,122 @@ pub mod tests {
         )
     }
 
+    #[test_case(false; "success")]
+    #[test_case(true; "abort")]
+    fn test_confirm_slot_yields_at_pending_footer(abort: bool) {
+        let genesis = create_genesis_config(100 * LAMPORTS_PER_SOL).genesis_config;
+        let (blockstore, genesis, _path, workers) =
+            confirm_slot_with_block_markers_common(1, true, genesis);
+        let (sibling_store, _, _sibling_path, _sibling_workers) =
+            confirm_slot_with_block_markers_common(2, true, genesis.clone());
+        blockstore
+            .insert_shreds(sibling_store.get_data_shreds_for_slot(2, 0).unwrap(), true)
+            .unwrap();
+        let forks = BankForks::new_rw_arc(Bank::new_for_tests(&genesis));
+        let root = forks.read().unwrap().root_bank();
+        let migration = MigrationStatus::post_migration_status();
+        let new_bank = |slot| {
+            let mut bank = Bank::new_from_parent(root.clone(), SlotLeader::default(), slot);
+            bank.activate_feature(&agave_feature_set::alpenglow::id());
+            set_alpenglow_ticks(&bank, &migration);
+            forks.write().unwrap().insert(bank)
+        };
+        let slow_bank = new_bank(1).clone_without_scheduler();
+        let sibling = new_bank(2);
+        let ready = Arc::new(AtomicBool::new(false));
+        let mut scheduler = MockInstalledScheduler::new();
+        scheduler
+            .expect_context()
+            .return_const(SchedulingContext::new(slow_bank.clone()));
+        scheduler
+            .expect_request_termination()
+            .times(1)
+            .return_const(());
+        let completed = ready.clone();
+        scheduler
+            .expect_try_wait_for_termination()
+            .returning(move || {
+                if completed.load(Ordering::Acquire) {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            });
+        scheduler
+            .expect_wait_for_termination()
+            .times(1)
+            .returning(move |_| {
+                let mut uninstalled = MockUninstalledScheduler::new();
+                uninstalled
+                    .expect_return_to_pool()
+                    .times(1)
+                    .return_const(());
+                let result = if abort {
+                    Err(TransactionError::BlockhashNotFound)
+                } else {
+                    Ok(())
+                };
+                ((result, ExecuteTimings::default()), Box::new(uninstalled))
+            });
+        let slow = BankWithScheduler::new(slow_bank, Some(Box::new(scheduler)));
+        let confirm = |bank: &BankWithScheduler, progress: &mut ConfirmationProgress| {
+            confirm_slot(
+                &blockstore,
+                bank,
+                0,
+                &workers,
+                &mut ConfirmationTiming::default(),
+                progress,
+                true,
+                None,
+                None,
+                None,
+                false,
+                /* wait_for_execution */ false,
+                &migration,
+            )
+        };
+        let mut slow_progress = ConfirmationProgress::new(root.last_blockhash());
+        confirm(&slow, &mut slow_progress).unwrap();
+        let footer_offset = slow_progress.num_shreds;
+        assert!(footer_offset > 0);
+        assert!(!slow.is_complete());
+        assert!(slow.expected_bank_hash().is_none());
+        confirm(&slow, &mut slow_progress).unwrap();
+        assert_eq!(slow_progress.num_shreds, footer_offset);
+
+        // The first bank is still pending, but a sibling can replay its footer and final tick.
+        confirm(
+            &sibling,
+            &mut ConfirmationProgress::new(root.last_blockhash()),
+        )
+        .unwrap();
+        assert!(sibling.is_complete());
+        assert!(!slow.is_complete());
+        ready.store(true, Ordering::Release);
+        let result = confirm(&slow, &mut slow_progress);
+        if abort {
+            assert_matches!(
+                result,
+                Err(BlockstoreProcessorError::InvalidTransaction(
+                    TransactionError::BlockhashNotFound
+                ))
+            );
+            assert_eq!(slow_progress.num_shreds, footer_offset);
+            assert!(slow.expected_bank_hash().is_none());
+        } else {
+            result.unwrap();
+            assert!(slow.is_complete());
+            assert!(slow_progress.num_shreds > footer_offset);
+            assert!(slow.expected_bank_hash().is_some());
+        }
+    }
+
     #[test]
     fn test_confirm_slot_block_with_markers_fails_without_alpenglow() {
         let genesis_config = create_tower_genesis_config(100 * LAMPORTS_PER_SOL).genesis_config;
         let (blockstore, genesis_config, _ledger_path, replay_verification_worker_pool) =
-            confirm_slot_with_block_markers_common(true, genesis_config);
+            confirm_slot_with_block_markers_common(1, true, genesis_config);
 
         let bank_forks = BankForks::new_rw_arc(Bank::new_for_tests(&genesis_config));
         let bank0 = bank_forks.read().unwrap().get(0).unwrap();
@@ -5935,6 +6070,7 @@ pub mod tests {
             None,
             None,
             false,
+            /* wait_for_execution */ true,
             &MigrationStatus::default(),
         )
         .unwrap_err();
@@ -5944,7 +6080,7 @@ pub mod tests {
     fn test_confirm_slot_block_with_markers_succeeds_with_alpenglow() {
         let genesis_config = create_genesis_config(100 * LAMPORTS_PER_SOL).genesis_config;
         let (blockstore, genesis_config, _ledger_path, replay_verification_worker_pool) =
-            confirm_slot_with_block_markers_common(true, genesis_config);
+            confirm_slot_with_block_markers_common(1, true, genesis_config);
 
         let bank_forks = BankForks::new_rw_arc(Bank::new_for_tests(&genesis_config));
         let bank0 = bank_forks.read().unwrap().get(0).unwrap();
@@ -5971,6 +6107,7 @@ pub mod tests {
             None,
             None,
             false,
+            /* wait_for_execution */ true,
             &MigrationStatus::post_migration_status(),
         )
         .unwrap();
@@ -6024,7 +6161,7 @@ pub mod tests {
     fn test_confirm_slot_rejects_alpentick_before_footer() {
         let genesis_config = create_genesis_config(100 * LAMPORTS_PER_SOL).genesis_config;
         let (blockstore, genesis_config, _ledger_path, replay_verification_worker_pool) =
-            confirm_slot_with_block_markers_common(false, genesis_config);
+            confirm_slot_with_block_markers_common(1, false, genesis_config);
 
         let bank_forks = BankForks::new_rw_arc(Bank::new_for_tests(&genesis_config));
         let bank0 = bank_forks.read().unwrap().get(0).unwrap();
@@ -6044,6 +6181,7 @@ pub mod tests {
             None,
             None,
             false,
+            /* wait_for_execution */ true,
             &MigrationStatus::post_migration_status(),
         );
         assert_matches!(
