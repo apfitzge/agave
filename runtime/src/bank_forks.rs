@@ -844,6 +844,12 @@ mod tests {
             unreachable!("blocking test scheduler never aborts")
         }
 
+        fn request_termination(&mut self) {}
+
+        fn try_wait_for_termination(&mut self) -> std::task::Poll<()> {
+            std::task::Poll::Pending
+        }
+
         fn wait_for_termination(
             self: Box<Self>,
             is_dropped: bool,

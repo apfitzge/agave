@@ -33,7 +33,8 @@ use {
         fmt::{self, Debug},
         mem,
         ops::Deref,
-        sync::{Arc, RwLock},
+        sync::{Arc, RwLock, TryLockError},
+        task::Poll,
         thread,
     },
 };
@@ -108,8 +109,8 @@ pub trait InstalledScheduler: Send + Sync + Debug + 'static {
     ///
     /// This non-blocking function will return immediately without waiting for actual execution.
     ///
-    /// Calling this is illegal as soon as `wait_for_termination()` is called. It would result in
-    /// fatal logic error.
+    /// Calling this is illegal as soon as `request_termination()` or `wait_for_termination()`
+    /// is called. It would result in fatal logic error.
     ///
     /// Note that the returned result indicates whether the scheduler has been aborted due to a
     /// previously-scheduled bad transaction, which terminates further block verification. So,
@@ -141,6 +142,12 @@ pub trait InstalledScheduler: Send + Sync + Debug + 'static {
     /// from `schedule_execution()`. While it's not guaranteed, the same `.clone()`-ed errors of
     /// the first bad transaction are usually returned across invocations.
     fn recover_error_after_abort(&mut self) -> TransactionError;
+
+    /// Requests session completion without waiting. Call exactly once before polling.
+    fn request_termination(&mut self);
+
+    /// Polls a previously requested completion, retaining its result for `wait_for_termination()`.
+    fn try_wait_for_termination(&mut self) -> Poll<()>;
 
     /// Wait for a scheduler to terminate after processing.
     ///
@@ -488,6 +495,34 @@ impl BankWithScheduler {
         );
     }
 
+    /// Requests completion without waiting for execution. Retry only if the scheduler lock is
+    /// busy (`Pending`); after `Ready`, stop scheduling transactions and poll for completion.
+    pub fn try_request_scheduler_termination(&self) -> Poll<()> {
+        self.inner.try_with_scheduler(|scheduler| {
+            if let SchedulerStatus::Active(scheduler) = scheduler {
+                scheduler.request_termination();
+            }
+            Poll::Ready(())
+        })
+    }
+
+    /// Collects a previously requested completion. A pending scheduler stays installed.
+    #[must_use]
+    pub fn try_wait_for_completed_scheduler(&self) -> Poll<Option<ResultWithTimings>> {
+        self.inner.try_with_scheduler(|scheduler| {
+            if let SchedulerStatus::Active(scheduler) = scheduler {
+                if scheduler.try_wait_for_termination().is_pending() {
+                    return Poll::Pending;
+                }
+            }
+            Poll::Ready(BankWithSchedulerInner::finish_scheduler_termination(
+                &self.inner.bank,
+                scheduler,
+                WaitReason::TerminatedToFreeze,
+            ))
+        })
+    }
+
     #[must_use]
     pub fn wait_for_completed_scheduler(&self) -> Option<ResultWithTimings> {
         BankWithSchedulerInner::wait_for_scheduler_termination(
@@ -503,6 +538,15 @@ impl BankWithScheduler {
 }
 
 impl BankWithSchedulerInner {
+    fn try_with_scheduler<T>(&self, f: impl FnOnce(&mut SchedulerStatus) -> Poll<T>) -> Poll<T> {
+        let mut scheduler = match self.scheduler.try_write() {
+            Ok(scheduler) => scheduler,
+            Err(TryLockError::WouldBlock) => return Poll::Pending,
+            Err(err) => panic!("scheduler lock poisoned: {err}"),
+        };
+        f(&mut scheduler)
+    }
+
     fn with_active_scheduler(
         self: &Arc<Self>,
         f: impl FnOnce(&InstalledSchedulerBox) -> ScheduleResult,
@@ -629,6 +673,15 @@ impl BankWithSchedulerInner {
         scheduler: &InstalledSchedulerRwLock,
         reason: WaitReason,
     ) -> Option<ResultWithTimings> {
+        let mut scheduler = scheduler.write().unwrap();
+        Self::finish_scheduler_termination(bank, &mut scheduler, reason)
+    }
+
+    fn finish_scheduler_termination(
+        bank: &Bank,
+        scheduler: &mut SchedulerStatus,
+        reason: WaitReason,
+    ) -> Option<ResultWithTimings> {
         debug!(
             "wait_for_scheduler_termination(slot: {}, reason: {:?}): started at {:?}...",
             bank.slot(),
@@ -636,8 +689,7 @@ impl BankWithSchedulerInner {
             thread::current(),
         );
 
-        let mut scheduler = scheduler.write().unwrap();
-        let (was_noop, result_with_timings) = match &mut *scheduler {
+        let (was_noop, result_with_timings) = match scheduler {
             SchedulerStatus::Active(scheduler) if reason.is_paused() => {
                 scheduler.pause_for_recent_blockhash();
                 (false, None)

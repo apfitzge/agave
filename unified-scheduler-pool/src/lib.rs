@@ -61,6 +61,7 @@ use {
             Arc, Mutex, OnceLock, Weak,
             atomic::{AtomicU64, Ordering::Relaxed},
         },
+        task::Poll,
         thread::{self, JoinHandle, sleep},
         time::{Duration, Instant},
     },
@@ -1761,9 +1762,8 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                             Ok(NewTaskPayload::UnpauseOpenedSubchannel) => {
                                 unreachable!("unpause without open is prohibited");
                             }
-                            Ok(NewTaskPayload::CloseSubchannel) => {
-                                unreachable!("close without open is prohibited");
-                            }
+                            // Blocking collection may repeat an earlier nonblocking close.
+                            Ok(NewTaskPayload::CloseSubchannel) => {}
                             Ok(NewTaskPayload::Reset) => {
                                 unreachable!("reset without open is prohibited");
                             }
@@ -1977,6 +1977,32 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
         }
     }
 
+    fn try_end_session(&mut self) -> Poll<()> {
+        if self.session_result_with_timings.is_none() {
+            match self.session_result_receiver.try_recv() {
+                Ok(result) => self.put_session_result_with_timings(result),
+                Err(TryRecvError::Empty) => return Poll::Pending,
+                Err(TryRecvError::Disconnected) => panic!("scheduler result channel disconnected"),
+            }
+        }
+        if matches!(self.session_result_with_timings, Some((Err(_), _)))
+            && !self.are_threads_joined()
+        {
+            // Abort results can arrive before the other handlers stop; polling must not join
+            // executing threads or return their scheduler to the pool.
+            if !self.scheduler_thread.as_ref().unwrap().is_finished()
+                || self
+                    .handler_threads
+                    .iter()
+                    .any(|thread| !thread.is_finished())
+            {
+                return Poll::Pending;
+            }
+            self.ensure_join_threads_after_abort(false);
+        }
+        Poll::Ready(())
+    }
+
     fn end_session(&mut self) {
         self.do_end_session(false)
     }
@@ -1986,7 +2012,10 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
             assert!(self.session_result_with_timings.is_some());
             debug!("end_session(): skipping; already joined the aborted threads...");
             return;
-        } else if self.session_result_with_timings.is_some() {
+        } else if let Some((result, _)) = &self.session_result_with_timings {
+            if result.is_err() {
+                self.ensure_join_threads_after_abort(false);
+            }
             debug!("end_session(): skipping; already result resides within thread manager...");
             return;
         }
@@ -2162,6 +2191,14 @@ impl<TH: TaskHandler> InstalledScheduler for PooledScheduler<TH> {
         self.inner
             .thread_manager
             .ensure_join_threads_after_abort(true)
+    }
+
+    fn request_termination(&mut self) {
+        self.inner.thread_manager.do_end_session(true);
+    }
+
+    fn try_wait_for_termination(&mut self) -> Poll<()> {
+        self.inner.thread_manager.try_end_session()
     }
 
     fn wait_for_termination(
@@ -2940,6 +2977,71 @@ mod tests {
         ) -> Result<TrackedCost> {
             Err(TransactionError::AccountNotFound)
         }
+    }
+
+    #[test_case(false; "success")]
+    #[test_case(true; "abort")]
+    fn test_try_wait_for_completed_scheduler(abort: bool) {
+        // Hold the transaction in the scheduler until the pending polls have returned.
+        let _progress =
+            sleepless_testing::setup(&[&TestCheckPoint::BeforeEndSession, &CheckPoint::NewTask(0)]);
+        let GenesisConfigInfo {
+            genesis_config,
+            mint_keypair,
+            ..
+        } = create_genesis_config(10_000);
+        let (bank, _forks) = setup_dummy_fork_graph(Bank::new_for_tests(&genesis_config));
+        let pool = DefaultSchedulerPool::new_for_verification(Some(1), None, None, None, None);
+        let context = SchedulingContext::new(bank.clone());
+        let scheduler = pool.take_scheduler(context.clone()).unwrap();
+        let bank = BankWithScheduler::new(bank, Some(scheduler));
+        let blockhash = if abort {
+            Hash::new_unique()
+        } else {
+            genesis_config.hash()
+        };
+        let tx = ReplayTransaction::from(system_transaction::transfer(
+            &mint_keypair,
+            &Pubkey::new_unique(),
+            2,
+            blockhash,
+        ));
+        bank.schedule_transaction_executions([(tx, 0)].into_iter())
+            .unwrap();
+        assert!(bank.try_request_scheduler_termination().is_ready());
+        for _ in 0..3 {
+            assert!(bank.try_wait_for_completed_scheduler().is_pending());
+            assert!(bank.has_installed_scheduler());
+        }
+        sleepless_testing::at(TestCheckPoint::BeforeEndSession);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let result = loop {
+            match bank.try_wait_for_completed_scheduler() {
+                Poll::Ready(Some((result, _))) => break result,
+                Poll::Ready(None) => panic!("scheduler result lost"),
+                Poll::Pending => {
+                    assert!(Instant::now() < deadline);
+                    std::thread::yield_now();
+                }
+            }
+        };
+        assert_eq!(
+            result,
+            if abort {
+                Err(TransactionError::BlockhashNotFound)
+            } else {
+                Ok(())
+            }
+        );
+        assert!(!bank.has_installed_scheduler());
+        assert!(matches!(
+            bank.try_wait_for_completed_scheduler(),
+            Poll::Ready(None)
+        ));
+        // Blocking collection after an explicit close also works without another state flag.
+        let mut scheduler = pool.do_take_scheduler(context);
+        scheduler.request_termination();
+        assert!(scheduler.into_inner().0.0.is_ok());
     }
 
     #[test_case(false; "success")]
@@ -3983,6 +4085,22 @@ mod tests {
 
         fn recover_error_after_abort(&mut self) -> TransactionError {
             unimplemented!();
+        }
+
+        fn request_termination(&mut self) {}
+
+        fn try_wait_for_termination(&mut self) -> Poll<()> {
+            if self
+                .1
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|thread| thread.is_finished())
+            {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
         }
 
         fn wait_for_termination(
