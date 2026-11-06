@@ -336,7 +336,6 @@ fn expired_execution_batch_is_dispatched_in_the_next_slot() {
     reply_checks(&mut agave);
     scheduler.run_iteration();
     let batch = receive_execution(&mut agave, 0, 100, &[transaction]);
-    leader_ready(&mut agave, 101);
     agave.workers[0]
         .worker_to_pack
         .try_write(ExecutionWorkerToPackMessage {
@@ -348,6 +347,21 @@ fn expired_execution_batch_is_dispatched_in_the_next_slot() {
             },
         })
         .unwrap();
+    // The worker can observe the slot ending before the progress tracker does.
+    scheduler.run_iteration();
+    assert!(scheduler.in_flight.is_empty());
+    assert_eq!(scheduler.transactions.len(), 1);
+    assert_eq!(scheduler.scheduled_cost, 0);
+    assert!(agave.workers[0].pack_to_worker.try_read().is_none());
+
+    // Neither another iteration nor a stale ready snapshot may reopen the slot.
+    scheduler.run_iteration();
+    assert!(agave.workers[0].pack_to_worker.try_read().is_none());
+    leader_ready(&mut agave, 100);
+    scheduler.run_iteration();
+    assert!(agave.workers[0].pack_to_worker.try_read().is_none());
+
+    leader_ready(&mut agave, 101);
     scheduler.run_iteration();
     let batch = receive_execution(&mut agave, 0, 101, &[transaction]);
     reply_execution(&mut agave, 0, batch, &[not_included_reasons::NONE]);
