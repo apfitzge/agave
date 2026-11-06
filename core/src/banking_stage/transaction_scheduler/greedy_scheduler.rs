@@ -130,6 +130,7 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for GreedyScheduler<Tx> {
         let mut num_sent: usize = 0;
         let mut num_unschedulable_conflicts: usize = 0;
         let mut num_unschedulable_threads: usize = 0;
+        let mut num_dropped_on_alt_expiration: usize = 0;
 
         while budget > 0
             && num_scanned < self.config.max_scanned_transactions_per_scheduling_pass
@@ -147,6 +148,15 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for GreedyScheduler<Tx> {
             let Some(transaction_state) = container.get_mut_transaction_state(id.id) else {
                 panic!("transaction state must exist")
             };
+
+            // Workers execute only in this slot, so resolved addresses remain valid
+            // through execution. Conservatively drop expired lookups without loading
+            // the tables again, even if skipped slots could extend their lifetime.
+            if slot > transaction_state.max_age().alt_invalidation_slot {
+                container.remove_by_id(id.id);
+                num_dropped_on_alt_expiration += 1;
+                continue;
+            }
 
             // Now check if the transaction can actually be scheduled.
             match try_schedule_transaction(
@@ -236,6 +246,7 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for GreedyScheduler<Tx> {
             num_scheduled,
             num_unschedulable_conflicts,
             num_unschedulable_threads,
+            num_dropped_on_alt_expiration,
         })
     }
 
@@ -321,6 +332,57 @@ mod test {
     };
 
     const TEST_SLOT: Slot = 42;
+
+    #[test_matrix([TEST_SLOT - 1, TEST_SLOT, TEST_SLOT + 1])]
+    fn test_alt_expiration(alt_invalidation_slot: Slot) {
+        let (mut scheduler, receivers, finished) =
+            create_test_frame(1, GreedySchedulerConfig::default());
+        let mut container = TransactionStateContainer::with_capacity(1);
+        container.insert_new_transaction(
+            prioritized_tranfers(&Keypair::new(), [Pubkey::new_unique()], 1, 1),
+            MaxAge {
+                sanitized_epoch: 0,
+                alt_invalidation_slot,
+            },
+            1,
+            5000,
+        );
+
+        let summary = scheduler
+            .schedule(&mut container, TEST_SLOT, u64::MAX)
+            .unwrap();
+        if alt_invalidation_slot < TEST_SLOT {
+            assert_eq!(summary.num_scheduled, 0);
+            assert_eq!(summary.num_dropped_on_alt_expiration, 1);
+            assert!(receivers[0].is_empty());
+        } else {
+            assert_eq!(summary.num_scheduled, 1);
+            assert_eq!(summary.num_dropped_on_alt_expiration, 0);
+            let work = receivers[0].try_recv().unwrap();
+            assert_eq!(work.target_slot, TEST_SLOT);
+            finished
+                .send(FinishedConsumeWork {
+                    work,
+                    retryable_indexes: vec![crate::banking_stage::consumer::RetryableIndex {
+                        index: 0,
+                        immediately_retryable: true,
+                    }],
+                })
+                .unwrap();
+            assert_eq!(scheduler.receive_completed(&mut container).unwrap(), (1, 1));
+
+            // A retry in a later slot must check expiration again.
+            let summary = scheduler
+                .schedule(&mut container, TEST_SLOT + 2, u64::MAX)
+                .unwrap();
+            assert_eq!(summary.num_scheduled, 0);
+            assert_eq!(summary.num_dropped_on_alt_expiration, 1);
+            assert!(receivers[0].is_empty());
+        }
+        assert_eq!(container.queue_size(), 0);
+        assert_eq!(container.buffer_size(), 0);
+        assert!(!scheduler.has_in_flight_transactions());
+    }
 
     #[allow(clippy::type_complexity)]
     fn create_test_frame(

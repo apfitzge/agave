@@ -194,7 +194,7 @@ impl Consumer {
         self.process_and_record_transactions_with_pre_results(bank, txs, pre_results, flags)
     }
 
-    fn process_and_record_transactions_with_pre_results(
+    pub(super) fn process_and_record_transactions_with_pre_results(
         &self,
         bank: &Bank,
         txs: &[impl TransactionWithMeta],

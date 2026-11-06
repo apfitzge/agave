@@ -371,6 +371,8 @@ where
 
                 self.count_metrics.update(|count_metrics| {
                     count_metrics.num_scheduled += scheduling_summary.num_scheduled;
+                    count_metrics.num_dropped_on_clean +=
+                        scheduling_summary.num_dropped_on_alt_expiration;
                     count_metrics.num_unschedulable_conflicts +=
                         scheduling_summary.num_unschedulable_conflicts;
                     count_metrics.num_unschedulable_threads +=

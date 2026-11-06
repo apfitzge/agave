@@ -119,16 +119,32 @@ impl<Tx: TransactionWithMeta> ConsumeWorker<Tx> {
             .num_messages_processed
             .fetch_add(1, Ordering::Relaxed);
 
-        let output = self.consumer.process_and_record_aged_transactions(
-            bank,
-            &work.transactions,
-            &work.max_ages,
-            &ExecutionFlags {
-                simulate: false,
-                drop_on_failure: false,
-                all_or_nothing: false,
-            },
-        );
+        // The internal scheduler checked ALT expiration for target_slot, and
+        // the slot check above ensures we execute against that same bank slot.
+        // Retain epoch and vote-only checks without resolving addresses again.
+        let pre_results = work
+            .transactions
+            .iter()
+            .zip(&work.max_ages)
+            .map(|(tx, max_age)| {
+                bank.resanitize_transaction_minimally(
+                    tx,
+                    max_age.sanitized_epoch,
+                    solana_clock::Slot::MAX,
+                )
+            });
+        let output = self
+            .consumer
+            .process_and_record_transactions_with_pre_results(
+                bank,
+                &work.transactions,
+                pre_results,
+                &ExecutionFlags {
+                    simulate: false,
+                    drop_on_failure: false,
+                    all_or_nothing: false,
+                },
+            );
         self.metrics.update_for_consume(&output);
         self.metrics.has_data.store(true, Ordering::Relaxed);
 
@@ -2796,7 +2812,7 @@ mod tests {
     }
 
     #[test]
-    fn test_worker_ttl() {
+    fn test_worker_epoch_checks_without_alt_resolution() {
         let (mut test_frame, worker) = setup_test_frame();
         let TestFrame {
             mint_keypair,
@@ -2823,7 +2839,9 @@ mod tests {
         // 1. Epoch expiration, before slot => still succeeds due to resanitizing
         // 2. Epoch expiration, on slot => succeeds normally
         // 3. Epoch expiration, after slot => succeeds normally
-        // 4. ALT expiration, before slot => fails
+        // ALT expiration is checked by the internal scheduler, so the worker
+        // never resolves the missing lookup tables, even for an expired max age.
+        // 4. ALT expiration, before slot => succeeds
         // 5. ALT expiration, on slot => succeeds normally
         // 6. ALT expiration, after slot => succeeds normally
         let simple_transfer = || {
@@ -2925,8 +2943,8 @@ mod tests {
 
         let consumed = consumed_receiver.recv().unwrap();
         assert_eq!(consumed.retryable_indexes, Vec::new());
-        // all but one succeed. 6 for initial funding
-        assert_eq!(bank.transaction_count(), 6 + 5);
+        // All succeed. 6 for initial funding.
+        assert_eq!(bank.transaction_count(), 6 + 6);
 
         let already_processed_results = Consumer::check_transactions_for_scheduling(
             bank,
@@ -2947,7 +2965,7 @@ mod tests {
                 Err(TransactionError::AlreadyProcessed),
                 Err(TransactionError::AlreadyProcessed),
                 Err(TransactionError::AlreadyProcessed),
-                Ok(()), // <--- this transaction was not processed
+                Err(TransactionError::AlreadyProcessed),
                 Err(TransactionError::AlreadyProcessed),
                 Err(TransactionError::AlreadyProcessed)
             ]

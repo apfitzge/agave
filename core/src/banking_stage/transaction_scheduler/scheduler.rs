@@ -64,4 +64,6 @@ pub(crate) struct SchedulingSummary {
     pub num_unschedulable_conflicts: usize,
     /// Number of transactions that were skipped due to thread capacity.
     pub num_unschedulable_threads: usize,
+    /// Number of transactions dropped because their resolved addresses expired.
+    pub num_dropped_on_alt_expiration: usize,
 }
